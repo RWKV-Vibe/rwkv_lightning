@@ -1,7 +1,7 @@
 #include "hip/hip_runtime.h"
-#undef __CUDA_NO_HALF2_OPERATORS__
-#undef __CUDA_NO_HALF_CONVERSIONS__
-#undef __CUDA_NO_HALF_OPERATORS__
+#undef __HIP_NO_HALF2_OPERATORS__
+#undef __HIP_NO_HALF_CONVERSIONS__
+#undef __HIP_NO_HALF_OPERATORS__
 
 #include <stdio.h>
 #include <assert.h>
@@ -111,31 +111,24 @@ __global__ void kernel_forward_w0_fp16_dither_seq(const int B, const int T, cons
         ((F *)b)[i] = _b[t];
         ((F *)r)[i] = _r[t];
         __syncthreads();
-        __half2 sa2 = __halves2half2(__float2half(0.0f), __float2half(0.0f));
+        __half2 sa2 = {0., 0.};
         #pragma unroll
         for (int j = 0; j < _N_ / 2; j++)
-            // sa2 += a[j] * state[j];
-            sa2 = __hadd2(sa2, __hmul2(a[j], state[j]));
-        // __half sa = sa2.x + sa2.y;
-        __half sa = __hadd(__low2half(sa2), __high2half(sa2));
-        // sa2 = {sa, sa};
-        sa2 = __halves2half2(sa, sa);
+            sa2 += a[j] * state[j];
+        __half sa = sa2.x + sa2.y;
+        sa2 = __half2(sa, sa);
 
         __half vv = _v[t];
         __half2 vv2 = {vv, vv};
-        // __half2 y2 = {0., 0.};
-        __half2 y2 = __halves2half2(__float2half(0.0f), __float2half(0.0f));
+        __half2 y2 = {0., 0.};
         #pragma unroll
         for (int j = 0; j < _N_ / 2; j++)
         {
             __half2 &s = state[j];
-            // s += s * w[j] + k[j] * vv2 + sa2 * b[j];
-            // y2 += s * r[j];
-            s = __hadd2(__hadd2(__hadd2(s, __hmul2(s, w[j])), __hmul2(k[j], vv2)), __hmul2(sa2, b[j]));
-            y2 = __hadd2(y2, __hmul2(s, r[j]));
+            s += s * w[j] + k[j] * vv2 + sa2 * b[j];
+            y2 += s * r[j];
         }
-        // _y[t] = y2.x + y2.y;
-        _y[t] = __hadd(__low2half(y2), __high2half(y2));
+        _y[t] = y2.x + y2.y;
     }
     #pragma unroll
     for (int j = 0; j < _N_ / 2; j++)
@@ -201,32 +194,24 @@ __global__ void kernel_forward_w0_fp16_dither_one(const int B, const int C, cons
     ((F *)b)[i] = _b[t];
     ((F *)r)[i] = _r[t];
     __syncthreads();
-    // __half2 sa2 = {0., 0.};
-    __half2 sa2 = __halves2half2(__float2half(0.0f), __float2half(0.0f));
+    __half2 sa2 = {0., 0.};
 #pragma unroll
     for (int j = 0; j < _N_ / 2; j++)
-        // sa2 += a[j] * state[j];
-        sa2 = __hadd2(sa2, __hmul2(a[j], state[j]));
-    // __half sa = sa2.x + sa2.y;
-    __half sa = __hadd(__low2half(sa2), __high2half(sa2));
-    // sa2 = {sa, sa};
-    sa2 = __halves2half2(sa, sa);
+        sa2 += a[j] * state[j];
+    __half sa = sa2.x + sa2.y;
+    sa2 = __half2(sa, sa);
 
     __half vv = _v[t];
     __half2 vv2 = {vv, vv};
-    // __half2 y2 = {0., 0.};
-    __half2 y2 = __halves2half2(__float2half(0.0f), __float2half(0.0f));
+    __half2 y2 = {0., 0.};
 #pragma unroll
     for (int j = 0; j < _N_ / 2; j++)
     {
         __half2 &s = state[j];
-        // s += s * w[j] + k[j] * vv2 + sa2 * b[j];
-        // y2 += s * r[j];
-        s = __hadd2(__hadd2(__hadd2(s, __hmul2(s, w[j])), __hmul2(k[j], vv2)), __hmul2(sa2, b[j]));
-        y2 = __hadd2(y2, __hmul2(s, r[j]));
+        s += s * w[j] + k[j] * vv2 + sa2 * b[j];
+        y2 += s * r[j];
     }
-    // _y[t] = y2.x + y2.y;
-    _y[t] = __hadd(__low2half(y2), __high2half(y2));
+    _y[t] = y2.x + y2.y;
 
 #pragma unroll
     for (int j = 0; j < _N_ / 2; j++)
