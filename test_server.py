@@ -26,6 +26,7 @@ payload = {
         "Chinese: 这个宝藏是一个神秘的地方，充满了奇迹和神秘的事物\n\nEnglish:"
         "Chinese: 你会发现自己对这些故事产生了共鸣\n\nEnglish:",
         "Chinese: RWKV-8 ROSA 机制：超越注意力机制的神经符号无限范围无损信息传播器，使大语言模型(LLM)能够发明自己的内心独白语言。迈向可扩展后神经方法的第一步，开启人工智能的新时代 \n\nEnglish:",
+        "Chinese: 兼容\n\nEnglish:",
     ],
     "max_tokens": 1024,
     "temperature": 1,
