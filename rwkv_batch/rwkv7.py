@@ -10,12 +10,11 @@ current_path = os.path.dirname(os.path.abspath(__file__))
 
 import torch
 torch.backends.cudnn.benchmark = True
-# torch.backends.cudnn.allow_tf32 = True
-# torch.backends.cuda.matmul.allow_tf32 = True
-torch.backends.cudnn.conv.fp32_precision = 'tf32'
-torch.backends.cuda.matmul.fp32_precision = 'ieee'
+torch.backends.cudnn.allow_tf32 = True
+torch.backends.cuda.matmul.allow_tf32 = True
+# torch.backends.cudnn.conv.fp32_precision = 'tf32'
+# torch.backends.cuda.matmul.fp32_precision = 'ieee'
 # torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = True
-# torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = True
 torch._C._jit_set_autocast_mode(False)
 
 import torch.nn as nn
