@@ -33,10 +33,11 @@ class ChatRequest(BaseModel):
     contents: list[str]               # 输入句子列表
     max_tokens: int = 50
     temperature: float = 1.0
+    noise: float = 1.5
     stream: bool = False
 
 
-def batch_generate(prompts, max_length=512, temperature=1.0):
+def batch_generate(prompts, max_length=512, noise=1.5 ,temperature=1.0):
     B = len(prompts)
     state = model.generate_zero_state(B)
     encoded_prompts = [tokenizer.encode(p) for p in prompts]
@@ -46,7 +47,7 @@ def batch_generate(prompts, max_length=512, temperature=1.0):
     generated_tokens = [[] for _ in range(B)]
 
     for step in range(max_length):
-        new_tokens = sampler_simple_batch(out, temp=temperature).tolist()
+        new_tokens = sampler_simple_batch(out, noise=noise, temp=temperature).tolist()
         out = model.forward_batch(new_tokens, state)
 
         for i in range(B):
@@ -69,7 +70,7 @@ def batch_generate(prompts, max_length=512, temperature=1.0):
         decoded.append(text)
     return decoded
 
-async def batch_infer_stream(prompts, max_length=512, temperature=1.0):
+async def batch_infer_stream(prompts, max_length=512, noise=1.5, temperature=1.0):
     B = len(prompts)
     state = model.generate_zero_state(B)
     encoded_prompts = [tokenizer.encode(p) for p in prompts]
@@ -81,7 +82,7 @@ async def batch_infer_stream(prompts, max_length=512, temperature=1.0):
 
     try:
         while not all(finished) and max_length > 0:
-            new_tokens = sampler_simple_batch(out, noise=0, temp=temperature).tolist()
+            new_tokens = sampler_simple_batch(out, noise=noise, temp=temperature).tolist()
             out = model.forward_batch(new_tokens, state)
             max_length -= 1
 
@@ -151,11 +152,11 @@ async def chat_completions(request):
 
     if req.stream:
         return StreamingResponse(
-            batch_infer_stream(prompts, req.max_tokens, req.temperature),
+            batch_infer_stream(prompts, req.max_tokens, req.noise, req.temperature),
             media_type="text/event-stream"
         )
 
-    results = batch_generate(prompts, req.max_tokens, req.temperature)
+    results = batch_generate(prompts, req.max_tokens, req.noise, req.temperature)
     choices = []
     for i, text in enumerate(results):
         choices.append({
@@ -224,7 +225,7 @@ async def batch_translate(request):
         max_tokens = 2048
         temperature = 1.0
 
-        translated_texts = batch_generate(prompts, max_length=max_tokens, temperature=temperature)
+        translated_texts = batch_generate(prompts, max_length=max_tokens, noise=0, temperature=temperature)
                 
         translations_result = []
         for i, translation in enumerate(translated_texts):
