@@ -10,15 +10,13 @@ from collections import deque
 np.set_printoptions(precision=4, suppress=True, linewidth=200)
 import types, torch, copy, time, random, json, math, gc
 from tqdm import tqdm
-from torch.nn import functional as F
-import flashinfer
 
 SEED = 42
 random.seed(SEED)
 np.random.seed(SEED)
 torch.manual_seed(SEED)
 torch.cuda.manual_seed(SEED)
-
+ROCm_Flag = torch.version.hip is not None
 ########################################################################################################
 
 args = types.SimpleNamespace()
@@ -41,7 +39,26 @@ from rwkv_batch.utils import TRIE_TOKENIZER, sampler_simple_batch, sampler_simpl
 tokenizer = TRIE_TOKENIZER("rwkv_batch/rwkv_vocab_v20230424.txt")
 
 ########################################################################################################
+def torch_top_k_top_p(logits, top_k, top_p):
+    if top_k > 0:
+        top_k = min(top_k, logits.size(-1)) 
+        indices_to_remove = logits < torch.topk(logits, top_k, dim=-1)[0][..., -1, None]
+        logits = logits.masked_fill(indices_to_remove, -float('Inf'))
 
+    if top_p < 1.0:
+        sorted_logits, sorted_indices = torch.sort(logits, descending=True, dim=-1)
+        cumulative_probs = torch.cumsum(torch.softmax(sorted_logits, dim=-1), dim=-1)
+        
+        sorted_indices_to_remove = cumulative_probs > top_p
+        sorted_indices_to_remove[..., :1] = False  
+        
+        indices_to_remove = sorted_indices_to_remove.scatter(dim=-1, index=sorted_indices, src=sorted_indices_to_remove)
+        logits = logits.masked_fill(indices_to_remove, -float('Inf'))
+    
+    probabilities = torch.softmax(logits, dim=-1)
+    sampled_tokens = torch.multinomial(probabilities, 1).squeeze(-1)
+    
+    return sampled_tokens
 
 # @profile
 def continuous_batching(
@@ -208,8 +225,12 @@ def continuous_batching(
 
         if temperature != 1.0:
             out /= temperature
-
-        new_tokens = flashinfer.sampling.top_k_top_p_sampling_from_logits(out, top_k, top_p)
+        # out [Batch, Vocab]
+        if ROCm_Flag:
+            new_tokens = torch_top_k_top_p(out, top_k, top_p)
+        else:
+            import flashinfer
+            new_tokens = flashinfer.sampling.top_k_top_p_sampling_from_logits(out, top_k, top_p)
         new_tokens = new_tokens.tolist()
         # torch.cuda.synchronize()
 
@@ -271,4 +292,5 @@ if __name__ == "__main__":
         ALPHA_DECAY,
     )
 
-    print(outputs[-1]["generated_text"])
+for i, output in enumerate(outputs):
+    print(f"Output {i}: {output['generated_text']}")
