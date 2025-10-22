@@ -2,7 +2,8 @@ import argparse
 import types
 import json
 import gc
-from robyn import Robyn, Response
+import asyncio
+from robyn import Robyn, Response, StreamingResponse
 from pydantic import BaseModel
 from rwkv_batch.rwkv7 import RWKV_x070
 from rwkv_batch.utils import TRIE_TOKENIZER, sampler_simple_batch
@@ -68,11 +69,91 @@ def batch_generate(prompts, max_length=512, temperature=1.0):
         decoded.append(text)
     return decoded
 
+async def batch_infer_stream(prompts, max_length=512, temperature=1.0):
+    B = len(prompts)
+    state = model.generate_zero_state(B)
+    encoded_prompts = [tokenizer.encode(p) for p in prompts]
+    out = model.forward_batch(encoded_prompts, state)
+
+    finished = [False] * B
+    generated_tokens = [[] for _ in range(B)]
+    token_buffers = [[] for _ in range(B)] 
+
+    try:
+        while not all(finished) and max_length > 0:
+            new_tokens = sampler_simple_batch(out, noise=0, temp=temperature).tolist()
+            out = model.forward_batch(new_tokens, state)
+            max_length -= 1
+
+            contents_to_send = [""] * B
+            
+            for i in range(B):
+                if finished[i]:
+                    continue
+                    
+                tok = new_tokens[i][0] if isinstance(new_tokens[i], list) else new_tokens[i]
+                
+                if tok == 0:
+                    finished[i] = True
+                    if token_buffers[i]:
+                        contents_to_send[i] = tokenizer.decode(token_buffers[i], utf8_errors="ignore")
+                        token_buffers[i].clear()
+                    continue
+                
+                token_buffers[i].append(tok)
+                generated_tokens[i].append(tok)
+                
+                if len(token_buffers[i]) >= 8:
+                    contents_to_send[i] = tokenizer.decode(token_buffers[i], utf8_errors="ignore")
+                    token_buffers[i].clear()
+            
+            if any(contents_to_send):
+                chunk = {
+                    "object": "chat.completion.chunk",
+                    "choices": [
+                        {"index": i, "delta": {"content": contents_to_send[i]}} 
+                        for i in range(B) if contents_to_send[i]
+                    ]
+                }
+                if chunk["choices"]:
+                    yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+            
+            await asyncio.sleep(0)
+        
+        remaining_contents = [""] * B
+        for i in range(B):
+            if token_buffers[i]:
+                remaining_contents[i] = tokenizer.decode(token_buffers[i], utf8_errors="ignore")
+                token_buffers[i].clear()
+        
+        if any(remaining_contents):
+            chunk = {
+                "object": "chat.completion.chunk",
+                "choices": [
+                    {"index": i, "delta": {"content": remaining_contents[i]}}
+                    for i in range(B) if remaining_contents[i]
+                ]
+            }
+            if chunk["choices"]:
+                yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+                
+    finally:
+        del state
+        gc.collect()
+
+    yield "data: [DONE]\n\n"
+
 @app.post("/v1/chat/completions")
 async def chat_completions(request):
     body = json.loads(request.body)
     req = ChatRequest(**body)
     prompts = req.contents
+
+    if req.stream:
+        return StreamingResponse(
+            batch_infer_stream(prompts, req.max_tokens, req.temperature),
+            media_type="text/event-stream"
+        )
 
     results = batch_generate(prompts, req.max_tokens, req.temperature)
     choices = []
