@@ -2,7 +2,8 @@ import requests
 import json
 import curses
 
-url = "http://localhost:8000/v1/chat/completions"
+url = "http://localhost:8000/v2/chat/completions"
+# url = "http://localhost:8000/v1/chat/completions"
 
 payload = {
     "contents": [
@@ -29,10 +30,19 @@ payload = {
         "Chinese: 兼容\n\nEnglish:",
     ],
     "max_tokens": 1024,
-    "temperature": 1,
-    "stream": True,
-    "noise": 0,
     "stop_tokens": [0, 261, 24281],
+    "temperature": 1.0,
+    "top_k": 1,
+    "top_p": 0.3,
+    "noise": 1.5,
+    "stream": False,
+    "pad_zero": True,
+    "alpha_presence": 0.5,
+    "alpha_frequency":  0.5,
+    "alpha_decay": 0.996,
+    "enable_think": False,
+    "chunk_size": 32,
+    "stream": True
 }
 
 def display_stream(stdscr):
