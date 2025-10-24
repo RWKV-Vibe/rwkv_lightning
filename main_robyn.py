@@ -32,12 +32,18 @@ class ChatRequest(BaseModel):
     model: str = "rwkv7"
     contents: list[str]               # 输入句子列表
     max_tokens: int = 50
+    stop_tokens: list[int] = [0, 261, 24281]
     temperature: float = 1.0
     noise: float = 1.5
     stream: bool = False
+    pad_zero:bool = True
+    alpha_presence: float = 0.5
+    alpha_frequency: float = 0.5
+    alpha_decay: float = 0.996
+    enable_think: bool = False
 
 
-def batch_generate(prompts, max_length=512, noise=1.5 ,temperature=1.0):
+def batch_generate(prompts, max_length=512, noise=1.5 ,temperature=1.0, stop_tokens=[0, 261, 24281]):
     B = len(prompts)
     state = model.generate_zero_state(B)
     encoded_prompts = [tokenizer.encode(p) for p in prompts]
@@ -54,7 +60,7 @@ def batch_generate(prompts, max_length=512, noise=1.5 ,temperature=1.0):
             tok = new_tokens[i][0] if isinstance(new_tokens[i], list) else new_tokens[i]
             if finished[i]:
                 continue
-            if tok == 0 or tok == 261:
+            if tok in stop_tokens:
                 finished[i] = True
                 continue
             generated_tokens[i].append(tok)
@@ -70,7 +76,7 @@ def batch_generate(prompts, max_length=512, noise=1.5 ,temperature=1.0):
         decoded.append(text)
     return decoded
 
-async def batch_infer_stream(prompts, max_length=512, noise=1.5, temperature=1.0):
+async def batch_infer_stream(prompts, max_length=512, noise=1.5, temperature=1.0, stop_tokens=[0, 261, 24281]):
     B = len(prompts)
     state = model.generate_zero_state(B)
     encoded_prompts = [tokenizer.encode(p) for p in prompts]
@@ -94,7 +100,7 @@ async def batch_infer_stream(prompts, max_length=512, noise=1.5, temperature=1.0
                     
                 tok = new_tokens[i][0] if isinstance(new_tokens[i], list) else new_tokens[i]
                 
-                if tok == 0:
+                if tok in stop_tokens:
                     finished[i] = True
                     if token_buffers[i]:
                         contents_to_send[i] = tokenizer.decode(token_buffers[i], utf8_errors="ignore")
@@ -104,7 +110,7 @@ async def batch_infer_stream(prompts, max_length=512, noise=1.5, temperature=1.0
                 token_buffers[i].append(tok)
                 generated_tokens[i].append(tok)
                 
-                if len(token_buffers[i]) >= 8:
+                if len(token_buffers[i]) >= 32:
                     contents_to_send[i] = tokenizer.decode(token_buffers[i], utf8_errors="ignore")
                     token_buffers[i].clear()
             
@@ -152,11 +158,11 @@ async def chat_completions(request):
 
     if req.stream:
         return StreamingResponse(
-            batch_infer_stream(prompts, req.max_tokens, req.noise, req.temperature),
+            batch_infer_stream(prompts, req.max_tokens, req.noise, req.temperature, req.stop_tokens),
             media_type="text/event-stream"
         )
 
-    results = batch_generate(prompts, req.max_tokens, req.noise, req.temperature)
+    results = batch_generate(prompts, req.max_tokens, req.noise, req.temperature, req.stop_tokens)
     choices = []
     for i, text in enumerate(results):
         choices.append({

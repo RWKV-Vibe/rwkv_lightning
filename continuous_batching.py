@@ -8,7 +8,7 @@ import numpy as np
 from collections import deque
 
 np.set_printoptions(precision=4, suppress=True, linewidth=200)
-import types, torch, copy, time, random, json, math, gc
+import types, torch, random
 from tqdm import tqdm
 
 SEED = 42
@@ -26,7 +26,7 @@ args.head_size = 64
 # model download: https://huggingface.co/BlinkDL/rwkv7-g1
 
 # args.MODEL_NAME = "../models/rwkv7-g0a-7.2b-20250829-ctx4096"
-args.MODEL_NAME = "/home/alic-li/ComfyUI/models/RWKV/RWKV_v7_G1a_0.4B_Translate_ctx4096_20250915_latest"
+args.MODEL_NAME = "/mnt/64F412C7F4129AFE/rwkv7-g0a-7.2b-20250829-ctx4096"
 
 print(f"\nUsing CUDA fp16. Loading {args.MODEL_NAME} ...\n")
 
@@ -266,7 +266,7 @@ if __name__ == "__main__":
     inputs = [f"User: 为什么 {i} 是一个有趣的数字?\n\nAssistant:" for i in range(256)]
     TEMPERATURE = 0.3
     STOP_TOKENS = [0, 261, 24281]
-    MAX_GENERATE_TOKENS = 4096
+    MAX_GENERATE_TOKENS = 32
     BATCH_SIZE = 128
     TOP_K = 1
     TOP_P = 0.3

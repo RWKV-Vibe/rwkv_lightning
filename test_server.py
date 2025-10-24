@@ -30,7 +30,9 @@ payload = {
     ],
     "max_tokens": 1024,
     "temperature": 1,
-    "stream": True
+    "stream": True,
+    "noise": 0,
+    "stop_tokens": [0, 261, 24281],
 }
 
 def display_stream(stdscr):
