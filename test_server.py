@@ -35,7 +35,6 @@ payload = {
     "top_k": 1,
     "top_p": 0.3,
     "noise": 1.5,
-    "stream": False,
     "pad_zero": True,
     "alpha_presence": 0.5,
     "alpha_frequency":  0.5,
