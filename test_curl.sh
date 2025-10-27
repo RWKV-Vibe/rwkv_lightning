@@ -1,5 +1,25 @@
 #!/bin/bash
 
+# 批量翻译
+curl -X POST http://localhost:8000/translate/v1/batch-translate \
+         -H "Content-Type: application/json" \
+         -d '{
+           "source_lang": "en",
+           "target_lang": "zh-CN",
+           "text_list": ["Hello world!", "Good morning"]
+         }'
+echo -e "\n\n========================================\n\n"
+
+curl -X POST http://localhost:8000/translate/v1/batch-translate \
+         -H "Content-Type: application/json" \
+         -d '{
+           "source_lang": "zh-CN",
+           "target_lang": "en",
+           "text_list": ["你好世界", "早上好"],"temperature": 0.7,
+       "max_tokens": 1024
+         }'
+echo -e "\n\n========================================\n\n"
+
 # 非流式同步并发请求，并发请求，只能调整noise参数和temperature参数，速度最快
 curl -X POST http://localhost:8000/v1/chat/completions \
   -H "Content-Type: application/json" \
