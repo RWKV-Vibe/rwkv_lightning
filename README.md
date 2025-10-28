@@ -1,16 +1,23 @@
 # rwkv_lightning 🕊️ ⚡
 RWKV Batch infer backend Base on [Albatross](https://github.com/BlinkDL/Albatross) 🕊️ and [Robyn](https://github.com/sparckles/Robyn) 🦀 
+
+
 ## Usage
 ```bash
 python main_robyn.py --model-path <your model path> --port <your port number>
 ```
+
+
 ## Test API quickly
 ```bash
 bash ./test_curl.sh 
 ```
+
+
 ## API Docs 
 ### 1. Batch synchronous Translate 
 **Compatible with immersive translation custom API**
+**--- Very stable 🚀 ---** 
 ```bash
 curl -X POST http://localhost:8000/translate/v1/batch-translate \
          -H "Content-Type: application/json" \
@@ -29,7 +36,10 @@ curl -X POST http://localhost:8000/translate/v1/batch-translate \
            "text_list": ["你好世界", "早上好"]
          }'
 ```
+
+
 ### 2. ```v1/chat/completions``` [Fastest Speed But Only support noise temperature decode] 
+**--- Very stable 🚀 ---** 
 - Streaming synchronous batch processing 
 ```bash
 curl -X POST http://localhost:8000/v1/chat/completions \
@@ -62,7 +72,10 @@ curl -X POST http://localhost:8000/v1/chat/completions \
     "stream": true
   }'
 ```
+
+
 ### 3. ```v2/chat/completions``` [Little slower than V1 But Only support all decode parameters]
+**--- Very stable 🚀 ---** 
 - Streaming synchronous batch processing
 ```bash
 curl -X POST http://localhost:8000/v2/chat/completions \
@@ -108,18 +121,22 @@ curl -X POST http://localhost:8000/v2/chat/completions \
     "stream": false
   }'
 ```
+
+
 ### 4. ```v3/chat/completions``` [Little slower than V1 But Only support all decode parameters]
 
-**--- Under construction 🚧 🥲 ---** 
+**--- Under Test Verification, Not sure the stability & performance yet 🚧 🥲 ---** 
 - Streaming asynchronous batch processing
 ```bash
 curl -X POST http://localhost:8000/v3/chat/completions \
   -H "Content-Type: application/json" \
   -N \
   -d '{
-    "contents": [
-      "Chinese: RWKV-8 ROSA 机制：超越注意力机制的神经符号无限范围无损信息传播器，使大语言模型(LLM)能够发明自己的内心独白语言。迈向可扩展后神经方法的第一步，开启人工智能的新时代\n\nEnglish:",
-      "Chinese: 他的脸上写满了痛苦和绝望，你会发现自己对这些故事产生了共鸣\n\nEnglish:"
+    "messages": [
+      {
+        "role": "user",
+        "content": "What is the capital of France?"
+      }
     ],
     "max_tokens": 1024,
     "stop_tokens": [0, 261, 24281],
@@ -139,9 +156,11 @@ curl -X POST http://localhost:8000/v3/chat/completions \
 curl -X POST http://localhost:8000/v3/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
-    "contents": [
-      "Chinese: RWKV-8 ROSA 机制：超越注意力机制的神经符号无限范围无损信息传播器，使大语言模型(LLM)能够发明自己的内心独白语言。迈向可扩展后神经方法的第一步，开启人工智能的新时代\n\nEnglish:",
-      "Chinese: 他的脸上写满了痛苦和绝望，你会发现自己对这些故事产生了共鸣\n\nEnglish:"
+    "messages": [
+      {
+        "role": "user",
+        "content": "What is the capital of France?"
+      }
     ],
     "max_tokens": 1024,
     "stop_tokens": [0, 261, 24281],

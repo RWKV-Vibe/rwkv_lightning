@@ -752,8 +752,96 @@ async def continuous_batching(request):
             headers={"Content-Type": "application/json"}
         )
 
-# @app.post("/v3/chat/completions")
-# async def continuous_batching_chat(request):
+@app.post("/v3/chat/completions")
+async def v3_chat_completions(request):
+    try:
+        body = json.loads(request.body)
+        # 若传入 messages，则提取其中的 user 内容作为 contents
+        if "contents" not in body and "messages" in body:
+            msgs = body.get("messages") or []
+            # 提取所有 user 内容；若无，则取所有 content
+            user_texts = [m.get("content", "") for m in msgs if m.get("role") == "user"]
+            if not user_texts and msgs:
+                user_texts = [m.get("content", "") for m in msgs]
+            body = {**body, "contents": user_texts}
+
+        req = ChatRequest(**body)
+        prompts = req.contents
+        # 将输入问题转换为指定提示模板："User: 问题\n\nAssistant:"
+        prompts_formatted = [f"User: {q}\n\nAssistant:" for q in prompts]
+
+        if not prompts:
+            return Response(
+                status_code=400,
+                description=json.dumps({"error": "Empty prompts list"}),
+                headers={"Content-Type": "application/json"}
+            )
+
+        if req.stream:
+            return StreamingResponse(
+                continuous_batching_stream(model=model,
+                                           tokenizer=tokenizer,
+                                           inputs=prompts_formatted,
+                                           stop_tokens=req.stop_tokens,
+                                           max_generate_tokens=req.max_tokens,
+                                           batch_size=len(prompts),
+                                           pad_zero=req.pad_zero,
+                                           temperature=req.temperature,
+                                           top_k=req.top_k,
+                                           top_p=req.top_p,
+                                           alpha_presence=req.alpha_presence,
+                                           alpha_frequency=req.alpha_frequency,
+                                           alpha_decay=req.alpha_decay,
+                                           chunk_size=req.chunk_size),
+                media_type="text/event-stream"
+            )
+
+        results = _continuous_batching_sync(model=model,
+                                            tokenizer=tokenizer,
+                                            inputs=prompts_formatted,
+                                            stop_tokens=req.stop_tokens,
+                                            max_generate_tokens=req.max_tokens,
+                                            batch_size=len(prompts),
+                                            pad_zero=req.pad_zero,
+                                            temperature=req.temperature,
+                                            top_k=req.top_k,
+                                            top_p=req.top_p,
+                                            alpha_presence=req.alpha_presence,
+                                            alpha_frequency=req.alpha_frequency,
+                                            alpha_decay=req.alpha_decay)
+        choices = []
+        for i, text in enumerate(results):
+            choices.append({
+                "index": i,
+                "message": {"role": "assistant", "content": text},
+                "finish_reason": "stop",
+            })
+
+        response = {
+            "id": "rwkv7-batch-v3",
+            "object": "chat.completion",
+            "model": req.model,
+            "choices": choices,
+        }
+        return Response(
+            status_code=200,
+            description=json.dumps(response, ensure_ascii=False),
+            headers={"Content-Type": "application/json"}
+        )
+    except json.JSONDecodeError as e:
+        return Response(
+            status_code=400,
+            description=json.dumps({"error": f"Invalid JSON: {str(e)}"}),
+            headers={"Content-Type": "application/json"}
+        )
+    except Exception as e:
+        import traceback
+        print(f"[ERROR] /v3/chat/completions: {traceback.format_exc()}")
+        return Response(
+            status_code=500,
+            description=json.dumps({"error": str(e)}),
+            headers={"Content-Type": "application/json"}
+        )
 
 #=== RWKV-7 Batch Translate Server ===#
 
