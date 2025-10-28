@@ -7,7 +7,9 @@ RWKV Batch infer backend Base on [Albatross](https://github.com/BlinkDL/Albatros
 pip install torch robyn pydantic ninja numpy flashinfer-python
 ```
 **For AMD ROCm**
+
 (The Flashinfer-python is not transfer to the AMD ROCm officially yet, please wait for the official compatibility. I actually tried to transfer it, but the Flash Infer library is a bit abstract and huge. I use the Pytorch base top_k top_p decode to implement the Flash infer CUDA GPU decode kernel)
+
 **No problem! This could work too. It's not that it can't be used 🫣**
 ```bash
 pip3 install torch torchvision --index-url https://download.pytorch.org/whl/rocm6.4
