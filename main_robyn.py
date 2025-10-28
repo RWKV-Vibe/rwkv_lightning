@@ -381,6 +381,184 @@ def _continuous_batching_stream_sync(
         output_queue.put("EOF")  # 发送结束信号
 
 
+def _continuous_batching_sync(
+    model,
+    tokenizer,
+    inputs,
+    stop_tokens,
+    max_generate_tokens,
+    batch_size,
+    pad_zero=True,
+    temperature=1,
+    top_k=50,
+    top_p=0.3,
+    alpha_presence=0.5,
+    alpha_frequency=0.5,
+    alpha_decay=0.996,
+):
+    """
+    同步版本：执行模型推理，直接返回所有生成的结果
+    非流式输出，等待所有任务完成后一次性返回
+    """
+    STOP_TOKENS = stop_tokens
+    MAX_GENERATE_TOKENS = max_generate_tokens
+    BATCH_SIZE = batch_size
+    PAD_ZERO = pad_zero
+    
+    device = model.z["head.weight"].device
+    alpha_presence_val = torch.tensor(alpha_presence, dtype=torch.float32, device=device)
+    
+    if temperature == 0:
+        temperature = 1.0
+        top_k = 1
+    
+    # 准备输入
+    encoded_inputs = []
+    for prompt in inputs:
+        input_token = tokenizer.encode(prompt)
+        if PAD_ZERO:
+            input_token = [0] + input_token
+        encoded_inputs.append((prompt, input_token))
+    input_queue = deque(encoded_inputs)
+    
+    # 初始化状态
+    states = model.generate_zero_state(BATCH_SIZE)
+    task_pool = []
+    # 用于存储每个prompt的完整生成文本
+    results = {}
+    
+    prompt_idx = 0
+    for i in range(BATCH_SIZE):
+        prompt, input_token = input_queue.popleft()
+        task_pool.append({
+            "prompt_idx": prompt_idx,
+            "prompt": prompt,
+            "input_token": input_token,
+            "state_pos": i,
+            "generated_tokens": [],
+            "new_token": None,
+        })
+        prompt_idx += 1
+    
+    occurrence = torch.zeros((BATCH_SIZE, args.vocab_size), dtype=torch.float32, device=device)
+    no_penalty_token_ids = set([33, 10, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58])
+    alpha_presence_vector = torch.zeros((BATCH_SIZE, args.vocab_size), dtype=torch.float32, device=device)
+    
+    try:
+        while True:
+            accomplished_task_indices = []
+            state_slots_to_remove = set()
+            
+            # 检查任务状态
+            for task_idx, task in enumerate(task_pool):
+                if len(task["input_token"]) == 0:
+                    if task["new_token"] is None:
+                        continue
+                    
+                    new_token = task["new_token"]
+                    prompt_id = task["prompt_idx"]
+                    
+                    is_finished = (new_token in STOP_TOKENS or 
+                                 len(task["generated_tokens"]) >= MAX_GENERATE_TOKENS)
+                    
+                    if not is_finished:
+                        task["generated_tokens"].append(new_token)
+                    
+                    if is_finished:
+                        # 将生成的tokens解码为文本，存储到results中
+                        if task["generated_tokens"]:
+                            text = tokenizer.decode(task["generated_tokens"], utf8_errors="ignore")
+                            results[prompt_id] = text
+                        else:
+                            results[prompt_id] = ""
+                        
+                        if len(input_queue) > 0:
+                            prompt, input_token = input_queue.popleft()
+                            new_prompt_idx = prompt_idx
+                            task_pool[task_idx] = {
+                                "prompt_idx": new_prompt_idx,
+                                "prompt": prompt,
+                                "input_token": input_token,
+                                "state_pos": task["state_pos"],
+                                "generated_tokens": [],
+                                "new_token": None,
+                            }
+                            prompt_idx += 1
+                            
+                            state_pos = task["state_pos"]
+                            states[0][:, :, state_pos, :] = 0
+                            states[1][:, state_pos, :, :] = 0
+                            occurrence[state_pos, :] = 0
+                            alpha_presence_vector[state_pos, :] = 0
+                        else:
+                            accomplished_task_indices.append(task_idx)
+                            state_slots_to_remove.add(task["state_pos"])
+                    else:
+                        task["input_token"].append(new_token)
+                        www = 0.0 if new_token in no_penalty_token_ids else 1.0
+                        occurrence[task["state_pos"], new_token] += www
+                        alpha_presence_vector[task["state_pos"], new_token] = alpha_presence_val
+            
+            # 压缩状态张量
+            if accomplished_task_indices:
+                sorted_slots = sorted(list(state_slots_to_remove), reverse=True)
+                
+                for slot in sorted_slots:
+                    states[0] = torch.cat([states[0][:, :, :slot, :], states[0][:, :, slot+1:, :]], dim=2)
+                    states[1] = torch.cat([states[1][:, :slot, :, :], states[1][:, slot+1:, :, :]], dim=1)
+                    occurrence = torch.cat([occurrence[:slot, :], occurrence[slot+1:, :]], dim=0)
+                    alpha_presence_vector = torch.cat([alpha_presence_vector[:slot, :], 
+                                                       alpha_presence_vector[slot+1:, :]], dim=0)
+                
+                for task_idx in sorted(accomplished_task_indices, reverse=True):
+                    del task_pool[task_idx]
+                
+                remaining_slots = sorted([t["state_pos"] for t in task_pool])
+                pos_map = {old_pos: new_pos for new_pos, old_pos in enumerate(remaining_slots)}
+                for task in task_pool:
+                    task["state_pos"] = pos_map[task["state_pos"]]
+            
+            if len(task_pool) == 0:
+                break
+            
+            # 准备下一批tokens
+            current_batch_size = len(task_pool)
+            next_tokens = [None] * current_batch_size
+            for task in task_pool:
+                next_tokens[task["state_pos"]] = [task["input_token"].pop(0)]
+            
+            # 模型前向传播
+            out = model.forward_batch(next_tokens, states)
+            
+            # 应用惩罚和采样
+            occurrence *= alpha_decay
+            out -= alpha_presence_vector + occurrence * alpha_frequency
+            
+            if temperature != 1.0:
+                out /= temperature
+            
+            if ROCm_Flag:
+                new_tokens = torch_top_k_top_p(out, top_k, top_p)
+            else:
+                import flashinfer
+                new_tokens = flashinfer.sampling.top_k_top_p_sampling_from_logits(out, top_k, top_p)
+            
+            new_tokens = new_tokens.tolist()
+            
+            for task in task_pool:
+                state_pos = task["state_pos"]
+                task["new_token"] = new_tokens[state_pos]
+    
+    finally:
+        del states
+        del occurrence
+        del alpha_presence_vector
+        gc.collect()
+    
+    # 返回结果列表，按照输入顺序
+    return [results.get(i, "") for i in range(len(inputs))]
+
+
 async def continuous_batching_stream(
     model,
     tokenizer,
@@ -524,7 +702,19 @@ async def continuous_batching(request):
                 media_type="text/event-stream"
             )
 
-        results = batch_generate(prompts, req.max_tokens, req.noise, req.temperature, req.stop_tokens)
+        results = _continuous_batching_sync(model=model,
+                                            tokenizer=tokenizer,
+                                            inputs=prompts,
+                                            stop_tokens=req.stop_tokens,
+                                            max_generate_tokens=req.max_tokens,
+                                            batch_size=len(prompts),
+                                            pad_zero=req.pad_zero,
+                                            temperature=req.temperature,
+                                            top_k=req.top_k,
+                                            top_p=req.top_p,
+                                            alpha_presence=req.alpha_presence,
+                                            alpha_frequency=req.alpha_frequency,
+                                            alpha_decay=req.alpha_decay)
         choices = []
         for i, text in enumerate(results):
             choices.append({
