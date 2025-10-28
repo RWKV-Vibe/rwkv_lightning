@@ -2,7 +2,7 @@ import argparse
 import torch
 import types
 import json
-import gc
+import gc, re
 import asyncio
 from robyn import Robyn, Response, StreamingResponse
 from pydantic import BaseModel
@@ -23,7 +23,10 @@ print(f"\n[INFO] Loading RWKV-7 model from {args_cli.model_path}\n")
 args = types.SimpleNamespace()
 args.vocab_size = 65536
 args.head_size = 64
-args.MODEL_NAME = args_cli.model_path
+if args_cli.model_path.endswith(".pth"):
+    args.MODEL_NAME = re.sub(r'\.pth$', '', args_cli.model_path)
+else:
+    args.MODEL_NAME = args_cli.model_path
 
 model = RWKV_x070(args)
 tokenizer = TRIE_TOKENIZER("rwkv_batch/rwkv_vocab_v20230424.txt")
