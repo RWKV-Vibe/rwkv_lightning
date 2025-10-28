@@ -8,8 +8,9 @@ python main_robyn.py --model-path <your model path> --port <your port number>
 ```bash
 bash ./test_curl.sh 
 ```
-## API Docs
-1. Batch synchronous Translate 
+## API Docs 
+### 1. Batch synchronous Translate 
+**Compatible with immersive translation custom API**
 ```bash
 curl -X POST http://localhost:8000/translate/v1/batch-translate \
          -H "Content-Type: application/json" \
@@ -28,7 +29,7 @@ curl -X POST http://localhost:8000/translate/v1/batch-translate \
            "text_list": ["你好世界", "早上好"]
          }'
 ```
-2. ```v1/chat/completions``` [Fastest Speed But Only support noise temperature decode] 
+### 2. ```v1/chat/completions``` [Fastest Speed But Only support noise temperature decode] 
 - Streaming synchronous batch processing 
 ```bash
 curl -X POST http://localhost:8000/v1/chat/completions \
@@ -61,7 +62,7 @@ curl -X POST http://localhost:8000/v1/chat/completions \
     "stream": true
   }'
 ```
-2. ```v2/chat/completions``` [Little slower than V1 But Only support all decode parameters]
+### 3. ```v2/chat/completions``` [Little slower than V1 But Only support all decode parameters]
 - Streaming synchronous batch processing
 ```bash
 curl -X POST http://localhost:8000/v2/chat/completions \
@@ -107,7 +108,7 @@ curl -X POST http://localhost:8000/v2/chat/completions \
     "stream": false
   }'
 ```
-3. ```v3/chat/completions``` [Little slower than V1 But Only support all decode parameters]
+### 4. ```v3/chat/completions``` [Little slower than V1 But Only support all decode parameters]
 
 **--- Under construction 🚧 🥲 ---** 
 - Streaming asynchronous batch processing
