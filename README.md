@@ -111,7 +111,7 @@ curl -X POST http://localhost:8000/v2/chat/completions \
 3. ```v3/chat/completions``` [Little slower than V1 But Only support all decode parameters]
 
 **--- Under construction 🚧 🥲 ---** 
-- Streaming synchronous batch processing
+- Streaming asynchronous batch processing
 ```bash
 curl -X POST http://localhost:8000/v3/chat/completions \
   -H "Content-Type: application/json" \
@@ -134,7 +134,7 @@ curl -X POST http://localhost:8000/v3/chat/completions \
     "stream": true
   }'
 ```
-- Non-streaming synchronous batch processing
+- Non-streaming asynchronous batch processing
 ```bash
 curl -X POST http://localhost:8000/v3/chat/completions \
   -H "Content-Type: application/json" \
