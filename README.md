@@ -1,6 +1,5 @@
 # rwkv_lightning 🕊️ ⚡
-RWKV Batch infer backend ⚡Base on albatross [https://github.com/BlinkDL/Albatross]🕊️
-
+RWKV Batch infer backend Base on [Albatross](https://github.com/BlinkDL/Albatross) 🕊️ and [Robyn](https://github.com/sparckles/Robyn) 🦀 
 ## Usage
 ```bash
 python main_robyn.py --model-path <your model path> --port <your port number>
