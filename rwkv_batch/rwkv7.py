@@ -9,46 +9,50 @@ import os
 current_path = os.path.dirname(os.path.abspath(__file__))
 
 import torch
-torch.backends.cudnn.benchmark = True
-torch.backends.cudnn.allow_tf32 = True
-torch.backends.cuda.matmul.allow_tf32 = True
-# torch.backends.cudnn.conv.fp32_precision = 'tf32'
-# torch.backends.cuda.matmul.fp32_precision = 'ieee'
-# torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = True
+# torch.backends.cudnn.benchmark = True
+# torch.backends.cudnn.allow_tf32 = True
+# torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.conv.fp32_precision = 'tf32'
+torch.backends.cuda.matmul.fp32_precision = 'ieee'
+torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = True
 torch._C._jit_set_autocast_mode(False)
 
 import torch.nn as nn
 from torch.nn import functional as F
 
-MyModule = torch.jit.ScriptModule
-MyFunction = torch.jit.script_method
-MyStatic = torch.jit.script
-# MyModule = nn.Module
-# MyFunction = torch.compile(mode='max-autotune-no-cudagraphs')
-# MyStatic = torch.compile(mode='max-autotune-no-cudagraphs')
-# MyDisable = torch.compiler.disable
-def __nop(ob): return ob
+# MyModule = torch.jit.ScriptModule
+# MyFunction = torch.jit.script_method
+# MyStatic = torch.jit.script
+MyModule = nn.Module
+MyFunction = torch.compile(mode='max-autotune-no-cudagraphs')
+MyStatic = torch.compile(mode='max-autotune-no-cudagraphs')
+MyDisable = torch.compiler.disable
+# def __nop(ob): return ob
 # MyFunction = __nop
 # MyStatic = __nop
-MyDisable = __nop
+# MyDisable = __nop
 
 DTYPE = torch.half
-
+ROCm_flag = torch.version.hip is not None
 ############################################### gems ###################################################
-# os.environ['USE_C_EXTENSION'] = '1'
-# # os.environ['FLAGGEMS_SOURCE_DIR'] = '/home/xujiahao/rwkv/gems/FlagGems/src/flag_gems'
-# os.environ['FLAGGEMS_SOURCE_DIR'] = os.path.abspath(os.path.join(current_path, "../gems/FlagGems/src/flag_gems"))
-# import flag_gems
-
+if ROCm_flag == False:
+    try:
+        import flag_gems # type: ignore
+        import torch.ops.flag_gems.rwkv_mm_sparsity as rwkv_mm_sparsity # type: ignore
+    except:
+        print("flag_gems is not installed. Using triton kernel directly instead.")
+        from .rwkv_mm_op_triton import rwkv_mm_sparsity
+else:
+    from .rwkv_mm_op_triton import rwkv_mm_sparsity
 
 ########################################################################################################
 
 from torch.utils.cpp_extension import load
 HEAD_SIZE = 64
-ROCm_flag = torch.version.hip is not None
+
 if ROCm_flag == True:
     load(name="rwkv7_state_fwd_fp16", sources=[f"{current_path}/hip/rwkv7_state_fwd_fp16_op.hip", f"{current_path}/hip/rwkv7_state_fwd_fp16.hip"], is_python_module=False,
-                    verbose=True, extra_cuda_cflags=['-fopenmp', '-ffast-math', '-O3', '--offload-arch=gfx1030','-munsafe-fp-atomics', f"-D_N_={HEAD_SIZE}"])
+                    verbose=True, extra_cuda_cflags=['-fopenmp', '-ffast-math', '-O3', '-munsafe-fp-atomics', f"-D_N_={HEAD_SIZE}"])
 else:
     load(name="rwkv7_state_fwd_fp16", sources=[f"{current_path}/cuda/rwkv7_state_fwd_fp16.cpp", f"{current_path}/cuda/rwkv7_state_fwd_fp16.cu"], is_python_module=False,
                     verbose=True, extra_cuda_cflags=["-res-usage", "--use_fast_math", "-O3", "--extra-device-vectorization", f"-D_N_={HEAD_SIZE}"] + (["-Xptxas -O3"] if os.name != "nt" else []))
@@ -141,9 +145,9 @@ class RWKV_x070(MyModule):
         self.n_layer, self.n_embd = args.n_layer, args.n_embd
 
         z['emb.weight'] = F.layer_norm(z['emb.weight'], (args.n_embd,), weight=z['blocks.0.ln0.weight'], bias=z['blocks.0.ln0.bias'])
-        z['blocks.0.att.v0'] = z['blocks.0.att.a0'] # actually ignored
-        z['blocks.0.att.v1'] = z['blocks.0.att.a1'] # actually ignored
-        z['blocks.0.att.v2'] = z['blocks.0.att.a2'] # actually ignored
+        z['blocks.0.att.v0'] = z['blocks.0.att.a0'].clone()
+        z['blocks.0.att.v1'] = z['blocks.0.att.a1'].clone()
+        z['blocks.0.att.v2'] = z['blocks.0.att.a2'].clone()
 
     def generate_zero_state(self, bsz):
         args = self.args
@@ -387,7 +391,13 @@ def RWKV_x070_TMix_seq_batch(layer_id: int, H:int, N:int, x, x_prev, v_first, st
     else: v = v + (v_first - v) * torch.sigmoid(v0 + (xv @ v1) @ v2)
 
     w += w0
-    xx = RWKV7_BATCH_OP(state, r, w, k, v, -kk, kka, elapsed_t)
+    # if T == 1:
+    #     vk = v.view(B,H,N,1) @ k.view(B,H,1,N)
+    #     ab = (-kk).view(B,H,N,1) @ (kk*a).view(B,H,1,N)
+    #     state = state * w.view(B,H,1,N) + state @ ab + vk
+    #     xx = (state.to(dtype=x.dtype) @ r.view(B,H,N,1)).view(B*T,H*N)
+    # else:
+    xx = RWKV7_BATCH_OP(state, r, w, k, v, -kk, kka, elapsed_t).view(B*T,H*N)
 
     xx = F.group_norm(xx.view(B*T,H*N), num_groups=H, weight=ln_w, bias=ln_b, eps = 64e-5).view(B,T,H*N)
     xx = xx + ((r * k * r_k).view(B,T,H,N).sum(dim=-1, keepdim=True) * v.view(B,T,H,N)).view(B,T,H*N)
@@ -401,8 +411,8 @@ def RWKV_x070_CMix_one(x, x_prev, x_k, K_, V_):
     x_prev[1] = x
     k = x + xx * x_k
     k = torch.relu(k @ K_) ** 2
-    kv = k @ V_
-    # kv = torch.ops.flag_gems.rwkv_mm_sparsity(k, V_)
+    # kv = k @ V_
+    kv = rwkv_mm_sparsity(k, V_)
     return kv
 
 @MyStatic
