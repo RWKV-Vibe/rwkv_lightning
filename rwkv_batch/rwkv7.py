@@ -9,12 +9,15 @@ import os
 current_path = os.path.dirname(os.path.abspath(__file__))
 
 import torch
-# torch.backends.cudnn.benchmark = True
-# torch.backends.cudnn.allow_tf32 = True
-# torch.backends.cuda.matmul.allow_tf32 = True
-torch.backends.cudnn.conv.fp32_precision = 'tf32'
-torch.backends.cuda.matmul.fp32_precision = 'ieee'
-torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = True
+import torch.library
+from torch.library import register_fake
+torch.set_grad_enabled(False)
+torch.backends.cudnn.benchmark = True
+torch.backends.cudnn.allow_tf32 = True
+torch.backends.cuda.matmul.allow_tf32 = True
+
+# torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = True
+# torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = True
 torch._C._jit_set_autocast_mode(False)
 
 import torch.nn as nn
@@ -57,6 +60,23 @@ else:
     load(name="rwkv7_state_fwd_fp16", sources=[f"{current_path}/cuda/rwkv7_state_fwd_fp16.cpp", f"{current_path}/cuda/rwkv7_state_fwd_fp16.cu"], is_python_module=False,
                     verbose=True, extra_cuda_cflags=["-res-usage", "--use_fast_math", "-O3", "--extra-device-vectorization", f"-D_N_={HEAD_SIZE}"] + (["-Xptxas -O3"] if os.name != "nt" else []))
 
+class SPMV(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, vec, mat):
+        D, C = mat.size()
+        out = torch.zeros((C,), device=vec.device, dtype=DTYPE, requires_grad=False)
+        torch.ops.rwkv7_state_fwd_fp16.spmv_forward(D, C, vec, mat, out)
+        return out
+
+@torch.library.custom_op("mylib::SPMV_OP", mutates_args=())
+# @MyDisable
+def SPMV_OP(vec:torch.Tensor, mat:torch.Tensor) -> torch.Tensor:
+    return SPMV.apply(vec, mat)
+@SPMV_OP.register_fake
+def _(vec:torch.Tensor, mat:torch.Tensor) -> torch.Tensor:
+    D, C = mat.size()
+    return torch.zeros((C,), device=vec.device, dtype=DTYPE, requires_grad=False)
+
 class WKV_7_ONE(torch.autograd.Function):
     @staticmethod
     def forward(ctx, state, r, w, k, v, a, b, elapsed_t):
@@ -66,9 +86,14 @@ class WKV_7_ONE(torch.autograd.Function):
             y = torch.empty((C,), device=k.device, dtype=DTYPE, requires_grad=False, memory_format=torch.contiguous_format)
             torch.ops.rwkv7_state_fwd_fp16.forward_one(1, C, H, state, r, w, k, v, a, b, y, elapsed_t)
             return y
-@MyDisable
-def RWKV7_ONE_OP(state, r, w, k, v, a, b, elapsed_t):
+
+@torch.library.custom_op("mylib::RWKV7_ONE_OP", mutates_args=())
+# @MyDisable
+def RWKV7_ONE_OP(state:torch.Tensor, r:torch.Tensor, w:torch.Tensor, k:torch.Tensor, v:torch.Tensor, a:torch.Tensor, b:torch.Tensor, elapsed_t:torch.Tensor) -> torch.Tensor:
     return WKV_7_ONE.apply(state, r, w, k, v, a, b, elapsed_t)
+@RWKV7_ONE_OP.register_fake
+def _(state:torch.Tensor, r:torch.Tensor, w:torch.Tensor, k:torch.Tensor, v:torch.Tensor, a:torch.Tensor, b:torch.Tensor, elapsed_t:torch.Tensor) -> torch.Tensor:
+    return torch.empty_like(r)
 
 class WKV_7_SEQ(torch.autograd.Function):
     @staticmethod
@@ -80,10 +105,13 @@ class WKV_7_SEQ(torch.autograd.Function):
             torch.ops.rwkv7_state_fwd_fp16.forward_seq(1, T, C, H, state, r, w, k, v, a, b, y, elapsed_t)
             return y
 
-@MyDisable
-def RWKV7_SEQ_OP(state, r, w, k, v, a, b, elapsed_t):
+@torch.library.custom_op("mylib::RWKV7_SEQ_OP", mutates_args=())
+# @MyDisable
+def RWKV7_SEQ_OP(state:torch.Tensor, r:torch.Tensor, w:torch.Tensor, k:torch.Tensor, v:torch.Tensor, a:torch.Tensor, b:torch.Tensor, elapsed_t:torch.Tensor) -> torch.Tensor:
     return WKV_7_SEQ.apply(state, r, w, k, v, a, b, elapsed_t)
-
+@RWKV7_SEQ_OP.register_fake
+def _(state:torch.Tensor, r:torch.Tensor, w:torch.Tensor, k:torch.Tensor, v:torch.Tensor, a:torch.Tensor, b:torch.Tensor, elapsed_t:torch.Tensor) -> torch.Tensor:
+    return torch.empty_like(r)
 
 class WKV_7_BATCH(torch.autograd.Function):
     @staticmethod
@@ -94,9 +122,15 @@ class WKV_7_BATCH(torch.autograd.Function):
             y = torch.empty((B, C), device=k.device, dtype=DTYPE, requires_grad=False, memory_format=torch.contiguous_format)
             torch.ops.rwkv7_state_fwd_fp16.forward_one(B, C, H, state, r, w, k, v, a, b, y, elapsed_t)
             return y
-@MyDisable
-def RWKV7_ONE_BATCH_OP(state, r, w, k, v, a, b, elapsed_t):
+
+@torch.library.custom_op("mylib::RWKV7_ONE_BATCH_OP", mutates_args=())
+# @MyDisable
+def RWKV7_ONE_BATCH_OP(state:torch.Tensor, r:torch.Tensor, w:torch.Tensor, k:torch.Tensor, v:torch.Tensor, a:torch.Tensor, b:torch.Tensor, elapsed_t:torch.Tensor) -> torch.Tensor:
     return WKV_7_BATCH.apply(state, r, w, k, v, a, b, elapsed_t)
+@RWKV7_ONE_BATCH_OP.register_fake
+def _(state:torch.Tensor, r:torch.Tensor, w:torch.Tensor, k:torch.Tensor, v:torch.Tensor, a:torch.Tensor, b:torch.Tensor, elapsed_t:torch.Tensor) -> torch.Tensor:
+    return torch.empty_like(r)
+
 
 class WKV_7_SEQ_BATCH(torch.autograd.Function):
     @staticmethod
@@ -108,9 +142,13 @@ class WKV_7_SEQ_BATCH(torch.autograd.Function):
             torch.ops.rwkv7_state_fwd_fp16.forward_seq(B, T, C, H, state, r, w, k, v, a, b, y, elapsed_t)
             return y
 
-@MyDisable
-def RWKV7_BATCH_OP(state, r, w, k, v, a, b, elapsed_t):
+@torch.library.custom_op("mylib::RWKV7_BATCH_OP", mutates_args=())
+# @MyDisable
+def RWKV7_BATCH_OP(state:torch.Tensor, r:torch.Tensor, w:torch.Tensor, k:torch.Tensor, v:torch.Tensor, a:torch.Tensor, b:torch.Tensor, elapsed_t:torch.Tensor) -> torch.Tensor:
     return WKV_7_SEQ_BATCH.apply(state, r, w, k, v, a, b, elapsed_t)
+@RWKV7_BATCH_OP.register_fake
+def _(state:torch.Tensor, r:torch.Tensor, w:torch.Tensor, k:torch.Tensor, v:torch.Tensor, a:torch.Tensor, b:torch.Tensor, elapsed_t:torch.Tensor) -> torch.Tensor:
+    return torch.empty_like(r)
 
 ########################################################################################################
 
@@ -132,12 +170,14 @@ class RWKV_x070(MyModule):
         keys = list(z.keys())
         max_layer = -1
         for k in keys:
-            if 'key.weight' in k or 'value.weight' in k or 'receptance.weight' in k or 'output.weight' in k or 'head.weight' in k:
+            kk = k.split('.')
+            # if kk[0] == 'blocks' and int(kk[1]) >= 10:
+            #     continue
+            if 'att.g1' in k or 'att.g2' in k or 'att.a1' in k or 'att.a2' in k or 'att.w1' in k or 'att.w2' in k or 'att.v1' in k or 'att.v2' in k or 'ffn.value.weight' in k:
                 z[k] = z[k].t()
             z[k] = z[k].squeeze().to(dtype=DTYPE, device="cuda")
             if k.endswith('att.r_k'): z[k] = z[k].flatten()
             z[k] = z[k].contiguous()
-            kk = k.split('.')
             if kk[0] == 'blocks':
                 max_layer = max(max_layer, int(kk[1]))
         args.n_layer = max_layer + 1
@@ -145,9 +185,9 @@ class RWKV_x070(MyModule):
         self.n_layer, self.n_embd = args.n_layer, args.n_embd
 
         z['emb.weight'] = F.layer_norm(z['emb.weight'], (args.n_embd,), weight=z['blocks.0.ln0.weight'], bias=z['blocks.0.ln0.bias'])
-        z['blocks.0.att.v0'] = z['blocks.0.att.a0'].clone()
-        z['blocks.0.att.v1'] = z['blocks.0.att.a1'].clone()
-        z['blocks.0.att.v2'] = z['blocks.0.att.a2'].clone()
+        z['blocks.0.att.v0'] = z['blocks.0.att.a0'] # actually ignored
+        z['blocks.0.att.v1'] = z['blocks.0.att.a1'] # actually ignored
+        z['blocks.0.att.v2'] = z['blocks.0.att.a2'] # actually ignored
 
     def generate_zero_state(self, bsz):
         args = self.args
@@ -239,7 +279,7 @@ class RWKV_x070(MyModule):
                 x = x + xx
             
             x = F.layer_norm(x, (self.n_embd,), weight=z['ln_out.weight'], bias=z['ln_out.bias'])
-            x = x @ z['head.weight']
+            x = F.linear(x, z['head.weight'])
             state[2] += 1
             return x
         
@@ -272,7 +312,7 @@ class RWKV_x070(MyModule):
             
             if not full_output: x = x[-1,:]
             x = F.layer_norm(x, (self.n_embd,), weight=z['ln_out.weight'], bias=z['ln_out.bias'])
-            x = x @ z['head.weight']
+            x = F.linear(x, z['head.weight'])
             state[2] += len(idx)
             return x
         
@@ -305,7 +345,7 @@ class RWKV_x070(MyModule):
             
             if not full_output: x = x[:,-1,:]
             x = F.layer_norm(x, (self.n_embd,), weight=z['ln_out.weight'], bias=z['ln_out.bias'])
-            x = x @ z['head.weight']
+            x = F.linear(x, z['head.weight'])
             state[2] += len(idxs[0])
             return x
 
@@ -317,27 +357,24 @@ def RWKV_x070_TMix_one(layer_id: int, H:int, N:int, x, x_prev, v_first, state, x
     x_prev[0] = x
     xr, xw, xk, xv, xa, xg = x+xx*x_r, x+xx*x_w, x+xx*x_k, x+xx*x_v, x+xx*x_a, x+xx*x_g
 
-    r = xr @ R_
-    w = torch.tanh(xw @ w1) @ w2
-    k = xk @ K_
-    v = xv @ V_
-    a = torch.sigmoid(a0 + (xa @ a1) @ a2)
-    g = torch.sigmoid(xg @ g1) @ g2
+    r = F.linear(xr, R_)
+    w = F.linear(torch.tanh(F.linear(xw, w1)), w2, bias=w0)
+    k = F.linear(xk, K_)
+    v = F.linear(xv, V_)
+    a = torch.sigmoid(F.linear(F.linear(xa, a1), a2, bias=a0))
+    g = F.linear(torch.sigmoid(F.linear(xg, g1)), g2)
     kk = F.normalize((k * k_k).view(H,N), dim=-1, p=2.0).view(H*N)
     k = k * (1 + (a-1) * k_a)
     kka = kk * a
 
-    # k, kk, kka = torch.ops.flag_gems.rwkv_ka_fusion(k, k_k, a, k_a, H, N)
-
     if layer_id == 0: v_first = v
-    else: v = v + (v_first - v) * torch.sigmoid(v0 + (xv @ v1) @ v2)
+    else: v = v + (v_first - v) * torch.sigmoid(F.linear(F.linear(xv, v1), v2, bias=v0))
 
-    w += w0
     xx = RWKV7_ONE_OP(state, r, w, k, v, -kk, kka, elapsed_t) # !!! using CUDA to modify state in-place !!! (faster too)
 
     xx = F.group_norm(xx.view(1,H*N), num_groups=H, weight=ln_w, bias=ln_b, eps = 64e-5).view(H*N)    
     xx = xx + ((r * k * r_k).view(H,N).sum(dim=-1, keepdim=True) * v.view(H,N)).view(H*N)
-    return (xx * g) @ O_, v_first
+    return F.linear((xx * g), O_), v_first
 
 @MyStatic
 def RWKV_x070_TMix_seq(layer_id: int, H:int, N:int, x, x_prev, v_first, state, x_r, x_w, x_k, x_v, x_a, x_g, w0, w1, w2, a0, a1, a2, v0, v1, v2, g1, g2, k_k, k_a, r_k, R_, K_, V_, O_, ln_w, ln_b, elapsed_t):
@@ -346,28 +383,24 @@ def RWKV_x070_TMix_seq(layer_id: int, H:int, N:int, x, x_prev, v_first, state, x
     x_prev[0] = x[-1,:]
     xr, xw, xk, xv, xa, xg = x+xx*x_r, x+xx*x_w, x+xx*x_k, x+xx*x_v, x+xx*x_a, x+xx*x_g
 
-    r = xr @ R_
-    w = torch.tanh(xw @ w1) @ w2
-    k = xk @ K_
-    v = xv @ V_
-    a = torch.sigmoid(a0 + (xa @ a1) @ a2)
-    g = torch.sigmoid(xg @ g1) @ g2
-
+    r = F.linear(xr, R_)
+    w = F.linear(torch.tanh(F.linear(xw, w1)), w2, bias=w0)
+    k = F.linear(xk, K_)
+    v = F.linear(xv, V_)
+    a = torch.sigmoid(F.linear(F.linear(xa, a1), a2, bias=a0))
+    g = F.linear(torch.sigmoid(F.linear(xg, g1)), g2)
     kk = F.normalize((k * k_k).view(T,H,N), dim=-1, p=2.0).view(T,H*N)
     k = k * (1 + (a-1) * k_a)
     kka = kk * a
 
-    # k, kk, kka = torch.ops.flag_gems.rwkv_ka_fusion(k, k_k, a, k_a, H, N)
-
     if layer_id == 0: v_first = v
-    else: v = v + (v_first - v) * torch.sigmoid(v0 + (xv @ v1) @ v2)
+    else: v = v + (v_first - v) * torch.sigmoid(F.linear(F.linear(xv, v1), v2, bias=v0))
 
-    w += w0
     xx = RWKV7_SEQ_OP(state, r, w, k, v, -kk, kka, elapsed_t)
 
     xx = F.group_norm(xx.view(T,H*N), num_groups=H, weight=ln_w, bias=ln_b, eps = 64e-5).view(T,H*N)
     xx = xx + ((r * k * r_k).view(T,H,N).sum(dim=-1, keepdim=True) * v.view(T,H,N)).view(T,H*N)
-    return (xx * g) @ O_, v_first
+    return F.linear((xx * g), O_), v_first
 
 @MyStatic
 def RWKV_x070_TMix_seq_batch(layer_id: int, H:int, N:int, x, x_prev, v_first, state, x_r, x_w, x_k, x_v, x_a, x_g, w0, w1, w2, a0, a1, a2, v0, v1, v2, g1, g2, k_k, k_a, r_k, R_, K_, V_, O_, ln_w, ln_b, elapsed_t):
@@ -376,21 +409,20 @@ def RWKV_x070_TMix_seq_batch(layer_id: int, H:int, N:int, x, x_prev, v_first, st
     x_prev[0] = x[:,-1,:]
     xr, xw, xk, xv, xa, xg = x+xx*x_r, x+xx*x_w, x+xx*x_k, x+xx*x_v, x+xx*x_a, x+xx*x_g
 
-    r = xr @ R_
-    w = torch.tanh(xw @ w1) @ w2
-    k = xk @ K_
-    v = xv @ V_
-    a = torch.sigmoid(a0 + (xa @ a1) @ a2)
-    g = torch.sigmoid(xg @ g1) @ g2
+    r = F.linear(xr, R_)
+    w = F.linear(torch.tanh(F.linear(xw, w1)), w2, bias=w0)
+    k = F.linear(xk, K_)
+    v = F.linear(xv, V_)
+    a = torch.sigmoid(F.linear(F.linear(xa, a1), a2, bias=a0))
+    g = F.linear(torch.sigmoid(F.linear(xg, g1)), g2)
 
     kk = F.normalize((k * k_k).view(B,T,H,N), dim=-1, p=2.0).view(B,T,H*N)
     k = k * (1 + (a-1) * k_a)
     kka = kk * a
 
     if layer_id == 0: v_first = v
-    else: v = v + (v_first - v) * torch.sigmoid(v0 + (xv @ v1) @ v2)
+    else: v = v + (v_first - v) * torch.sigmoid(F.linear(F.linear(xv, v1), v2, bias=v0))
 
-    w += w0
     # if T == 1:
     #     vk = v.view(B,H,N,1) @ k.view(B,H,1,N)
     #     ab = (-kk).view(B,H,N,1) @ (kk*a).view(B,H,1,N)
@@ -401,7 +433,7 @@ def RWKV_x070_TMix_seq_batch(layer_id: int, H:int, N:int, x, x_prev, v_first, st
 
     xx = F.group_norm(xx.view(B*T,H*N), num_groups=H, weight=ln_w, bias=ln_b, eps = 64e-5).view(B,T,H*N)
     xx = xx + ((r * k * r_k).view(B,T,H,N).sum(dim=-1, keepdim=True) * v.view(B,T,H,N)).view(B,T,H*N)
-    return (xx * g) @ O_, v_first
+    return F.linear((xx * g), O_), v_first
 
 ########################################################################################################
 
@@ -410,9 +442,10 @@ def RWKV_x070_CMix_one(x, x_prev, x_k, K_, V_):
     xx = x_prev[1] - x
     x_prev[1] = x
     k = x + xx * x_k
-    k = torch.relu(k @ K_) ** 2
-    # kv = k @ V_
+    k = torch.relu(F.linear(k, K_)) ** 2
     kv = rwkv_mm_sparsity(k, V_)
+    # kv = k @ V_
+    # kv = SPMV_OP(k, V_)
     return kv
 
 @MyStatic
@@ -420,14 +453,14 @@ def RWKV_x070_CMix_seq(x, x_prev, x_k, K_, V_):
     xx = torch.cat((x_prev[1].unsqueeze(0), x[:-1,:])) - x
     x_prev[1] = x[-1,:]
     k = x + xx * x_k
-    k = torch.relu(k @ K_) ** 2
+    k = torch.relu(F.linear(k, K_)) ** 2
     # print("Sparsity:", (k == 0).float().mean().item())
-    return k @ V_
+    return k @ V_ # F.linear(k, V_)
 
 @MyStatic
 def RWKV_x070_CMix_seq_batch(x, x_prev, x_k, K_, V_):
     xx = torch.cat((x_prev[1].unsqueeze(1), x[:,:-1,:]), dim=1) - x
     x_prev[1] = x[:,-1,:]
     k = x + xx * x_k
-    k = torch.relu(k @ K_) ** 2
-    return k @ V_
+    k = torch.relu(F.linear(k, K_)) ** 2
+    return k @ V_ # F.linear(k, V_)

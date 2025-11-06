@@ -53,52 +53,52 @@ def xprint(s):
     c0, c1 = 3, 80-len(s)-3
     print(f"\n{'#'*c0} {s} {'#'*c1}\n")
 
-xprint("Basic")
+# xprint("Basic")
 
-prompt = "The Eiffel tower is in the city of"
-print(prompt)
+# prompt = "The Eiffel tower is in the city of"
+# print(prompt)
 
-init_out = model.forward(tokenizer.encode(prompt), model.generate_zero_state(0))
-probs = F.softmax(init_out.float(), dim=-1) # compute softmax in float (more accurate)
-_, indices = torch.topk(probs, 5) # print top-5 possibilities
-for i in range(len(indices)):
-    token_id = indices[i].item()
-    token = tokenizer.decode([token_id])
-    token_prob = probs[token_id].item()
-    print(repr(token), f'[probability {token_prob:.2%}]')
+# init_out = model.forward(tokenizer.encode(prompt), model.generate_zero_state(0))
+# probs = F.softmax(init_out.float(), dim=-1) # compute softmax in float (more accurate)
+# _, indices = torch.topk(probs, 5) # print top-5 possibilities
+# for i in range(len(indices)):
+#     token_id = indices[i].item()
+#     token = tokenizer.decode([token_id])
+#     token_prob = probs[token_id].item()
+#     print(repr(token), f'[probability {token_prob:.2%}]')
 
-########################################################################################################
+# ########################################################################################################
 
-xprint("Batch")
+# xprint("Batch")
 
-prompts = ["The apple can be", "The cat can't be", "Q: 1+1=?\nA: 1+1=2."]
-tokens = [tokenizer.encode(prompt) for prompt in prompts]
+# prompts = ["The apple can be", "The cat can't be", "Q: 1+1=?\nA: 1+1=2."]
+# tokens = [tokenizer.encode(prompt) for prompt in prompts]
 
-print(tokens)
-for prompt in prompts:
-    print(prompt)
-    init_out = model.forward(tokenizer.encode(prompt), model.generate_zero_state(0))
-    probs = F.softmax(init_out.float(), dim=-1) # compute softmax in float (more accurate)
-    _, indices = torch.topk(probs, 5) # print top-5 possibilities
-    for i in range(len(indices)):
-        token_id = indices[i].item()
-        token = tokenizer.decode([token_id])
-        token_prob = probs[token_id].item()
-        print(repr(token), f'[probability {token_prob:.2%}]')
+# print(tokens)
+# for prompt in prompts:
+#     print(prompt)
+#     init_out = model.forward(tokenizer.encode(prompt), model.generate_zero_state(0))
+#     probs = F.softmax(init_out.float(), dim=-1) # compute softmax in float (more accurate)
+#     _, indices = torch.topk(probs, 5) # print top-5 possibilities
+#     for i in range(len(indices)):
+#         token_id = indices[i].item()
+#         token = tokenizer.decode([token_id])
+#         token_prob = probs[token_id].item()
+#         print(repr(token), f'[probability {token_prob:.2%}]')
 
-init_outs = model.forward_batch(tokens, model.generate_zero_state(len(prompts)))
-for n in range(len(prompts)):
-    print(prompts[n])
-    init_out = init_outs[n]
-    probs = F.softmax(init_out.float(), dim=-1) # compute softmax in float (more accurate)
-    _, indices = torch.topk(probs, 5) # print top-5 possibilities
-    for i in range(len(indices)):
-        token_id = indices[i].item()
-        token = tokenizer.decode([token_id], utf8_errors="replace")
-        token_prob = probs[token_id].item()
-        print(repr(token), f'[probability {token_prob:.2%}]')
-    if n != len(prompts)-1:
-        print()
+# init_outs = model.forward_batch(tokens, model.generate_zero_state(len(prompts)))
+# for n in range(len(prompts)):
+#     print(prompts[n])
+#     init_out = init_outs[n]
+#     probs = F.softmax(init_out.float(), dim=-1) # compute softmax in float (more accurate)
+#     _, indices = torch.topk(probs, 5) # print top-5 possibilities
+#     for i in range(len(indices)):
+#         token_id = indices[i].item()
+#         token = tokenizer.decode([token_id], utf8_errors="replace")
+#         token_prob = probs[token_id].item()
+#         print(repr(token), f'[probability {token_prob:.2%}]')
+#     if n != len(prompts)-1:
+#         print()
 
 ########################################################################################################
 
@@ -141,7 +141,7 @@ print(f'\n\nToken/s = {round(1/times,2)} (forward), {round(1/all_times,2)} (full
 
 # exit(0)
 
-#######################################################################################################
+# #######################################################################################################
 
 xprint("Decode (CUDAGraph)")
 
@@ -166,6 +166,8 @@ static_state[0] = torch.empty_like(state[0], device="cuda")
 static_state[1] = torch.empty_like(state[1], device="cuda")
 static_state[2] = torch.empty_like(state[2], device="cuda")
 static_output = torch.empty_like(out, device="cuda")
+
+static_output = model.forward(static_input, static_state)
 
 g = torch.cuda.CUDAGraph()
 with torch.cuda.graph(g):

@@ -390,7 +390,7 @@ def _continuous_batching_stream_sync(
             if ROCm_Flag:
                 new_tokens = torch_top_k_top_p(out, top_k, top_p)
             else:
-                import flashinfer
+                import flashinfer # type: ignore
                 new_tokens = flashinfer.sampling.top_k_top_p_sampling_from_logits(out, top_k, top_p)
             
             new_tokens = new_tokens.tolist()
@@ -566,7 +566,7 @@ def _continuous_batching_sync(
             if ROCm_Flag:
                 new_tokens = torch_top_k_top_p(out, top_k, top_p)
             else:
-                import flashinfer
+                import flashinfer # type: ignore
                 new_tokens = flashinfer.sampling.top_k_top_p_sampling_from_logits(out, top_k, top_p)
             
             new_tokens = new_tokens.tolist()
