@@ -9,6 +9,10 @@
 #include <ATen/hip/HIPContext.h>
 
 #include <hip/hip_fp16.h>
+#include <ck_tile/core.hpp>
+using ck_tile::int32x4_t;
+using index_t = std::uint32_t;
+
 
 #ifndef _N_
 #define _N_ 64
@@ -179,30 +183,68 @@ union common128 {
     int i[4];
     float f[4];
 };
+struct __attribute__((packed)) buffer_resource {
+  const void *ptr;
+  uint32_t range;
+  uint32_t config;
+};
+
+__device__ int32x4_t make_wave_buffer_resource(const void *ptr,
+                                                   uint32_t size = 0xffffffff) {
+  buffer_resource res{ptr, size, CK_TILE_BUFFER_RESOURCE_3RD_DWORD};
+  int32x4_t r = __builtin_bit_cast(int32x4_t, res);
+  r.x = __builtin_amdgcn_readfirstlane(r.x);
+  r.y = __builtin_amdgcn_readfirstlane(r.y);
+  r.z = __builtin_amdgcn_readfirstlane(r.z);
+  r.w = __builtin_amdgcn_readfirstlane(r.w);
+  return r;
+}
+
+template <bool pre_nop = false>
+__device__ void async_buffer_load_dword_v(void *smem, int32x4_t rsrc,
+                                              index_t voffset) {
+
+  uint32_t lds_offset = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(smem));
+  
+  if (pre_nop) { }
+  
+  buffer_resource r = __builtin_bit_cast(buffer_resource, rsrc);
+  const uint32_t *global_base_ptr = static_cast<const uint32_t*>(r.ptr);
+  const uint32_t *src_ptr = global_base_ptr + (voffset / sizeof(uint32_t)); 
+
+  *(uint32_t*)smem = *src_ptr; 
+}
 
 template <int N>
-__device__ __forceinline__ void cp_async_gs_conditional(void *const smem_addr,
-                                       const void *const global_ptr, bool cond) {
-    static_assert(N == 16 || N == 8 || N == 4);
+__device__ __forceinline__ void cp_async_gs_conditional(void *lds_base_ptr,
+                                       void *global_base_ptr, bool cond) {
+  if constexpr (N == 16) {
+    *(uint4 *)lds_base_ptr =
+        cond ? *(uint4 *)global_base_ptr : make_uint4(0, 0, 0, 0);
+  } else if constexpr (N == 8) {
+    *(uint2 *)lds_base_ptr =
+        cond ? *(uint2 *)global_base_ptr : make_uint2(0, 0);
+  } else {
     if (cond) {
-        // use HIP cp to replace cp.async 😥
-        char* dst = reinterpret_cast<char*>(smem_addr);
-        const char* src = reinterpret_cast<const char*>(global_ptr);
-        #pragma unroll
-        for (int i = 0; i < N; ++i) {
-            dst[i] = src[i];
-        }
+      async_buffer_load_dword_v(
+          lds_base_ptr,
+          make_wave_buffer_resource(((int32_t *)global_base_ptr) - threadIdx.x),
+          threadIdx.x * N /*assume 4 bytes*/);
+    } else {
+      *(uint4 *)lds_base_ptr = make_uint4(0, 0, 0, 0);
     }
+  }
+}
+__device__ void async_gld_fence(index_t cnt) {
+  asm volatile("s_waitcnt vmcnt(%0)" : : "n"(cnt) : "memory");
+}
+template <int N = 0> __device__ __forceinline__ void cp_async_wait() {
+  async_gld_fence(N);
+  // or
+  // async_gld_sld_fence(N);
 }
 
-template <int N>
-__device__ __forceinline__ void cp_async_wait() {
-    __syncthreads();
-}
-
-__device__ __forceinline__ void cp_async_commit() {
-    __syncthreads();
-}
+__device__ __forceinline__ void cp_async_commit() {}
 
 __global__ void __launch_bounds__(BLOCKDIM, 1) spvecmatmul_noindices(
     const int C,
@@ -250,7 +292,7 @@ __global__ void __launch_bounds__(BLOCKDIM, 1) spvecmatmul_noindices(
     for(int i = 0; i < 2; i++){
         if (i < nnz_count){
             int actual_pos = start_pos + nnz_ids[i];
-            cp_async_gs_conditional<4>(mat_row_smem[i%2] + t*2, mat + actual_pos * C + by * (2*BLOCKDIM) + t*2, true);
+            cp_async_gs_conditional<4>((void*)(mat_row_smem[i%2] + t*2), (void*)(mat + actual_pos * C + by * (2*BLOCKDIM) + t*2), true);
             cp_async_commit();
         }
     }
@@ -265,7 +307,7 @@ __global__ void __launch_bounds__(BLOCKDIM, 1) spvecmatmul_noindices(
 
         // store
         int actual_pos = start_pos + nnz_ids[i+2];
-        cp_async_gs_conditional<4>(mat_row_smem[i%2] + t*2, mat + actual_pos * C + by * (2*BLOCKDIM) + t*2, true);
+        cp_async_gs_conditional<4>((void*)(mat_row_smem[i%2] + t*2), (void*)(mat + actual_pos * C + by * (2*BLOCKDIM) + t*2), true);
         cp_async_commit();
 
         // compute
@@ -292,13 +334,7 @@ __global__ void __launch_bounds__(BLOCKDIM, 1) spvecmatmul_noindices(
         out_frag = __hfma2(__half2half2(vec_value), mat_row_frag, out_frag);
     }
     
-    // 替换不支持的atomicAdd(half2*, half2)为手动原子操作
-    half2* target = (half2*)(out + by*(2*BLOCKDIM) + t*2);
-    half2 old_val, new_val;
-    do {
-        old_val = *target;
-        new_val = __hadd2(old_val, out_frag);
-    } while (atomicCAS((int*)target, *((int*)&old_val), *((int*)&new_val)) != *((int*)&old_val));
+    unsafeAtomicAdd((half2*)(out + by*(2*BLOCKDIM) + t*2), out_frag);
 }
 
 

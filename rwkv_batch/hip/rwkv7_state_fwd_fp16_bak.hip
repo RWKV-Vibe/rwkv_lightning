@@ -1,13 +1,14 @@
-#undef __CUDA_NO_HALF2_OPERATORS__
-#undef __CUDA_NO_HALF_CONVERSIONS__
-#undef __CUDA_NO_HALF_OPERATORS__
+#include "hip/hip_runtime.h"
+#undef __HIP_NO_HALF2_OPERATORS__
+#undef __HIP_NO_HALF_CONVERSIONS__
+#undef __HIP_NO_HALF_OPERATORS__
 
 #include <stdio.h>
 #include <assert.h>
 #include <ATen/ATen.h>
-#include <ATen/cuda/CUDAContext.h>
+#include <ATen/hip/HIPContext.h>
 
-#include <cuda_fp16.h>
+#include <hip/hip_fp16.h>
 
 #ifndef _N_
 #define _N_ 64
@@ -67,7 +68,7 @@ __global__ void kernel_forward_w0_fp16_dither_seq(
         for (int j = 0; j < _N_ / 2; j++)
             sa2 += a[j] * state[j];
         half sa = sa2.x + sa2.y;
-        sa2 = {sa, sa};
+        sa2 = __half2(sa, sa);
 
         half vv = _v[t];
         half2 vv2 = {vv, vv};
@@ -137,7 +138,7 @@ __global__ void kernel_forward_w0_fp16_dither_one(
     for (int j = 0; j < _N_ / 2; j++)
         sa2 += a[j] * state[j];
     half sa = sa2.x + sa2.y;
-    sa2 = {sa, sa};
+    sa2 = __half2(sa, sa);
 
     half vv = _v[t];
     half2 vv2 = {vv, vv};
@@ -180,43 +181,27 @@ union common128 {
 };
 
 template <int N>
-__device__ __forceinline__ void cp_async_gs_conditional(void const *const smem_addr,
-                                       void const *const global_ptr, bool cond) {
+__device__ __forceinline__ void cp_async_gs_conditional(void *const smem_addr,
+                                       const void *const global_ptr, bool cond) {
     static_assert(N == 16 || N == 8 || N == 4);
-    int bytes = cond ? N : 0;
-    unsigned int addr = __cvta_generic_to_shared(smem_addr);
-    if constexpr (N == 16) {
-        asm volatile(
-            #if ENABLE_L2_PREFETCH
-            "cp.async.cg.shared.global.L2::128B [%0], [%1], %2, %3;"
-            #else
-            "cp.async.cg.shared.global [%0], [%1], %2, %3;"
-            #endif
-            ::"r"(addr),
-            "l"(global_ptr), "n"(N), "r"(bytes));
-    } else {
-        asm volatile(
-            #if ENABLE_L2_PREFETCH
-            "cp.async.ca.shared.global.L2::128B [%0], [%1], %2, %3;"
-            #else
-            "cp.async.ca.shared.global [%0], [%1], %2, %3;"
-            #endif
-            ::"r"(addr),
-            "l"(global_ptr), "n"(N), "r"(bytes));
+    if (cond) {
+        // use HIP cp to replace cp.async 😥
+        char* dst = reinterpret_cast<char*>(smem_addr);
+        const char* src = reinterpret_cast<const char*>(global_ptr);
+        #pragma unroll
+        for (int i = 0; i < N; ++i) {
+            dst[i] = src[i];
+        }
     }
 }
 
 template <int N>
 __device__ __forceinline__ void cp_async_wait() {
-    if constexpr (N == 0) {
-        asm volatile("cp.async.wait_all;\n" ::);
-    } else {
-        asm volatile("cp.async.wait_group %0;\n" ::"n"(N));
-    }
+    __syncthreads();
 }
 
 __device__ __forceinline__ void cp_async_commit() {
-    asm volatile("cp.async.commit_group;\n" ::);
+    __syncthreads();
 }
 
 __global__ void __launch_bounds__(BLOCKDIM, 1) spvecmatmul_noindices(
@@ -306,25 +291,32 @@ __global__ void __launch_bounds__(BLOCKDIM, 1) spvecmatmul_noindices(
 
         out_frag = __hfma2(__half2half2(vec_value), mat_row_frag, out_frag);
     }
-    atomicAdd((half2*)(out + by*(2*BLOCKDIM) + t*2), out_frag);
+    
+    // 替换不支持的atomicAdd(half2*, half2)为手动原子操作
+    half2* target = (half2*)(out + by*(2*BLOCKDIM) + t*2);
+    half2 old_val, new_val;
+    do {
+        old_val = *target;
+        new_val = __hadd2(old_val, out_frag);
+    } while (atomicCAS((int*)target, *((int*)&old_val), *((int*)&new_val)) != *((int*)&old_val));
 }
 
 
 void cuda_forward_seq(int B, int T, int C, int H, F *state, F *r, F *w, F *k, F *v, F *a, F *b, F *y, int *elapsed_t){
     assert(H * _N_ == C);
-    kernel_forward_w0_fp16_dither_seq<<<B * H, _N_>>>(B, T, C, H, state, r, w, k, v, a, b, y, elapsed_t);
+   hipLaunchKernelGGL(( kernel_forward_w0_fp16_dither_seq), dim3(B * H), dim3(_N_), 0, 0, B, T, C, H, state, r, w, k, v, a, b, y, elapsed_t);
 }
 
 void cuda_forward_one(int B, int C, int H, F *state, F *r, F *w, F *k, F *v, F *a, F *b, F *y, int *elapsed_t){
     assert(H * _N_ == C);
-    auto stream = at::cuda::getCurrentCUDAStream();
-    kernel_forward_w0_fp16_dither_one<<<B * H, _N_, 0, stream>>>(B, C, H, state, r, w, k, v, a, b, y, elapsed_t);
+    auto stream = at::hip::getCurrentHIPStreamMasqueradingAsCUDA();
+   hipLaunchKernelGGL(( kernel_forward_w0_fp16_dither_one), dim3(B * H), dim3(_N_), 0, stream, B, C, H, state, r, w, k, v, a, b, y, elapsed_t);
 }
 
 void cuda_spmv_forward(int D, int C, F* vec1, F* mat, F* out) {
     assert(C % (2*BLOCKDIM) == 0);
     assert(D % MAXNPERBLOCK == 0);
-    auto stream = at::cuda::getCurrentCUDAStream();
-    spvecmatmul_noindices<<<dim3(D/MAXNPERBLOCK, C/(2*BLOCKDIM), 1), dim3(BLOCKDIM, 1, 1), 0, stream>>>
-    (C, (const half*)vec1, (const half*)mat, (half*)out);
+    auto stream = at::hip::getCurrentHIPStreamMasqueradingAsCUDA();
+   hipLaunchKernelGGL(( spvecmatmul_noindices), dim3(dim3(D/MAXNPERBLOCK, C/(2*BLOCKDIM), 1)), dim3(dim3(BLOCKDIM, 1, 1)), 0, stream, 
+    C, (const half*)vec1, (const half*)mat, (half*)out);
 }

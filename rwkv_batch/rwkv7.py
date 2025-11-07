@@ -37,16 +37,6 @@ MyDisable = torch.compiler.disable
 
 DTYPE = torch.half
 ROCm_flag = torch.version.hip is not None
-############################################### gems ###################################################
-if ROCm_flag == False:
-    try:
-        import flag_gems # type: ignore
-        import torch.ops.flag_gems.rwkv_mm_sparsity as rwkv_mm_sparsity # type: ignore
-    except:
-        print("flag_gems is not installed. Using triton kernel directly instead.")
-        from .rwkv_mm_op_triton import rwkv_mm_sparsity
-else:
-    from .rwkv_mm_op_triton import rwkv_mm_sparsity
 
 ########################################################################################################
 
@@ -76,6 +66,17 @@ def SPMV_OP(vec:torch.Tensor, mat:torch.Tensor) -> torch.Tensor:
 def _(vec:torch.Tensor, mat:torch.Tensor) -> torch.Tensor:
     D, C = mat.size()
     return torch.zeros((C,), device=vec.device, dtype=DTYPE, requires_grad=False)
+############################################### gems ###################################################
+if ROCm_flag == False:
+    try:
+        # import flag_gems # type: ignore
+        # import torch.ops.flag_gems.rwkv_mm_sparsity as rwkv_mm_sparsity # type: ignore
+        rwkv_mm_sparsity = SPMV_OP
+    except:
+        print("flag_gems is not installed. Using triton kernel directly instead.")
+        from .rwkv_mm_op_triton import rwkv_mm_sparsity
+else:
+    from .rwkv_mm_op_triton import rwkv_mm_sparsity
 
 class WKV_7_ONE(torch.autograd.Function):
     @staticmethod
