@@ -27,8 +27,8 @@ from torch.nn import functional as F
 # MyFunction = torch.jit.script_method
 # MyStatic = torch.jit.script
 MyModule = nn.Module
-MyFunction = torch.compile(mode='max-autotune-no-cudagraphs')
-MyStatic = torch.compile(mode='max-autotune-no-cudagraphs')
+MyFunction = torch.compile()
+MyStatic = torch.compile()
 MyDisable = torch.compiler.disable
 # def __nop(ob): return ob
 # MyFunction = __nop

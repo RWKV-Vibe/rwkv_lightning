@@ -60,7 +60,7 @@ async def handle_options():
 
 
 model_lock = Lock()
-executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="model_inference")
+executor = ThreadPoolExecutor(max_workers=128, thread_name_prefix="model_inference")
 
 class ChatRequest(BaseModel):
     model: str = "rwkv7"
