@@ -27,6 +27,15 @@ python main_robyn.py --model-path <your model path> --port <your port number>
 bash ./test_curl.sh 
 ```
 
+## Tips
+If you want to the max performance optimization, you can use the ```torch.compile(mode='max-autotune-no-cudagraphs')```  
+
+you can modify the code in the ```rwkv_batch/rwkv7.py``` line 30, 31
+```python
+MyFunction = torch.compile(mode='max-autotune-no-cudagraphs')
+MyStatic = torch.compile(mode='max-autotune-no-cudagraphs')
+```
+**But it will be slow in first inference request, Because it needs to compile the Triton kernel firstly.**
 
 ## API Docs 
 ### 1. Batch synchronous Translate 
