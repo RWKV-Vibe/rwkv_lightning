@@ -198,3 +198,59 @@ curl -X POST http://localhost:8000/v3/chat/completions \
     "stream": false
   }'
 ```
+## 5. Single sequence asynchronous inference 
+[Trying to add CUDA graph but it seems not working well beaceus of the sample processing]
+```bash
+python single_infer.py --model-path <your model path> --port <your port number>
+```
+### 5. ```v4/chat/completions``` 
+
+- Streaming asynchronous single sequence processing
+```bash
+curl -X POST http://localhost:8000/v4/chat/completions \
+  -H "Content-Type: application/json" \
+  -N \
+  -d '{
+    "messages": [
+      {
+        "role": "user",
+        "content": "What is the capital of France?"
+      }
+    ],
+    "max_tokens": 1024,
+    "stop_tokens": [0, 261, 24281],
+    "temperature": 1.0,
+    "top_k": 1,
+    "top_p": 0.3,
+    "pad_zero": true,
+    "alpha_presence": 0.5,
+    "alpha_frequency": 0.5,
+    "alpha_decay": 0.996,
+    "chunk_size": 128,
+    "stream": true
+  }'
+```
+- Non-streaming asynchronous single sequence processing
+```bash
+curl -X POST http://localhost:8000/v4/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "messages": [
+      {
+        "role": "user",
+        "content": "What is the capital of France?"
+      }
+    ],
+    "max_tokens": 1024,
+    "stop_tokens": [0, 261, 24281],
+    "temperature": 1.0,
+    "top_k": 1,
+    "top_p": 0.3,
+    "pad_zero": true,
+    "alpha_presence": 0.5,
+    "alpha_frequency": 0.5,
+    "alpha_decay": 0.996,
+    "chunk_size": 128,
+    "stream": false
+  }'
+```
