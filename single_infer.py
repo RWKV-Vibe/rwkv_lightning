@@ -32,6 +32,53 @@ tokenizer = TRIE_TOKENIZER("rwkv_batch/rwkv_vocab_v20230424.txt")
 
 print(f"[INFO] Model loaded successfully.\n")
 
+static_graph = None
+static_input_global = None
+static_state_global = [None, None, None]
+static_output_global = None
+graph_initialized = False
+graph_lock = Lock()
+
+def initialize_cuda_graph():
+    global static_graph, static_input_global, static_state_global, static_output_global, graph_initialized
+    
+    with graph_lock:
+        if graph_initialized:
+            return  
+            
+        try:
+            state = model.generate_zero_state(0)
+            
+            example_prompt = "User: hello\n\nAssistant:"
+            encoded_prompt = tokenizer.encode(example_prompt)
+            
+            out = model.forward(encoded_prompt, state)
+            
+            token = sampler_simple(out, noise=0).item()
+            x = model.z['emb.weight'][token]
+            
+            static_input_global = torch.empty_like(x, device="cuda")
+            static_state_global[0] = torch.empty_like(state[0], device="cuda")
+            static_state_global[1] = torch.empty_like(state[1], device="cuda")
+            static_state_global[2] = torch.empty_like(state[2], device="cuda")
+            static_output_global = torch.empty_like(out, device="cuda")
+            
+            static_output_global = model.forward(static_input_global, static_state_global)
+            
+            static_graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(static_graph):
+                static_output_global = model.forward(static_input_global, static_state_global)
+            
+            static_input_global.copy_(x)
+            static_state_global[0].copy_(state[0])
+            static_state_global[1].copy_(state[1])
+            static_state_global[2].copy_(state[2])
+            
+            graph_initialized = True
+            print("[INFO] CUDA graph initialized successfully.")
+        except Exception as e:
+            print(f"[WARNING] Failed to initialize CUDA graph: {e}")
+            print("[INFO] Will use eager mode instead.")
 
 app = Robyn(__file__)
 @app.after_request()
@@ -97,6 +144,7 @@ def torch_top_k_top_p(logits, top_k, top_p):
     return sampled_tokens
 
 def generate_single(prompt, max_tokens=50, stop_tokens=[0, 261, 24281], temperature=1.0, noise=1.5):
+    global static_graph, static_input_global, static_state_global, static_output_global, graph_initialized
     
     state = model.generate_zero_state(0)
     encoded_prompt = tokenizer.encode(prompt)
@@ -115,29 +163,14 @@ def generate_single(prompt, max_tokens=50, stop_tokens=[0, 261, 24281], temperat
     finished = False
     
     x = model.z['emb.weight'][token]
-    static_input = torch.empty_like(x, device="cuda")
-    static_state = [None, None, None]
-    static_state[0] = torch.empty_like(state[0], device="cuda")
-    static_state[1] = torch.empty_like(state[1], device="cuda")
-    static_state[2] = torch.empty_like(state[2], device="cuda")
-    static_output = torch.empty_like(out, device="cuda")
-    
-    static_output = model.forward(static_input, static_state)
-    
-    g = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(g):
-        static_output = model.forward(static_input, static_state)
-    
-    static_input.copy_(x)
-    static_state[0].copy_(state[0])
-    static_state[1].copy_(state[1])
-    static_state[2].copy_(state[2])
-    static_output.copy_(out)
-    
+    static_input_global.copy_(x)
+    static_state_global[0].copy_(state[0])
+    static_state_global[1].copy_(state[1])
+    static_state_global[2].copy_(state[2])
     for step in range(max_tokens):
-        g.replay()
+        static_graph.replay()
         
-        logits = static_output.clone()
+        logits = static_output_global.clone()
         if temperature != 1.0:
             logits /= temperature
         token = sampler_simple(logits, noise=noise).item()
@@ -149,9 +182,9 @@ def generate_single(prompt, max_tokens=50, stop_tokens=[0, 261, 24281], temperat
         generated_tokens.append(token)
         
         x = model.z['emb.weight'][token]
-        static_input.copy_(x)
+        static_input_global.copy_(x)
     
-    del state, static_input, static_state, static_output, g
+    del state
     gc.collect()
     
     text = tokenizer.decode(generated_tokens, utf8_errors="ignore")
@@ -159,8 +192,7 @@ def generate_single(prompt, max_tokens=50, stop_tokens=[0, 261, 24281], temperat
 
 async def single_infer_stream(prompt, max_tokens=50, stop_tokens=[0, 261, 24281], 
                              temperature=1.0, noise=1.5, chunk_size=32):
-    import time
-    import numpy as np
+    global static_graph, static_input_global, static_state_global, static_output_global, graph_initialized
     
     state = model.generate_zero_state(0)
     encoded_prompt = tokenizer.encode(prompt)
@@ -180,30 +212,16 @@ async def single_infer_stream(prompt, max_tokens=50, stop_tokens=[0, 261, 24281]
     finished = False
     
     x = model.z['emb.weight'][token]
-    static_input = torch.empty_like(x, device="cuda")
-    static_state = [None, None, None]
-    static_state[0] = torch.empty_like(state[0], device="cuda")
-    static_state[1] = torch.empty_like(state[1], device="cuda")
-    static_state[2] = torch.empty_like(state[2], device="cuda")
-    static_output = torch.empty_like(out, device="cuda")
-    
-    static_output = model.forward(static_input, static_state)
-    
-    g = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(g):
-        static_output = model.forward(static_input, static_state)
-    
-    static_input.copy_(x)
-    static_state[0].copy_(state[0])
-    static_state[1].copy_(state[1])
-    static_state[2].copy_(state[2])
-    static_output.copy_(out)
+    static_input_global.copy_(x)
+    static_state_global[0].copy_(state[0])
+    static_state_global[1].copy_(state[1])
+    static_state_global[2].copy_(state[2])
     
     try:
         for step in range(max_tokens):
-            g.replay()
+            static_graph.replay()
             
-            logits = static_output.clone()
+            logits = static_output_global.clone()
             if temperature != 1.0:
                 logits /= temperature
             token = sampler_simple(logits, noise=noise).item()
@@ -233,7 +251,7 @@ async def single_infer_stream(prompt, max_tokens=50, stop_tokens=[0, 261, 24281]
                 token_buffer.clear()
             
             x = model.z['emb.weight'][token]
-            static_input.copy_(x)
+            static_input_global.copy_(x)
             
             await asyncio.sleep(0)
         
@@ -244,9 +262,9 @@ async def single_infer_stream(prompt, max_tokens=50, stop_tokens=[0, 261, 24281]
                 "choices": [{"index": 0, "delta": {"content": text_chunk}}]
             }
             yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
-            
+                
     finally:
-        del state, static_input, static_state, static_output, g
+        del state
         gc.collect()
     
     yield "data: [DONE]\n\n"
@@ -329,4 +347,12 @@ async def v4_chat_completions(request):
         )
     
 if __name__ == "__main__":
+    # 尝试初始化CUDA graph，如果失败则回退到原始模式
+    try:
+        print("[INFO] Initializing CUDA graph...")
+        initialize_cuda_graph()
+    except Exception as e:
+        print(f"[WARNING] Failed to initialize CUDA graph: {e}")
+        print("[INFO] Will use eager mode instead.")
+    
     app.start(host="0.0.0.0", port=args_cli.port)
