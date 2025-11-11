@@ -97,6 +97,7 @@ def torch_top_k_top_p(logits, top_k, top_p):
     return sampled_tokens
 
 def generate_single(prompt, max_tokens=50, stop_tokens=[0, 261, 24281], temperature=1.0, noise=1.5):
+    
     state = model.generate_zero_state(0)
     encoded_prompt = tokenizer.encode(prompt)
     out = model.forward(encoded_prompt, state)
@@ -105,6 +106,7 @@ def generate_single(prompt, max_tokens=50, stop_tokens=[0, 261, 24281], temperat
         logits = out.clone()
         if temperature != 1.0:
             logits /= temperature
+            
         token = sampler_simple(logits, noise=noise).item()
     else:
         token = out
@@ -112,54 +114,45 @@ def generate_single(prompt, max_tokens=50, stop_tokens=[0, 261, 24281], temperat
     generated_tokens = []
     finished = False
     
-    # 创建独立的CUDA流
-    stream = torch.cuda.Stream()
-    with torch.cuda.stream(stream):
-        x = model.z['emb.weight'][token]
-        static_input = torch.empty_like(x, device="cuda")
-        static_state = [None, None, None]
-        static_state[0] = torch.empty_like(state[0], device="cuda")
-        static_state[1] = torch.empty_like(state[1], device="cuda")
-        static_state[2] = torch.empty_like(state[2], device="cuda")
-        static_output = torch.empty_like(out, device="cuda")
-        
-        static_output = model.forward(static_input, static_state)
-        
-        g = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(g):
-            static_output = model.forward(static_input, static_state)
-        
-        static_input.copy_(x)
-        static_state[0].copy_(state[0])
-        static_state[1].copy_(state[1])
-        static_state[2].copy_(state[2])
-        static_output.copy_(out)
-        
-        for step in range(max_tokens):
-            g.replay()
-            
-            logits = static_output.clone()
-            if temperature != 1.0:
-                logits /= temperature
-            token = sampler_simple(logits, noise=noise).item()
-            
-            if token in stop_tokens:
-                finished = True
-                break
-                
-            generated_tokens.append(token)
-            
-            x = model.z['emb.weight'][token]
-            static_input.copy_(x)
-        
-        # 确保图执行完成
-        stream.synchronize()
+    x = model.z['emb.weight'][token]
+    static_input = torch.empty_like(x, device="cuda")
+    static_state = [None, None, None]
+    static_state[0] = torch.empty_like(state[0], device="cuda")
+    static_state[1] = torch.empty_like(state[1], device="cuda")
+    static_state[2] = torch.empty_like(state[2], device="cuda")
+    static_output = torch.empty_like(out, device="cuda")
     
-    # 按正确顺序删除对象
-    del g, static_output, static_state, static_input, stream
-    del state
+    static_output = model.forward(static_input, static_state)
+    
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        static_output = model.forward(static_input, static_state)
+    
+    static_input.copy_(x)
+    static_state[0].copy_(state[0])
+    static_state[1].copy_(state[1])
+    static_state[2].copy_(state[2])
+    static_output.copy_(out)
+    
+    for step in range(max_tokens):
+        g.replay()
+        
+        logits = static_output.clone()
+        if temperature != 1.0:
+            logits /= temperature
+        token = sampler_simple(logits, noise=noise).item()
+        
+        if token in stop_tokens:
+            finished = True
+            break
+            
+        generated_tokens.append(token)
+        
+        x = model.z['emb.weight'][token]
+        static_input.copy_(x)
+    
+    del state, static_input, static_state, static_output, g
     gc.collect()
-    torch.cuda.empty_cache()
     
     text = tokenizer.decode(generated_tokens, utf8_errors="ignore")
     return text
@@ -253,10 +246,8 @@ async def single_infer_stream(prompt, max_tokens=50, stop_tokens=[0, 261, 24281]
             yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
             
     finally:
-        torch.cuda.synchronize()
         del state, static_input, static_state, static_output, g
         gc.collect()
-        torch.cuda.empty_cache()
     
     yield "data: [DONE]\n\n"
 
