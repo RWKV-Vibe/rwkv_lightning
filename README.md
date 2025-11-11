@@ -220,13 +220,7 @@ curl -X POST http://localhost:8000/v4/chat/completions \
     "max_tokens": 1024,
     "stop_tokens": [0, 261, 24281],
     "temperature": 1.0,
-    "top_k": 1,
-    "top_p": 0.3,
-    "pad_zero": true,
-    "alpha_presence": 0.5,
-    "alpha_frequency": 0.5,
-    "alpha_decay": 0.996,
-    "chunk_size": 128,
+    "niose": 1.5,
     "stream": true
   }'
 ```
@@ -244,12 +238,7 @@ curl -X POST http://localhost:8000/v4/chat/completions \
     "max_tokens": 1024,
     "stop_tokens": [0, 261, 24281],
     "temperature": 1.0,
-    "top_k": 1,
-    "top_p": 0.3,
-    "pad_zero": true,
-    "alpha_presence": 0.5,
-    "alpha_frequency": 0.5,
-    "alpha_decay": 0.996,
+    "niose": 1.5,
     "chunk_size": 128,
     "stream": false
   }'

@@ -96,95 +96,89 @@ def torch_top_k_top_p(logits, top_k, top_p):
     
     return sampled_tokens
 
-def generate_single(prompt, max_tokens=50, stop_tokens=[0, 261, 24281], temperature=1.0, 
-                   top_k=1, top_p=0.3, alpha_presence=0.5, alpha_frequency=0.5, 
-                   alpha_decay=0.996):
+def generate_single(prompt, max_tokens=50, stop_tokens=[0, 261, 24281], temperature=1.0, noise=1.5):
     state = model.generate_zero_state(0)
     encoded_prompt = tokenizer.encode(prompt)
     out = model.forward(encoded_prompt, state)
     
-    # Initial sampling to get the first token
     if isinstance(out, torch.Tensor):
-        # Process initial logits with temperature
         logits = out.clone()
         if temperature != 1.0:
             logits /= temperature
-            
-        # Sample first token using top-k and top-p
-        if ROCm_Flag:
-            token = torch_top_k_top_p(logits, top_k, top_p).item()
-        else:
-            import flashinfer # type: ignore
-            token = flashinfer.sampling.top_k_top_p_sampling_from_logits(logits, top_k, top_p).item()
+        token = sampler_simple(logits, noise=noise).item()
     else:
         token = out
 
     generated_tokens = []
     finished = False
     
-    occurrence = torch.zeros(args.vocab_size, dtype=torch.float32, device="cuda")
-    no_penalty_token_ids = set([33, 10, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58])
-    
-    for step in range(max_tokens):
-        # Run model inference directly (no CUDA graph)
+    # 创建独立的CUDA流
+    stream = torch.cuda.Stream()
+    with torch.cuda.stream(stream):
         x = model.z['emb.weight'][token]
-        out = model.forward(x, state)
+        static_input = torch.empty_like(x, device="cuda")
+        static_state = [None, None, None]
+        static_state[0] = torch.empty_like(state[0], device="cuda")
+        static_state[1] = torch.empty_like(state[1], device="cuda")
+        static_state[2] = torch.empty_like(state[2], device="cuda")
+        static_output = torch.empty_like(out, device="cuda")
         
-        # Process logits with penalties
-        logits = out.clone()
-        logits -= (alpha_presence + occurrence * alpha_frequency)
+        static_output = model.forward(static_input, static_state)
         
-        # Apply temperature
-        if temperature != 1.0:
-            logits /= temperature
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g):
+            static_output = model.forward(static_input, static_state)
         
-        # Sample token using top-k and top-p
-        if ROCm_Flag:
-            token = torch_top_k_top_p(logits, top_k, top_p).item()
-        else:
-            import flashinfer # type: ignore
-            token = flashinfer.sampling.top_k_top_p_sampling_from_logits(logits, top_k, top_p).item()
+        static_input.copy_(x)
+        static_state[0].copy_(state[0])
+        static_state[1].copy_(state[1])
+        static_state[2].copy_(state[2])
+        static_output.copy_(out)
         
-        if token in stop_tokens:
-            finished = True
-            break
+        for step in range(max_tokens):
+            g.replay()
             
-        generated_tokens.append(token)
+            logits = static_output.clone()
+            if temperature != 1.0:
+                logits /= temperature
+            token = sampler_simple(logits, noise=noise).item()
+            
+            if token in stop_tokens:
+                finished = True
+                break
+                
+            generated_tokens.append(token)
+            
+            x = model.z['emb.weight'][token]
+            static_input.copy_(x)
         
-        www = 0.0 if token in no_penalty_token_ids else 1.0
-        occurrence[token] += www
-        
-        occurrence *= alpha_decay
+        # 确保图执行完成
+        stream.synchronize()
     
-    del state, occurrence
+    # 按正确顺序删除对象
+    del g, static_output, static_state, static_input, stream
+    del state
     gc.collect()
+    torch.cuda.empty_cache()
     
     text = tokenizer.decode(generated_tokens, utf8_errors="ignore")
     return text
 
 async def single_infer_stream(prompt, max_tokens=50, stop_tokens=[0, 261, 24281], 
-                             temperature=1.0, top_k=1, top_p=0.3,
-                             alpha_presence=0.5, alpha_frequency=0.5, alpha_decay=0.996,
-                             chunk_size=32):
+                             temperature=1.0, noise=1.5, chunk_size=32):
+    import time
+    import numpy as np
+    
     state = model.generate_zero_state(0)
-    
     encoded_prompt = tokenizer.encode(prompt)
-    
     out = model.forward(encoded_prompt, state)
     
-    # Initial sampling to get the first token
     if isinstance(out, torch.Tensor):
-        # Process initial logits with temperature
         logits = out.clone()
         if temperature != 1.0:
             logits /= temperature
             
-        # Sample first token using top-k and top-p
-        if ROCm_Flag:
-            token = torch_top_k_top_p(logits, top_k, top_p).item()
-        else:
-            import flashinfer # type: ignore
-            token = flashinfer.sampling.top_k_top_p_sampling_from_logits(logits, top_k, top_p).item()
+        token = sampler_simple(logits, noise=noise).item()
     else:
         token = out
 
@@ -192,29 +186,34 @@ async def single_infer_stream(prompt, max_tokens=50, stop_tokens=[0, 261, 24281]
     token_buffer = []
     finished = False
     
-    occurrence = torch.zeros(args.vocab_size, dtype=torch.float32, device="cuda")
-    no_penalty_token_ids = set([33, 10, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58])
+    x = model.z['emb.weight'][token]
+    static_input = torch.empty_like(x, device="cuda")
+    static_state = [None, None, None]
+    static_state[0] = torch.empty_like(state[0], device="cuda")
+    static_state[1] = torch.empty_like(state[1], device="cuda")
+    static_state[2] = torch.empty_like(state[2], device="cuda")
+    static_output = torch.empty_like(out, device="cuda")
+    
+    static_output = model.forward(static_input, static_state)
+    
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        static_output = model.forward(static_input, static_state)
+    
+    static_input.copy_(x)
+    static_state[0].copy_(state[0])
+    static_state[1].copy_(state[1])
+    static_state[2].copy_(state[2])
+    static_output.copy_(out)
     
     try:
         for step in range(max_tokens):
-            # Run model inference directly (no CUDA graph)
-            x = model.z['emb.weight'][token]
-            out = model.forward(x, state)
+            g.replay()
             
-            # Process logits with penalties
-            logits = out.clone()
-            logits -= (alpha_presence + occurrence * alpha_frequency)
-            
-            # Apply temperature
+            logits = static_output.clone()
             if temperature != 1.0:
                 logits /= temperature
-
-            # Sample token using top-k and top-p
-            if ROCm_Flag:
-                token = torch_top_k_top_p(logits, top_k, top_p).item()
-            else:
-                import flashinfer # type: ignore
-                token = flashinfer.sampling.top_k_top_p_sampling_from_logits(logits, top_k, top_p).item()
+            token = sampler_simple(logits, noise=noise).item()
             
             if token in stop_tokens:
                 finished = True
@@ -240,10 +239,8 @@ async def single_infer_stream(prompt, max_tokens=50, stop_tokens=[0, 261, 24281]
                 yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
                 token_buffer.clear()
             
-            www = 0.0 if token in no_penalty_token_ids else 1.0
-            occurrence[token] += www
-            
-            occurrence *= alpha_decay
+            x = model.z['emb.weight'][token]
+            static_input.copy_(x)
             
             await asyncio.sleep(0)
         
@@ -256,8 +253,10 @@ async def single_infer_stream(prompt, max_tokens=50, stop_tokens=[0, 261, 24281]
             yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
             
     finally:
-        del state, occurrence
+        torch.cuda.synchronize()
+        del state, static_input, static_state, static_output, g
         gc.collect()
+        torch.cuda.empty_cache()
     
     yield "data: [DONE]\n\n"
 
@@ -290,11 +289,7 @@ async def v4_chat_completions(request):
                                    max_tokens=req.max_tokens,
                                    stop_tokens=req.stop_tokens,
                                    temperature=req.temperature,
-                                   top_k=req.top_k,
-                                   top_p=req.top_p,
-                                   alpha_presence=req.alpha_presence,
-                                   alpha_frequency=req.alpha_frequency,
-                                   alpha_decay=req.alpha_decay,
+                                   noise=req.noise,
                                    chunk_size=req.chunk_size),
                 media_type="text/event-stream"
             )
@@ -307,11 +302,7 @@ async def v4_chat_completions(request):
                 req.max_tokens,
                 req.stop_tokens,
                 req.temperature,
-                req.top_k,
-                req.top_p,
-                req.alpha_presence,
-                req.alpha_frequency,
-                req.alpha_decay
+                req.noise,
             )
         
         choice = {
