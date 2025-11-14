@@ -390,8 +390,11 @@ def _continuous_batching_stream_sync(
             if ROCm_Flag:
                 new_tokens = torch_top_k_top_p(out, top_k, top_p)
             else:
-                import flashinfer # type: ignore
-                new_tokens = flashinfer.sampling.top_k_top_p_sampling_from_logits(out, top_k, top_p)
+                try:
+                    import flashinfer # type: ignore
+                    new_tokens = flashinfer.sampling.top_k_top_p_sampling_from_logits(out, top_k, top_p)
+                except:
+                    new_tokens = torch_top_k_top_p(out, top_k, top_p)
             
             new_tokens = new_tokens.tolist()
             
@@ -566,8 +569,11 @@ def _continuous_batching_sync(
             if ROCm_Flag:
                 new_tokens = torch_top_k_top_p(out, top_k, top_p)
             else:
-                import flashinfer # type: ignore
-                new_tokens = flashinfer.sampling.top_k_top_p_sampling_from_logits(out, top_k, top_p)
+                try:
+                    import flashinfer # type: ignore
+                    new_tokens = flashinfer.sampling.top_k_top_p_sampling_from_logits(out, top_k, top_p)
+                except:
+                    new_tokens = torch_top_k_top_p(out, top_k, top_p)
             
             new_tokens = new_tokens.tolist()
             
@@ -667,6 +673,10 @@ async def chat_completions(request):
     body = json.loads(request.body)
     req = ChatRequest(**body)
     prompts = req.contents
+    if req.enable_think:
+        prompts = [f"User: {q}\n\nAssistant: <think" for q in prompts]
+    else:
+        prompts = [f"User: {q}\n\nAssistant:" for q in prompts]
 
     if req.stream:
         return StreamingResponse(
@@ -701,6 +711,10 @@ async def continuous_batching(request):
         body = json.loads(request.body)
         req = ChatRequest(**body)
         prompts = req.contents
+        if req.enable_think:
+            prompts = [f"User: {q}\n\nAssistant: <think" for q in prompts]
+        else:
+            prompts = [f"User: {q}\n\nAssistant:" for q in prompts]
 
         if not prompts:
             return Response(
@@ -791,7 +805,10 @@ async def v3_chat_completions(request):
         req = ChatRequest(**body)
         prompts = req.contents
         # 将输入问题转换为指定提示模板："User: 问题\n\nAssistant:"
-        prompts_formatted = [f"User: {q}\n\nAssistant:" for q in prompts]
+        if req.enable_think:
+            prompts_formatted = [f"User: {q}\n\nAssistant: <think" for q in prompts]
+        else:
+            prompts_formatted = [f"User: {q}\n\nAssistant:" for q in prompts]
 
         if not prompts:
             return Response(

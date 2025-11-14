@@ -23,12 +23,12 @@ torch._C._jit_set_autocast_mode(False)
 import torch.nn as nn
 from torch.nn import functional as F
 
-# MyModule = torch.jit.ScriptModule
-# MyFunction = torch.jit.script_method
-# MyStatic = torch.jit.script
-MyModule = nn.Module
-MyFunction = torch.compile()
-MyStatic = torch.compile()
+MyModule = torch.jit.ScriptModule
+MyFunction = torch.jit.script_method
+MyStatic = torch.jit.script
+# MyModule = nn.Module
+# MyFunction = torch.compile()
+# MyStatic = torch.compile()
 MyDisable = torch.compiler.disable
 # def __nop(ob): return ob
 # MyFunction = __nop

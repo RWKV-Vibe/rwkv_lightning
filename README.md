@@ -76,7 +76,8 @@ curl -X POST http://localhost:8000/v1/chat/completions \
     "stop_tokens": [0, 261, 24281],
     "temperature": 1.0,
     "noise": 0,
-    "stream": true
+    "stream": true,
+    "enable_think": true
   }'
 ```
 - Non-streaming synchronous batch processing
@@ -92,7 +93,8 @@ curl -X POST http://localhost:8000/v1/chat/completions \
     "stop_tokens": [0, 261, 24281],
     "temperature": 1.0,
     "noise": 0,
-    "stream": true
+    "stream": true,
+    "enable_think": true
   }'
 ```
 
@@ -119,7 +121,8 @@ curl -X POST http://localhost:8000/v2/chat/completions \
     "alpha_frequency": 0.5,
     "alpha_decay": 0.996,
     "chunk_size": 128,
-    "stream": true
+    "stream": true,
+    "enable_think": true
   }'
 ```
 - Non-streaming synchronous batch processing
@@ -141,7 +144,8 @@ curl -X POST http://localhost:8000/v2/chat/completions \
     "alpha_frequency": 0.5,
     "alpha_decay": 0.996,
     "chunk_size": 32,
-    "stream": false
+    "stream": false,
+    "enable_think": true
   }'
 ```
 
@@ -171,7 +175,8 @@ curl -X POST http://localhost:8000/v3/chat/completions \
     "alpha_frequency": 0.5,
     "alpha_decay": 0.996,
     "chunk_size": 128,
-    "stream": true
+    "stream": true,
+    "enable_think": true
   }'
 ```
 - Non-streaming asynchronous batch processing
@@ -195,7 +200,8 @@ curl -X POST http://localhost:8000/v3/chat/completions \
     "alpha_frequency": 0.5,
     "alpha_decay": 0.996,
     "chunk_size": 128,
-    "stream": false
+    "stream": false,
+    "enable_think": true
   }'
 ```
 ## 5. Single sequence asynchronous inference 
@@ -221,7 +227,8 @@ curl -X POST http://localhost:8000/v4/chat/completions \
     "stop_tokens": [0, 261, 24281],
     "temperature": 1.0,
     "niose": 1.5,
-    "stream": true
+    "stream": true,
+    "enable_think": true
   }'
 ```
 - Non-streaming asynchronous single sequence processing
@@ -240,6 +247,7 @@ curl -X POST http://localhost:8000/v4/chat/completions \
     "temperature": 1.0,
     "niose": 1.5,
     "chunk_size": 128,
-    "stream": false
+    "stream": false,
+    "enable_think": true
   }'
 ```

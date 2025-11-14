@@ -159,7 +159,7 @@ def generate_single(prompt, max_tokens=50, stop_tokens=[0, 261, 24281], temperat
     else:
         token = out
 
-    generated_tokens = []
+    generated_tokens = [token]  # 第一个token加入结果
     finished = False
     
     x = model.z['emb.weight'][token]
@@ -167,7 +167,9 @@ def generate_single(prompt, max_tokens=50, stop_tokens=[0, 261, 24281], temperat
     static_state_global[0].copy_(state[0])
     static_state_global[1].copy_(state[1])
     static_state_global[2].copy_(state[2])
-    for step in range(max_tokens):
+    
+    # 循环次数减1，保证总共生成max_tokens个token
+    for step in range(max_tokens - 1):
         static_graph.replay()
         
         logits = static_output_global.clone()
@@ -202,13 +204,12 @@ async def single_infer_stream(prompt, max_tokens=50, stop_tokens=[0, 261, 24281]
         logits = out.clone()
         if temperature != 1.0:
             logits /= temperature
-            
         token = sampler_simple(logits, noise=noise).item()
     else:
         token = out
 
-    generated_tokens = []
-    token_buffer = []
+    generated_tokens = [token]  # 第一个token加入结果
+    token_buffer = [token]      # 第一个token也加入缓冲区，以便流式输出
     finished = False
     
     x = model.z['emb.weight'][token]
@@ -218,7 +219,8 @@ async def single_infer_stream(prompt, max_tokens=50, stop_tokens=[0, 261, 24281]
     static_state_global[2].copy_(state[2])
     
     try:
-        for step in range(max_tokens):
+        # 循环次数减1，保证总共生成max_tokens个token
+        for step in range(max_tokens - 1):
             static_graph.replay()
             
             logits = static_output_global.clone()
@@ -228,6 +230,7 @@ async def single_infer_stream(prompt, max_tokens=50, stop_tokens=[0, 261, 24281]
             
             if token in stop_tokens:
                 finished = True
+                # 发送剩余的缓冲区内容
                 if token_buffer:
                     text_chunk = tokenizer.decode(token_buffer, utf8_errors="ignore")
                     chunk = {
@@ -241,6 +244,7 @@ async def single_infer_stream(prompt, max_tokens=50, stop_tokens=[0, 261, 24281]
             generated_tokens.append(token)
             token_buffer.append(token)
             
+            # 缓冲区达到指定大小时发送数据
             if len(token_buffer) >= chunk_size:
                 text_chunk = tokenizer.decode(token_buffer, utf8_errors="ignore")
                 chunk = {
@@ -255,6 +259,7 @@ async def single_infer_stream(prompt, max_tokens=50, stop_tokens=[0, 261, 24281]
             
             await asyncio.sleep(0)
         
+        # 发送最后剩余的内容
         if token_buffer and not finished:
             text_chunk = tokenizer.decode(token_buffer, utf8_errors="ignore")
             chunk = {
@@ -282,8 +287,10 @@ async def v4_chat_completions(request):
 
         req = ChatRequest(**body)
         prompt = req.contents
-        
-        prompt_formatted = f"User: {prompt}\n\nAssistant:"
+        if req.enable_think:
+            prompt_formatted = f"User: {prompt}\n\nAssistant: <think"
+        else:
+            prompt_formatted = f"User: {prompt}\n\nAssistant:"
 
         if not prompt:
             return Response(
