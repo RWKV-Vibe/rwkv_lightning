@@ -226,7 +226,7 @@ curl -X POST http://localhost:8000/v4/chat/completions \
     "max_tokens": 1024,
     "stop_tokens": [0, 261, 24281],
     "temperature": 1.0,
-    "niose": 1.5,
+    "noise": 1.5,
     "stream": true,
     "enable_think": true
   }'
@@ -245,7 +245,7 @@ curl -X POST http://localhost:8000/v4/chat/completions \
     "max_tokens": 1024,
     "stop_tokens": [0, 261, 24281],
     "temperature": 1.0,
-    "niose": 1.5,
+    "noise": 1.5,
     "chunk_size": 128,
     "stream": false,
     "enable_think": true
