@@ -18,8 +18,9 @@ pip install torch robyn pydantic ninja numpy
 
 ## Usage
 ```bash
-python main_robyn.py --model-path <your model path> --port <your port number>
+python main_robyn.py --model-path <your model path> --port <your port number> --password rwkv7_7.2b
 ```
+- if no password, you can do not add ```--password``` flag
 
 
 ## Test API quickly
@@ -77,7 +78,7 @@ curl -X POST http://localhost:8000/v1/chat/completions \
     "temperature": 1.0,
     "noise": 0,
     "stream": true,
-    "enable_think": true
+    "password": "rwkv7_7.2b"
   }'
 ```
 - Non-streaming synchronous batch processing
@@ -93,8 +94,8 @@ curl -X POST http://localhost:8000/v1/chat/completions \
     "stop_tokens": [0, 261, 24281],
     "temperature": 1.0,
     "noise": 0,
-    "stream": true,
-    "enable_think": true
+    "stream": false,
+    "password": "rwkv7_7.2b"
   }'
 ```
 
@@ -122,7 +123,7 @@ curl -X POST http://localhost:8000/v2/chat/completions \
     "alpha_decay": 0.996,
     "chunk_size": 128,
     "stream": true,
-    "enable_think": true
+    "password": "rwkv7_7.2b"
   }'
 ```
 - Non-streaming synchronous batch processing
@@ -145,7 +146,7 @@ curl -X POST http://localhost:8000/v2/chat/completions \
     "alpha_decay": 0.996,
     "chunk_size": 32,
     "stream": false,
-    "enable_think": true
+    "password": "rwkv7_7.2b"
   }'
 ```
 
@@ -176,7 +177,8 @@ curl -X POST http://localhost:8000/v3/chat/completions \
     "alpha_decay": 0.996,
     "chunk_size": 128,
     "stream": true,
-    "enable_think": true
+    "enable_think": true,
+    "password": "rwkv7_7.2b"
   }'
 ```
 - Non-streaming asynchronous batch processing
@@ -201,7 +203,8 @@ curl -X POST http://localhost:8000/v3/chat/completions \
     "alpha_decay": 0.996,
     "chunk_size": 128,
     "stream": false,
-    "enable_think": true
+    "enable_think": true,
+    "password": "rwkv7_7.2b"
   }'
 ```
 ## 5. Single sequence asynchronous inference 

@@ -53,7 +53,8 @@ curl -X POST http://localhost:8000/v1/chat/completions \
     "stop_tokens": [0, 261, 24281],
     "temperature": 1.0,
     "noise": 0,
-    "stream": true
+    "stream": false,
+    "password": "rwkv7_7.2b"
   }'
 echo -e "\n[测试 3/7] V1 流式批处理\n"
 curl -X POST http://localhost:8000/v1/chat/completions \
@@ -67,7 +68,8 @@ curl -X POST http://localhost:8000/v1/chat/completions \
     "stop_tokens": [0, 261, 24281],
     "temperature": 1.0,
     "noise": 0,
-    "stream": true
+    "stream": true,
+    "password": "rwkv7_7.2b"
   }'
 
 
@@ -94,7 +96,8 @@ curl -X POST http://localhost:8000/v2/chat/completions \
     "alpha_frequency": 0.5,
     "alpha_decay": 0.996,
     "chunk_size": 32,
-    "stream": false
+    "stream": false,
+    "password": "rwkv7_7.2b"
   }'
 
 echo -e "\n\n========================================\n\n"
@@ -121,7 +124,8 @@ curl -X POST http://localhost:8000/v2/chat/completions \
     "alpha_frequency": 0.5,
     "alpha_decay": 0.996,
     "chunk_size": 128,
-    "stream": true
+    "stream": true,
+    "password": "rwkv7_7.2b"
   }'
 
 echo -e "\n\n========================================\n\n"
@@ -149,7 +153,9 @@ curl -X POST http://localhost:8000/v3/chat/completions \
     "alpha_frequency": 0.5,
     "alpha_decay": 0.996,
     "chunk_size": 128,
-    "stream": false
+    "stream": false,
+    "enable_think": true,
+    "password": "rwkv7_7.2b"
   }'
 
 echo -e "\n\n========================================\n\n"
@@ -178,7 +184,9 @@ curl -X POST http://localhost:8000/v3/chat/completions \
     "alpha_frequency": 0.5,
     "alpha_decay": 0.996,
     "chunk_size": 128,
-    "stream": true
+    "stream": true,
+    "enable_think": true,
+    "password": "rwkv7_7.2b"
   }'
 
 echo -e "\n\n========================================\n\n"

@@ -15,6 +15,7 @@ from threading import Lock
 parser = argparse.ArgumentParser()
 parser.add_argument("--model-path", type=str, required=True, help="RWKV model path")
 parser.add_argument("--port", type=int, default=8000)
+parser.add_argument("--password", type=str, default=None, help="API password for authentication")
 args_cli = parser.parse_args()
 ROCm_Flag = torch.version.hip is not None
 
@@ -78,6 +79,7 @@ class ChatRequest(BaseModel):
     alpha_decay: float = 0.996
     enable_think: bool = False
     chunk_size: int = 32
+    password: str = None
 
 def torch_top_k_top_p(logits, top_k, top_p):
     if top_k > 0:
@@ -672,11 +674,15 @@ async def continuous_batching_stream(
 async def chat_completions(request):
     body = json.loads(request.body)
     req = ChatRequest(**body)
+
+    if args_cli.password and req.password != args_cli.password:
+        return Response(
+            status_code=401,
+            description=json.dumps({"error": "Unauthorized: invalid or missing password"}),
+            headers={"Content-Type": "application/json"}
+        )
+
     prompts = req.contents
-    if req.enable_think:
-        prompts = [f"User: {q}\n\nAssistant: <think" for q in prompts]
-    else:
-        prompts = [f"User: {q}\n\nAssistant:" for q in prompts]
 
     if req.stream:
         return StreamingResponse(
@@ -710,11 +716,16 @@ async def continuous_batching(request):
     try:
         body = json.loads(request.body)
         req = ChatRequest(**body)
+
+        if args_cli.password and req.password != args_cli.password:
+            return Response(
+                status_code=401,
+                description=json.dumps({"error": "Unauthorized: invalid or missing password"}),
+                headers={"Content-Type": "application/json"}
+            )
+
         prompts = req.contents
-        if req.enable_think:
-            prompts = [f"User: {q}\n\nAssistant: <think" for q in prompts]
-        else:
-            prompts = [f"User: {q}\n\nAssistant:" for q in prompts]
+        
 
         if not prompts:
             return Response(
@@ -803,6 +814,14 @@ async def v3_chat_completions(request):
             body = {**body, "contents": user_texts}
 
         req = ChatRequest(**body)
+
+        if args_cli.password and req.password != args_cli.password:
+            return Response(
+                status_code=401,
+                description=json.dumps({"error": "Unauthorized: invalid or missing password"}),
+                headers={"Content-Type": "application/json"}
+            )
+
         prompts = req.contents
         # 将输入问题转换为指定提示模板："User: 问题\n\nAssistant:"
         if req.enable_think:
