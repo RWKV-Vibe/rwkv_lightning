@@ -290,7 +290,7 @@ async def v4_chat_completions(request):
         if req.enable_think:
             prompt_formatted = f"User: {prompt}\n\nAssistant: <think"
         else:
-            prompt_formatted = f"User: {prompt}\n\nAssistant: <think>/n</think>"
+            prompt_formatted = f"User: {prompt}\n\nAssistant: <think>\n</think>"
 
         if not prompt:
             return Response(

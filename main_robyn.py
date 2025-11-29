@@ -827,7 +827,7 @@ async def v3_chat_completions(request):
         if req.enable_think:
             prompts_formatted = [f"User: {q}\n\nAssistant: <think" for q in prompts]
         else:
-            prompts_formatted = [f"User: {q}\n\nAssistant: <think>/n</think>" for q in prompts]
+            prompts_formatted = [f"User: {q}\n\nAssistant: <think>\n</think>" for q in prompts]
 
         if not prompts:
             return Response(
