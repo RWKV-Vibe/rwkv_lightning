@@ -32,18 +32,19 @@ tokenizer = TRIE_TOKENIZER("rwkv_batch/rwkv_vocab_v20230424.txt")
 
 print(f"[INFO] Model loaded successfully.\n")
 
-static_graph = None
-static_input_global = None
-static_state_global = [None, None, None]
-static_output_global = None
-graph_initialized = False
+# 模板 tensor 形状信息，用于创建每个请求的 graph
+template_input_shape = None
+template_state_shapes = [None, None, None]
+template_output_shape = None
+graph_template_initialized = False
 graph_lock = Lock()
 
-def initialize_cuda_graph():
-    global static_graph, static_input_global, static_state_global, static_output_global, graph_initialized
+def initialize_cuda_graph_template():
+    """初始化模板 graph，用于获取 tensor 形状信息"""
+    global template_input_shape, template_state_shapes, template_output_shape, graph_template_initialized
     
     with graph_lock:
-        if graph_initialized:
+        if graph_template_initialized:
             return  
             
         try:
@@ -57,28 +58,52 @@ def initialize_cuda_graph():
             token = sampler_simple(out, noise=0).item()
             x = model.z['emb.weight'][token]
             
-            static_input_global = torch.empty_like(x, device="cuda")
-            static_state_global[0] = torch.empty_like(state[0], device="cuda")
-            static_state_global[1] = torch.empty_like(state[1], device="cuda")
-            static_state_global[2] = torch.empty_like(state[2], device="cuda")
-            static_output_global = torch.empty_like(out, device="cuda")
+            # 保存形状信息
+            template_input_shape = x.shape
+            template_state_shapes[0] = state[0].shape
+            template_state_shapes[1] = state[1].shape
+            template_state_shapes[2] = state[2].shape
+            template_output_shape = out.shape
             
-            static_output_global = model.forward(static_input_global, static_state_global)
-            
-            static_graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(static_graph):
-                static_output_global = model.forward(static_input_global, static_state_global)
-            
-            static_input_global.copy_(x)
-            static_state_global[0].copy_(state[0])
-            static_state_global[1].copy_(state[1])
-            static_state_global[2].copy_(state[2])
-            
-            graph_initialized = True
-            print("[INFO] CUDA graph initialized successfully.")
+            graph_template_initialized = True
+            print("[INFO] CUDA graph template initialized successfully.")
         except Exception as e:
-            print(f"[WARNING] Failed to initialize CUDA graph: {e}")
+            print(f"[WARNING] Failed to initialize CUDA graph template: {e}")
             print("[INFO] Will use eager mode instead.")
+
+def create_request_graph():
+    """为每个请求创建独立的 graph 和 tensor"""
+    if not graph_template_initialized:
+        return None, None, None, None
+    
+    try:
+        # 创建一个示例 state 和 token 来获取正确的数据类型
+        example_state = model.generate_zero_state(0)
+        example_token = 0
+        example_x = model.z['emb.weight'][example_token]
+        example_out = model.forward(example_x, example_state)
+        
+        # 创建请求专用的 tensor，使用正确的数据类型
+        static_input = torch.empty_like(example_x, device="cuda")
+        static_state = [
+            torch.empty_like(example_state[0], device="cuda"),
+            torch.empty_like(example_state[1], device="cuda"),
+            torch.empty_like(example_state[2], device="cuda")
+        ]
+        static_output = torch.empty_like(example_out, device="cuda")
+        
+        # 预热一次以确定计算图
+        static_output = model.forward(static_input, static_state)
+        
+        # 创建 graph
+        static_graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(static_graph):
+            static_output = model.forward(static_input, static_state)
+        
+        return static_graph, static_input, static_state, static_output
+    except Exception as e:
+        print(f"[WARNING] Failed to create request graph: {e}")
+        return None, None, None, None
 
 app = Robyn(__file__)
 @app.after_request()
@@ -144,7 +169,8 @@ def torch_top_k_top_p(logits, top_k, top_p):
     return sampled_tokens
 
 def generate_single(prompt, max_tokens=50, stop_tokens=[0, 261, 24281], temperature=1.0, noise=1.5):
-    global static_graph, static_input_global, static_state_global, static_output_global, graph_initialized
+    # 为每个请求创建独立的 graph
+    static_graph, static_input, static_state, static_output = create_request_graph()
     
     state = model.generate_zero_state(0)
     encoded_prompt = tokenizer.encode(prompt)
@@ -162,39 +188,65 @@ def generate_single(prompt, max_tokens=50, stop_tokens=[0, 261, 24281], temperat
     generated_tokens = [token]  # 第一个token加入结果
     finished = False
     
-    x = model.z['emb.weight'][token]
-    static_input_global.copy_(x)
-    static_state_global[0].copy_(state[0])
-    static_state_global[1].copy_(state[1])
-    static_state_global[2].copy_(state[2])
-    
-    # 循环次数减1，保证总共生成max_tokens个token
-    for step in range(max_tokens - 1):
-        static_graph.replay()
-        
-        logits = static_output_global.clone()
-        if temperature != 1.0:
-            logits /= temperature
-        token = sampler_simple(logits, noise=noise).item()
-        
-        if token in stop_tokens:
-            finished = True
-            break
+    try:
+        if static_graph is not None:
+            # 使用 CUDA graph
+            x = model.z['emb.weight'][token]
+            static_input.copy_(x)
+            static_state[0].copy_(state[0])
+            static_state[1].copy_(state[1])
+            static_state[2].copy_(state[2])
             
-        generated_tokens.append(token)
-        
-        x = model.z['emb.weight'][token]
-        static_input_global.copy_(x)
-    
-    del state
-    gc.collect()
+            # 循环次数减1，保证总共生成max_tokens个token
+            for step in range(max_tokens - 1):
+                static_graph.replay()
+                
+                logits = static_output.clone()
+                if temperature != 1.0:
+                    logits /= temperature
+                token = sampler_simple(logits, noise=noise).item()
+                
+                if token in stop_tokens:
+                    finished = True
+                    break
+                    
+                generated_tokens.append(token)
+                
+                x = model.z['emb.weight'][token]
+                static_input.copy_(x)
+        else:
+            # 回退到 eager 模式
+            for step in range(max_tokens - 1):
+                x = model.z['emb.weight'][token]
+                out = model.forward(x, state)
+                
+                if isinstance(out, torch.Tensor):
+                    logits = out.clone()
+                    if temperature != 1.0:
+                        logits /= temperature
+                    token = sampler_simple(logits, noise=noise).item()
+                else:
+                    token = out
+                
+                if token in stop_tokens:
+                    finished = True
+                    break
+                    
+                generated_tokens.append(token)
+    finally:
+        # 清理资源
+        del state
+        if static_graph is not None:
+            del static_graph, static_input, static_state, static_output
+        gc.collect()
     
     text = tokenizer.decode(generated_tokens, utf8_errors="ignore")
     return text
 
 async def single_infer_stream(prompt, max_tokens=50, stop_tokens=[0, 261, 24281], 
                              temperature=1.0, noise=1.5, chunk_size=32):
-    global static_graph, static_input_global, static_state_global, static_output_global, graph_initialized
+    # 为每个请求创建独立的 graph
+    static_graph, static_input, static_state, static_output = create_request_graph()
     
     state = model.generate_zero_state(0)
     encoded_prompt = tokenizer.encode(prompt)
@@ -212,26 +264,42 @@ async def single_infer_stream(prompt, max_tokens=50, stop_tokens=[0, 261, 24281]
     token_buffer = [token]      # 第一个token也加入缓冲区，以便流式输出
     finished = False
     
-    x = model.z['emb.weight'][token]
-    static_input_global.copy_(x)
-    static_state_global[0].copy_(state[0])
-    static_state_global[1].copy_(state[1])
-    static_state_global[2].copy_(state[2])
-    
     try:
-        # 循环次数减1，保证总共生成max_tokens个token
-        for step in range(max_tokens - 1):
-            static_graph.replay()
+        if static_graph is not None:
+            # 使用 CUDA graph
+            x = model.z['emb.weight'][token]
+            static_input.copy_(x)
+            static_state[0].copy_(state[0])
+            static_state[1].copy_(state[1])
+            static_state[2].copy_(state[2])
             
-            logits = static_output_global.clone()
-            if temperature != 1.0:
-                logits /= temperature
-            token = sampler_simple(logits, noise=noise).item()
-            
-            if token in stop_tokens:
-                finished = True
-                # 发送剩余的缓冲区内容
-                if token_buffer:
+            # 循环次数减1，保证总共生成max_tokens个token
+            for step in range(max_tokens - 1):
+                static_graph.replay()
+                
+                logits = static_output.clone()
+                if temperature != 1.0:
+                    logits /= temperature
+                token = sampler_simple(logits, noise=noise).item()
+                
+                if token in stop_tokens:
+                    finished = True
+                    # 发送剩余的缓冲区内容
+                    if token_buffer:
+                        text_chunk = tokenizer.decode(token_buffer, utf8_errors="ignore")
+                        chunk = {
+                            "object": "chat.completion.chunk",
+                            "choices": [{"index": 0, "delta": {"content": text_chunk}}]
+                        }
+                        yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+                        token_buffer.clear()
+                    break
+                    
+                generated_tokens.append(token)
+                token_buffer.append(token)
+                
+                # 缓冲区达到指定大小时发送数据
+                if len(token_buffer) >= chunk_size:
                     text_chunk = tokenizer.decode(token_buffer, utf8_errors="ignore")
                     chunk = {
                         "object": "chat.completion.chunk",
@@ -239,25 +307,52 @@ async def single_infer_stream(prompt, max_tokens=50, stop_tokens=[0, 261, 24281]
                     }
                     yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
                     token_buffer.clear()
-                break
                 
-            generated_tokens.append(token)
-            token_buffer.append(token)
-            
-            # 缓冲区达到指定大小时发送数据
-            if len(token_buffer) >= chunk_size:
-                text_chunk = tokenizer.decode(token_buffer, utf8_errors="ignore")
-                chunk = {
-                    "object": "chat.completion.chunk",
-                    "choices": [{"index": 0, "delta": {"content": text_chunk}}]
-                }
-                yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
-                token_buffer.clear()
-            
-            x = model.z['emb.weight'][token]
-            static_input_global.copy_(x)
-            
-            await asyncio.sleep(0)
+                x = model.z['emb.weight'][token]
+                static_input.copy_(x)
+                
+                await asyncio.sleep(0)
+        else:
+            # 回退到 eager 模式
+            for step in range(max_tokens - 1):
+                x = model.z['emb.weight'][token]
+                out = model.forward(x, state)
+                
+                if isinstance(out, torch.Tensor):
+                    logits = out.clone()
+                    if temperature != 1.0:
+                        logits /= temperature
+                    token = sampler_simple(logits, noise=noise).item()
+                else:
+                    token = out
+                
+                if token in stop_tokens:
+                    finished = True
+                    # 发送剩余的缓冲区内容
+                    if token_buffer:
+                        text_chunk = tokenizer.decode(token_buffer, utf8_errors="ignore")
+                        chunk = {
+                            "object": "chat.completion.chunk",
+                            "choices": [{"index": 0, "delta": {"content": text_chunk}}]
+                        }
+                        yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+                        token_buffer.clear()
+                    break
+                    
+                generated_tokens.append(token)
+                token_buffer.append(token)
+                
+                # 缓冲区达到指定大小时发送数据
+                if len(token_buffer) >= chunk_size:
+                    text_chunk = tokenizer.decode(token_buffer, utf8_errors="ignore")
+                    chunk = {
+                        "object": "chat.completion.chunk",
+                        "choices": [{"index": 0, "delta": {"content": text_chunk}}]
+                    }
+                    yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+                    token_buffer.clear()
+                
+                await asyncio.sleep(0)
         
         # 发送最后剩余的内容
         if token_buffer and not finished:
@@ -269,7 +364,10 @@ async def single_infer_stream(prompt, max_tokens=50, stop_tokens=[0, 261, 24281]
             yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
                 
     finally:
+        # 清理资源
         del state
+        if static_graph is not None:
+            del static_graph, static_input, static_state, static_output
         gc.collect()
     
     yield "data: [DONE]\n\n"
@@ -354,12 +452,12 @@ async def v4_chat_completions(request):
         )
     
 if __name__ == "__main__":
-    # 尝试初始化CUDA graph，如果失败则回退到原始模式
+    # 尝试初始化CUDA graph模板，如果失败则回退到原始模式
     try:
-        print("[INFO] Initializing CUDA graph...")
-        initialize_cuda_graph()
+        print("[INFO] Initializing CUDA graph template...")
+        initialize_cuda_graph_template()
     except Exception as e:
-        print(f"[WARNING] Failed to initialize CUDA graph: {e}")
+        print(f"[WARNING] Failed to initialize CUDA graph template: {e}")
         print("[INFO] Will use eager mode instead.")
     
     app.start(host="0.0.0.0", port=args_cli.port)
