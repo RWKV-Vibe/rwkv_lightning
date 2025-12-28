@@ -11,6 +11,7 @@ from rwkv_batch.utils import TRIE_TOKENIZER, sampler_simple_batch
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from threading import Lock
+from rwkv_batch.rwkv7 import Sampling
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--model-path", type=str, required=True, help="RWKV model path")
@@ -103,18 +104,52 @@ def torch_top_k_top_p(logits, top_k, top_p):
     return sampled_tokens
 
 
-def batch_generate(prompts, max_length=512, noise=1.5 ,temperature=1.0, stop_tokens=[0, 261, 24281]):
+def batch_generate(prompts, 
+                   max_length=512, 
+                   temperature=1,
+                   top_k=50,
+                   top_p=0.3,
+                   alpha_presence=0.5,
+                   alpha_frequency=0.5,
+                   alpha_decay=0.996,
+                   stop_tokens=[0, 261, 24281]):
     B = len(prompts)
+    
     state = model.generate_zero_state(B)
+    penalties, single_states = state[-2], state[-1]
+    # print(penalties, single_states)
     encoded_prompts = [tokenizer.encode(p) for p in prompts]
-    out = model.forward_batch(encoded_prompts, state)
+    # 获取每个序列的实际长度
+    lengths = [len(encoded) for encoded in encoded_prompts]
+    max_len = max(lengths) if lengths else 0
+    # 做个左填充0
+    padded_prompts = []
+    for encoded in encoded_prompts:
+        padding_needed = max_len - len(encoded)
+        padded = [0] * padding_needed + encoded  # 左填充
+        padded_prompts.append(padded)
+    tokens_tensor = torch.tensor(padded_prompts, device=model.z['emb.weight'].device)
+    lens_tensor = torch.tensor(lengths, dtype=torch.int32, device="cuda")
+    # varlen prefill
+    out = model.forward_seq_batch_varlen(tokens_tensor, state, lens_tensor) 
 
     finished = [False] * B
     generated_tokens = [[] for _ in range(B)]
 
     for step in range(max_length):
-        new_tokens = sampler_simple_batch(out, noise=noise, temp=temperature).tolist()
-        out = model.forward_batch(new_tokens, state)
+        # new_tokens = Sampling(logits=out,
+        #                       penalties=penalties,
+        #                       states=single_states,
+        #                       presence_penalty=alpha_presence,
+        #                       repetition_penalty=alpha_frequency,
+        #                       penalty_decay=alpha_decay,
+        #                       temperature=temperature,
+        #                       top_k=top_k,
+        #                       top_p=top_p
+        #                       ).tolist()
+        # new_tokens = [[token] for token in new_tokens]
+        new_tokens = sampler_simple_batch(out, noise=0.5, temp=temperature).tolist()
+        out = model.forward_seq_batch_samelen_idx(new_tokens, state)
 
         for i in range(B):
             tok = new_tokens[i][0] if isinstance(new_tokens[i], list) else new_tokens[i]
@@ -136,20 +171,55 @@ def batch_generate(prompts, max_length=512, noise=1.5 ,temperature=1.0, stop_tok
         decoded.append(text)
     return decoded
 
-async def batch_infer_stream(prompts, max_length=512, noise=1.5, temperature=1.0, stop_tokens=[0, 261, 24281]):
+async def batch_infer_stream(prompts, 
+                   max_length=512, 
+                   temperature=1,
+                   top_k=50,
+                   top_p=0.3,
+                   alpha_presence=0.5,
+                   alpha_frequency=0.5,
+                   alpha_decay=0.996,
+                   stop_tokens=[0, 261, 24281],
+                   chunk_size=32):
     B = len(prompts)
     state = model.generate_zero_state(B)
+    penalties, single_states = state[-2], state[-1]
+    # print(penalties, single_states)
     encoded_prompts = [tokenizer.encode(p) for p in prompts]
-    out = model.forward_batch(encoded_prompts, state)
+    # 获取每个序列的实际长度
+    lengths = [len(encoded) for encoded in encoded_prompts]
+    max_len = max(lengths) if lengths else 0
+    # 做个左填充0
+    padded_prompts = []
+    for encoded in encoded_prompts:
+        padding_needed = max_len - len(encoded)
+        padded = [0] * padding_needed + encoded  # 左填充
+        padded_prompts.append(padded)
+    tokens_tensor = torch.tensor(padded_prompts, device=model.z['emb.weight'].device)
+    lens_tensor = torch.tensor(lengths, dtype=torch.int32, device="cuda")
+    # varlen prefill
+    out = model.forward_seq_batch_varlen(tokens_tensor, state, lens_tensor)
 
     finished = [False] * B
     generated_tokens = [[] for _ in range(B)]
     token_buffers = [[] for _ in range(B)] 
 
+
     try:
         while not all(finished) and max_length > 0:
-            new_tokens = sampler_simple_batch(out, noise=noise, temp=temperature).tolist()
-            out = model.forward_batch(new_tokens, state)
+            # new_tokens = Sampling(logits=out,
+            #                   penalties=penalties,
+            #                   states=single_states,
+            #                   presence_penalty=alpha_presence,
+            #                   repetition_penalty=alpha_frequency,
+            #                   penalty_decay=alpha_decay,
+            #                   temperature=temperature,
+            #                   top_k=top_k,
+            #                   top_p=top_p
+            #                   ).tolist()
+            # new_tokens = [[token] for token in new_tokens]
+            new_tokens = sampler_simple_batch(out, noise=0.5, temp=temperature).tolist()
+            out = model.forward_seq_batch_samelen_idx(new_tokens, state)
             max_length -= 1
 
             contents_to_send = [""] * B
@@ -170,7 +240,7 @@ async def batch_infer_stream(prompts, max_length=512, noise=1.5, temperature=1.0
                 token_buffers[i].append(tok)
                 generated_tokens[i].append(tok)
                 
-                if len(token_buffers[i]) >= 32:
+                if len(token_buffers[i]) >= chunk_size:
                     contents_to_send[i] = tokenizer.decode(token_buffers[i], utf8_errors="ignore")
                     token_buffers[i].clear()
             
@@ -380,7 +450,7 @@ def _continuous_batching_stream_sync(
                 next_tokens[task["state_pos"]] = [task["input_token"].pop(0)]
             
             # 模型前向传播
-            out = model.forward_batch(next_tokens, states)
+            out = model.forward_seq_batch_samelen_idx(next_tokens, states)
             
             # 应用惩罚和采样
             occurrence *= alpha_decay
@@ -559,7 +629,7 @@ def _continuous_batching_sync(
                 next_tokens[task["state_pos"]] = [task["input_token"].pop(0)]
             
             # 模型前向传播
-            out = model.forward_batch(next_tokens, states)
+            out = model.forward_seq_batch_samelen_idx(next_tokens, states)
             
             # 应用惩罚和采样
             occurrence *= alpha_decay
@@ -686,11 +756,28 @@ async def chat_completions(request):
 
     if req.stream:
         return StreamingResponse(
-            batch_infer_stream(prompts, req.max_tokens, req.noise, req.temperature, req.stop_tokens),
+            batch_infer_stream(prompts=prompts, 
+                               max_length=req.max_tokens, 
+                               temperature=req.temperature,
+                               top_k=req.top_k,
+                               top_p=req.top_p,
+                               alpha_presence=req.alpha_presence,
+                               alpha_frequency=req.alpha_frequency,
+                               alpha_decay=req.alpha_decay,
+                               stop_tokens=req.stop_tokens,
+                               chunk_size=req.chunk_size),
             media_type="text/event-stream"
         )
 
-    results = batch_generate(prompts, req.max_tokens, req.noise, req.temperature, req.stop_tokens)
+    results = batch_generate(prompts=prompts, 
+                             max_length=req.max_tokens, 
+                             temperature=req.temperature,
+                             top_k=req.top_k,
+                             top_p=req.top_p,
+                             alpha_presence=req.alpha_presence,
+                             alpha_frequency=req.alpha_frequency,
+                             alpha_decay=req.alpha_decay,
+                             stop_tokens=req.stop_tokens)
     choices = []
     for i, text in enumerate(results):
         choices.append({
