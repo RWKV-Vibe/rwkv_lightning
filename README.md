@@ -102,7 +102,7 @@ curl -X POST http://localhost:8000/v1/chat/completions \
 
 ### 3. ```v2/chat/completions``` [Little slower than V1 But Only support all decode parameters]
 **--- Very stable 🚀 ---** 
-- Streaming synchronous batch processing
+- Streaming synchronous continuous batching processing 
 ```bash
 curl -X POST http://localhost:8000/v2/chat/completions \
   -H "Content-Type: application/json" \
@@ -118,15 +118,15 @@ curl -X POST http://localhost:8000/v2/chat/completions \
     "top_k": 1,
     "top_p": 0.3,
     "pad_zero": true,
-    "alpha_presence": 0.5,
-    "alpha_frequency": 0.5,
+    "alpha_presence": 0.8,
+    "alpha_frequency": 0.8,
     "alpha_decay": 0.996,
     "chunk_size": 128,
     "stream": true,
     "password": "rwkv7_7.2b"
   }'
 ```
-- Non-streaming synchronous batch processing
+- Non-streaming synchronous continuous batching processing
 ```bash
 curl -X POST http://localhost:8000/v2/chat/completions \
   -H "Content-Type: application/json" \
@@ -141,8 +141,8 @@ curl -X POST http://localhost:8000/v2/chat/completions \
     "top_k": 1,
     "top_p": 0.3,
     "pad_zero": true,
-    "alpha_presence": 0.5,
-    "alpha_frequency": 0.5,
+    "alpha_presence": 0.8,
+    "alpha_frequency": 0.8,
     "alpha_decay": 0.996,
     "chunk_size": 32,
     "stream": false,
@@ -151,10 +151,9 @@ curl -X POST http://localhost:8000/v2/chat/completions \
 ```
 
 
-### 4. ```v3/chat/completions``` [Little slower than V1 But Only support all decode parameters]
+### 4. ```v3/chat/completions``` [Support all decode parameters]
 
-**--- Under Test Verification, Not sure the stability & performance yet 🚧 🥲 ---** 
-- Streaming asynchronous batch processing
+- Streaming asynchronous batch processing With CUDA Graph For Bsz=1
 ```bash
 curl -X POST http://localhost:8000/v3/chat/completions \
   -H "Content-Type: application/json" \
@@ -172,8 +171,8 @@ curl -X POST http://localhost:8000/v3/chat/completions \
     "top_k": 1,
     "top_p": 0.3,
     "pad_zero": true,
-    "alpha_presence": 0.5,
-    "alpha_frequency": 0.5,
+    "alpha_presence": 0.8,
+    "alpha_frequency": 0.8,
     "alpha_decay": 0.996,
     "chunk_size": 128,
     "stream": true,
@@ -181,7 +180,7 @@ curl -X POST http://localhost:8000/v3/chat/completions \
     "password": "rwkv7_7.2b"
   }'
 ```
-- Non-streaming asynchronous batch processing
+- Non-streaming asynchronous batch processing With CUDA Graph For Bsz=1
 ```bash
 curl -X POST http://localhost:8000/v3/chat/completions \
   -H "Content-Type: application/json" \
@@ -198,59 +197,12 @@ curl -X POST http://localhost:8000/v3/chat/completions \
     "top_k": 1,
     "top_p": 0.3,
     "pad_zero": true,
-    "alpha_presence": 0.5,
-    "alpha_frequency": 0.5,
+    "alpha_presence": 0.8,
+    "alpha_frequency": 0.8,
     "alpha_decay": 0.996,
     "chunk_size": 128,
     "stream": false,
     "enable_think": true,
     "password": "rwkv7_7.2b"
-  }'
-```
-## 5. Single sequence asynchronous inference 
-[Trying to add CUDA graph but it seems not working well beaceus of the sample processing]
-```bash
-python single_infer.py --model-path <your model path> --port <your port number>
-```
-### 5. ```v4/chat/completions``` 
-
-- Streaming asynchronous single sequence processing
-```bash
-curl -X POST http://localhost:8000/v4/chat/completions \
-  -H "Content-Type: application/json" \
-  -N \
-  -d '{
-    "messages": [
-      {
-        "role": "user",
-        "content": "What is the capital of France?"
-      }
-    ],
-    "max_tokens": 1024,
-    "stop_tokens": [0, 261, 24281],
-    "temperature": 1.0,
-    "noise": 1.5,
-    "stream": true,
-    "enable_think": true
-  }'
-```
-- Non-streaming asynchronous single sequence processing
-```bash
-curl -X POST http://localhost:8000/v4/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{
-    "messages": [
-      {
-        "role": "user",
-        "content": "What is the capital of France?"
-      }
-    ],
-    "max_tokens": 1024,
-    "stop_tokens": [0, 261, 24281],
-    "temperature": 1.0,
-    "noise": 1.5,
-    "chunk_size": 128,
-    "stream": false,
-    "enable_think": true
   }'
 ```

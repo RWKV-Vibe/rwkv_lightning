@@ -7,7 +7,7 @@ import asyncio
 from robyn import Robyn, Response, StreamingResponse, ALLOW_CORS
 from pydantic import BaseModel
 from rwkv_batch.rwkv7 import RWKV_x070
-from rwkv_batch.utils import TRIE_TOKENIZER, sampler_simple_batch
+from rwkv_batch.utils import TRIE_TOKENIZER, sampler_simple_batch, sampler_simple
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from threading import Lock
@@ -210,6 +210,252 @@ async def batch_infer_stream(prompts, max_length=512, noise=1.5, temperature=1.0
 
     yield "data: [DONE]\n\n"
 
+async def graph_generate(
+    inputs,
+    stop_tokens,
+    max_generate_tokens,
+    temperature=1.0,
+    top_k=50,
+    top_p=0.3,
+    alpha_presence=0.5,
+    alpha_frequency=0.5,
+    alpha_decay=0.996,
+):
+    # Only BSZ=1 
+    prompt = inputs[0]
+    encoded_prompt = tokenizer.encode(prompt)
+    state = model.generate_zero_state(0)
+    
+    # 3. Prefill
+    out = model.forward(encoded_prompt, state)
+    
+    # 初始采样 (获取 prefill 后的第一个 token)
+    # 用 sampler_simple 取值用于构建 graph 反正只是 prepare CUDA Graph 又没事哈哈，后续循环会用完整采样逻辑
+    token = sampler_simple(out, noise=0, temp=temperature).item()
+    
+    # prepare CUDA Graph 
+    x_emb = model.z['emb.weight'][token]
+    
+    static_input = torch.empty_like(x_emb, device="cuda")
+    static_state = [None, None, None]
+    static_state[0] = torch.empty_like(state[0], device="cuda")
+    static_state[1] = torch.empty_like(state[1], device="cuda")
+    static_state[2] = torch.empty_like(state[2], device="cuda")
+    static_output = torch.empty_like(out, device="cuda")
+
+    # Warmup run 
+    static_output = model.forward(static_input, static_state)
+
+    # Capture Graph
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        static_output = model.forward(static_input, static_state)
+
+    # Copy to static_state (Context Transfer)
+    static_input.copy_(x_emb)
+    static_state[0].copy_(state[0])
+    static_state[1].copy_(state[1])
+    static_state[2].copy_(state[2])
+    static_output.copy_(out)
+    
+    generated_tokens = [token]
+    occurrence = {} 
+    
+    for _ in range(max_generate_tokens):
+        if token in stop_tokens:
+            break
+            
+        x_emb = model.z['emb.weight'][token]
+        static_input.copy_(x_emb)
+        
+        # Replay Graph
+        g.replay()
+        
+        # sampling (必须在 Graph 外进行, 否则会被这该死的随机数生成器炸了的)
+        logits = static_output
+        
+        # 经典加惩罚，求求模型不要再复读了 Please!!!
+        for t, count in occurrence.items():
+             logits[t] -= (alpha_presence + count * alpha_frequency)
+        
+        if temperature != 1.0:
+             logits /= temperature
+        
+        # 增加 batch 维度适配采样函数 [Vocab] -> [1, Vocab]
+        logits_reshaped = logits.unsqueeze(0)
+        
+        if ROCm_Flag:
+             next_token_tensor = torch_top_k_top_p(logits_reshaped, top_k, top_p)
+        else:
+            try:
+                import flashinfer # type: ignore
+                next_token_tensor = flashinfer.sampling.top_k_top_p_sampling_from_logits(logits_reshaped, top_k, top_p)
+            except:
+                next_token_tensor = torch_top_k_top_p(logits_reshaped, top_k, top_p)
+        
+        token = next_token_tensor.item()
+        
+        generated_tokens.append(token)
+        
+        if token not in occurrence:
+            occurrence[token] = 0
+        occurrence[token] += 1
+        occurrence[token] *= alpha_decay
+
+    del state
+    del static_state
+    del static_input
+    del static_output
+    del g
+    gc.collect()
+
+    decoded = tokenizer.decode(generated_tokens, utf8_errors="ignore")
+    return [decoded]
+
+
+async def graph_infer_stream(
+    inputs,
+    stop_tokens,
+    max_generate_tokens,
+    temperature=1.0,
+    top_k=50,
+    top_p=0.3,
+    alpha_presence=0.5,
+    alpha_frequency=0.5,
+    alpha_decay=0.996,
+    chunk_size=32,
+):
+    prompt = inputs[0]
+    encoded_prompt = tokenizer.encode(prompt)
+    
+    state = model.generate_zero_state(0)
+    
+    # 3. Prefill
+    out = model.forward(encoded_prompt, state)
+    
+    # 初始采样 (获取 prefill 后的第一个 token)
+    # 用 sampler_simple 取值用于构建 graph 反正只是 prepare CUDA Graph 又没事哈哈，后续循环会用完整采样逻辑
+    token = sampler_simple(out, noise=0, temp=temperature).item()
+    
+    # 4. 准备 CUDA Graph (严格照搬 Benchmark)
+    x_emb = model.z['emb.weight'][token]
+    
+    static_input = torch.empty_like(x_emb, device="cuda")
+    static_state = [None, None, None]
+    static_state[0] = torch.empty_like(state[0], device="cuda")
+    static_state[1] = torch.empty_like(state[1], device="cuda")
+    static_state[2] = torch.empty_like(state[2], device="cuda")
+    static_output = torch.empty_like(out, device="cuda")
+
+    # Warmup
+    static_output = model.forward(static_input, static_state)
+
+    # 5. Capture
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        static_output = model.forward(static_input, static_state)
+        
+    # 6. Copy Context
+    static_input.copy_(x_emb)
+    static_state[0].copy_(state[0])
+    static_state[1].copy_(state[1])
+    static_state[2].copy_(state[2])
+    static_output.copy_(out)
+    
+    generated_tokens = [token]
+    token_buffer = [token]
+    occurrence = {}
+    
+    try:
+        if token in stop_tokens:
+            pass 
+        else:
+            if len(token_buffer) >= chunk_size:
+                content = tokenizer.decode(token_buffer, utf8_errors="ignore")
+                token_buffer.clear()
+                chunk = {
+                    "object": "chat.completion.chunk",
+                    "choices": [{"index": 0, "delta": {"content": content}}]
+                }
+                yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+
+        for _ in range(max_generate_tokens):
+            if token in stop_tokens:
+                break
+            
+            x_emb = model.z['emb.weight'][token]
+            static_input.copy_(x_emb)
+            
+            # cuda graph Replay
+            g.replay()
+
+            # sampling (必须在 Graph 外进行, 否则会被这该死的随机数生成器炸了的)
+            logits = static_output
+            
+            # 经典加惩罚，求求模型不要再复读了 Please!!!
+            for t, count in occurrence.items():
+                logits[t] -= (alpha_presence + count * alpha_frequency)
+            
+            if temperature != 1.0:
+                logits /= temperature
+            # 增加 batch 维度适配采样函数 [Vocab] -> [1, Vocab]
+            logits_reshaped = logits.unsqueeze(0)
+            
+            if ROCm_Flag:
+                next_token_tensor = torch_top_k_top_p(logits_reshaped, top_k, top_p)
+            else:
+                try:
+                    import flashinfer # type: ignore
+                    next_token_tensor = flashinfer.sampling.top_k_top_p_sampling_from_logits(logits_reshaped, top_k, top_p)
+                except:
+                    next_token_tensor = torch_top_k_top_p(logits_reshaped, top_k, top_p)
+            
+            token = next_token_tensor.item()
+            
+            if token in stop_tokens:
+                break
+
+            generated_tokens.append(token)
+            token_buffer.append(token)
+            
+            # 更新惩罚记录
+            if token not in occurrence:
+                occurrence[token] = 0
+            occurrence[token] += 1
+            occurrence[token] *= alpha_decay
+            
+            # 发送 Chunk
+            if len(token_buffer) >= chunk_size:
+                content = tokenizer.decode(token_buffer, utf8_errors="ignore")
+                token_buffer.clear()
+                chunk = {
+                    "object": "chat.completion.chunk",
+                    "choices": [{"index": 0, "delta": {"content": content}}]
+                }
+                yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+            
+            await asyncio.sleep(0) # 让出控制权
+            
+        # 发送剩余 buffer
+        if token_buffer:
+            content = tokenizer.decode(token_buffer, utf8_errors="ignore")
+            chunk = {
+                "object": "chat.completion.chunk",
+                "choices": [{"index": 0, "delta": {"content": content}}]
+            }
+            if chunk["choices"][0]["delta"]["content"]:
+                yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+                
+    finally:
+        del state
+        del static_state
+        del static_input
+        del static_output
+        del g
+        gc.collect()
+
+    yield "data: [DONE]\n\n"
+
 def _continuous_batching_stream_sync(
     model,
     tokenizer,
@@ -381,6 +627,10 @@ def _continuous_batching_stream_sync(
             
             # 模型前向传播
             out = model.forward_batch(next_tokens, states)
+
+            if alpha_presence != 0 or alpha_frequency != 0:
+                mask = (occurrence > 0).float()
+                out -= (mask * alpha_presence + occurrence * alpha_frequency)
             
             # 应用惩罚和采样
             occurrence *= alpha_decay
@@ -560,6 +810,10 @@ def _continuous_batching_sync(
             
             # 模型前向传播
             out = model.forward_batch(next_tokens, states)
+
+            if alpha_presence != 0 or alpha_frequency != 0:
+                mask = (occurrence > 0).float()
+                out -= (mask * alpha_presence + occurrence * alpha_frequency)
             
             # 应用惩罚和采样
             occurrence *= alpha_decay
@@ -838,13 +1092,9 @@ async def v3_chat_completions(request):
 
         if req.stream:
             return StreamingResponse(
-                continuous_batching_stream(model=model,
-                                           tokenizer=tokenizer,
-                                           inputs=prompts_formatted,
+                graph_infer_stream(inputs=prompts_formatted,
                                            stop_tokens=req.stop_tokens,
                                            max_generate_tokens=req.max_tokens,
-                                           batch_size=len(prompts),
-                                           pad_zero=req.pad_zero,
                                            temperature=req.temperature,
                                            top_k=req.top_k,
                                            top_p=req.top_p,
@@ -855,13 +1105,9 @@ async def v3_chat_completions(request):
                 media_type="text/event-stream"
             )
 
-        results = _continuous_batching_sync(model=model,
-                                            tokenizer=tokenizer,
-                                            inputs=prompts_formatted,
+        results = await graph_generate(inputs=prompts_formatted,
                                             stop_tokens=req.stop_tokens,
                                             max_generate_tokens=req.max_tokens,
-                                            batch_size=len(prompts),
-                                            pad_zero=req.pad_zero,
                                             temperature=req.temperature,
                                             top_k=req.top_k,
                                             top_p=req.top_p,

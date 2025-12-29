@@ -92,8 +92,8 @@ curl -X POST http://localhost:8000/v2/chat/completions \
     "top_k": 1,
     "top_p": 0.3,
     "pad_zero": true,
-    "alpha_presence": 0.5,
-    "alpha_frequency": 0.5,
+    "alpha_presence": 0.8,
+    "alpha_frequency": 0.8,
     "alpha_decay": 0.996,
     "chunk_size": 32,
     "stream": false,
@@ -120,8 +120,8 @@ curl -X POST http://localhost:8000/v2/chat/completions \
     "top_k": 1,
     "top_p": 0.3,
     "pad_zero": true,
-    "alpha_presence": 0.5,
-    "alpha_frequency": 0.5,
+    "alpha_presence": 0.8,
+    "alpha_frequency": 0.8,
     "alpha_decay": 0.996,
     "chunk_size": 128,
     "stream": true,
@@ -133,7 +133,7 @@ echo -e "\n\n========================================\n\n"
 # ============================================================================
 # 测试 6: V3 - 非流式异步高并发
 # ============================================================================
-echo -e "\n[测试 6/7] V3 非流式异步高并发\n"
+echo -e "\n[测试 6/7] V3 非流式异步高并发 With CUDA Graph For Bsz=1\n"
 curl -X POST http://localhost:8000/v3/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
@@ -149,8 +149,8 @@ curl -X POST http://localhost:8000/v3/chat/completions \
     "top_k": 1,
     "top_p": 0.3,
     "pad_zero": true,
-    "alpha_presence": 0.5,
-    "alpha_frequency": 0.5,
+    "alpha_presence": 0.8,
+    "alpha_frequency": 0.8,
     "alpha_decay": 0.996,
     "chunk_size": 128,
     "stream": false,
@@ -163,7 +163,7 @@ echo -e "\n\n========================================\n\n"
 # ============================================================================
 # 测试 7: V3 - 流式异步高并发 (VLLM风格)
 # ============================================================================
-echo -e "\n[测试 7/7] V3 流式异步高并发\n"
+echo -e "\n[测试 7/7] V3 流式异步高并发 With CUDA Graph For Bsz=1\n"
 curl -X POST http://localhost:8000/v3/chat/completions \
   -H "Content-Type: application/json" \
   -N \
@@ -180,8 +180,8 @@ curl -X POST http://localhost:8000/v3/chat/completions \
     "top_k": 1,
     "top_p": 0.3,
     "pad_zero": true,
-    "alpha_presence": 0.5,
-    "alpha_frequency": 0.5,
+    "alpha_presence": 0.8,
+    "alpha_frequency": 0.8,
     "alpha_decay": 0.996,
     "chunk_size": 128,
     "stream": true,
