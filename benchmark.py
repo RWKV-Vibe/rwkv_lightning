@@ -29,7 +29,7 @@ args.head_size = 64
 # args.MODEL_NAME = "/mnt/e/RWKV-Runner/models/rwkv7-g1a-0.4b-20250905-ctx4096"
 # args.MODEL_NAME = "/mnt/e/RWKV-Runner/models/rwkv7-g1-1.5b-20250429-ctx4096"
 # args.MODEL_NAME = "/mnt/e/RWKV-Runner/models/rwkv7-g1-2.9b-20250519-ctx4096"
-args.MODEL_NAME = "/mnt/sda1/rwkv_weights/rwkv7-g0a3-7.2b-20251029-ctx8192"
+args.MODEL_NAME = "/mnt/3f7ab3b2-e663-407a-831c-ee4789165577/rwkv_translate/rwkv7-g1b-1.5b-20251202-ctx8192"
 
 print(f'\nUsing CUDA fp16. Loading {args.MODEL_NAME} ...\n')
 
@@ -273,3 +273,99 @@ for BSZ in [512, 768, 920, 1024, 1248, 1536, 1792, 2048, 2304, 2560]:
             print('#'*80)
 
     print(f'Bsz {BSZ} || Token/s = {round(nnn/times,2)} (forward), {round(nnn/all_times,2)} (full) || {round(time.perf_counter()-t000,3)}s')
+
+######################################################################################################
+
+xprint("Prefill")
+
+base_memory = torch.cuda.memory_allocated()
+print(f'Base memory after model loading: {base_memory/1e9:.2f} GB')
+
+raw = open("test_batch_scripts/calibration_data_v5_rc.txt").read()
+tokens = tokenizer.encode(raw)
+
+for stage in range(8, 12+1):
+    CTX_LEN = 2**stage
+    loss = 0
+    a = 0
+    cnt = 0
+    
+    torch.cuda.reset_peak_memory_stats()
+    
+    times = []
+    while a+CTX_LEN < len(tokens):
+        src = tokens[a:a+CTX_LEN]
+
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        prob = model.forward(src[:-1], model.generate_zero_state(0), full_output=True)
+        torch.cuda.synchronize()
+        t1 = time.perf_counter()
+        times.append(t1 - t0)
+            
+        prob = F.softmax(prob.float(), dim=-1)
+        for j in range(CTX_LEN-1):
+            loss -= math.log(prob[j][src[j+1]])
+            cnt += 1
+        a += CTX_LEN
+
+    final_memory = torch.cuda.memory_allocated()
+    peak_memory = torch.cuda.max_memory_allocated()
+    
+    memory_delta_peak = peak_memory - base_memory
+    memory_delta_final = final_memory - base_memory
+    
+    times = np.percentile(times, SHOW_SPEED_PERCENTILE)
+    print(f'CTX_LEN {CTX_LEN} : avg loss {round(loss/cnt,4)} || prefill {round((CTX_LEN-1)/times)} token/s = {round((CTX_LEN-1)/times * active_params * 2/1e12, 2)} TFLOPS || Memory: +peak {memory_delta_peak/1e9:.2f}GB, +final {memory_delta_final/1e9:.2f}GB')
+
+
+xprint("Batch Prefill")
+
+raw = open("test_batch_scripts/calibration_data_v5_rc.txt").read()
+tokens = tokenizer.encode(raw)
+base_memory = torch.cuda.memory_allocated()
+print(f'Base memory after model loading: {base_memory/1e9:.2f} GB')
+
+for batch_size in [8, 16, 32, 64, 128, 256]:
+    CTX_LEN = 4096
+    total_loss = 0
+    total_tokens = 0  
+    
+    src = tokens[:CTX_LEN] 
+    batch_tokens = [src for _ in range(batch_size)]  
+    torch.cuda.reset_peak_memory_stats()
+    
+    times = []
+    torch.cuda.synchronize()
+    t0 = time.perf_counter()
+    with torch.no_grad():
+        probs = model.forward_seq_batch_trunk(batch_tokens, model.generate_zero_state(batch_size), trunk_len=64)
+    torch.cuda.synchronize()
+    t1 = time.perf_counter()
+    times.append(t1 - t0)
+    
+    probs = F.softmax(probs.float(), dim=-1)
+    # for b in range(batch_size):
+    #     for j in range(CTX_LEN-1):
+    #         total_loss -= math.log(probs[b][j][batch_tokens[b][j+1]].item())
+    #         total_tokens += 1
+
+    final_memory = torch.cuda.memory_allocated()
+    peak_memory = torch.cuda.max_memory_allocated()
+    
+    memory_delta_peak = peak_memory - base_memory
+    memory_delta_final = final_memory - base_memory
+    
+    avg_time = np.mean(times)
+    processed_tokens = batch_size * (CTX_LEN - 1)
+    tokens_per_sec = processed_tokens / avg_time
+    
+    # avg_loss = total_loss / total_tokens 
+    
+    print(f'Batch Size {batch_size}, CTX_LEN {CTX_LEN} : batch prefill {round(tokens_per_sec)} token/s || Memory: +peak {memory_delta_peak/1e9:.5f}GB, +final {memory_delta_final/1e9:.5f}GB')
+    
+    del probs
+    torch.cuda.empty_cache()
+    gc.collect()
+
+exit(0)
