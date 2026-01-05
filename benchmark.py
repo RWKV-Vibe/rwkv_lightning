@@ -339,7 +339,7 @@ for batch_size in [8, 16, 32, 64, 128, 256]:
     torch.cuda.synchronize()
     t0 = time.perf_counter()
     with torch.no_grad():
-        probs = model.forward_seq_batch_trunk(batch_tokens, model.generate_zero_state(batch_size), trunk_len=64)
+        probs = model.forward_seq_batch_chunk(batch_tokens, model.generate_zero_state(batch_size), chunk_len=64)
     torch.cuda.synchronize()
     t1 = time.perf_counter()
     times.append(t1 - t0)

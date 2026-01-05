@@ -350,7 +350,7 @@ class RWKV_x070(MyModule):
             state[2] += len(idxs[0])
             return x
     @MyFunction
-    def forward_seq_batch_trunk(self, idxs: List[List[int]], state: List[torch.Tensor], trunk_len: int = 64, full_output: bool = False):
+    def forward_seq_batch_chunk(self, idxs: List[List[int]], state: List[torch.Tensor], chunk_len: int = 64, full_output: bool = False):
         with torch.no_grad():
             z = self.z
             device = z['emb.weight'].device
@@ -361,13 +361,13 @@ class RWKV_x070(MyModule):
             
             all_outputs = []
 
-            # 按 trunk_len 进行循环处理
-            for start in range(0, total_len, trunk_len):
-                end = min(start + trunk_len, total_len)
-                # 截取当前的 trunk
-                trunk_idxs = full_idxs[:, start:end]
+            # 按 chunk_len 进行循环处理
+            for start in range(0, total_len, chunk_len):
+                end = min(start + chunk_len, total_len)
+                # 截取当前的 chunk
+                chunk_idxs = full_idxs[:, start:end]
                 
-                x = z['emb.weight'][trunk_idxs] 
+                x = z['emb.weight'][chunk_idxs] 
                 v_first = torch.empty_like(x)
 
                 for i in range(self.n_layer):
