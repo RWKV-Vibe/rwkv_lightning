@@ -47,6 +47,7 @@ def after_request(response):
 @app.options("/v2/chat/completions")
 @app.options("/v3/chat/completions")
 @app.options("/translate/v1/batch-translate")
+@app.options("/FIM/v1/batch-FIM")
 async def handle_options():
     return Response(
         status_code=204,
@@ -65,7 +66,9 @@ executor = ThreadPoolExecutor(max_workers=128, thread_name_prefix="model_inferen
 
 class ChatRequest(BaseModel):
     model: str = "rwkv7"
-    contents: list[str]               # 输入句子列表
+    contents: list[str] = []              # 输入句子列表
+    prefix: list[str] = []
+    suffix: list[str] = [] 
     max_tokens: int = 50
     stop_tokens: list[int] = [0, 261, 24281]
     temperature: float = 1.0
@@ -938,6 +941,9 @@ async def chat_completions(request):
 
     prompts = req.contents
 
+    # print(f"[REQUEST] /v1/: {req.model_dump()}")
+    # print(f"[REQUEST] /v1/: {prompts}")
+
     if req.stream:
         return StreamingResponse(
             batch_infer_stream(prompts, req.max_tokens, req.noise, req.temperature, req.stop_tokens),
@@ -1226,5 +1232,97 @@ async def batch_translate(request):
             headers={"Content-Type": "application/json"}
         )
 
+@app.post("/FIM/v1/batch-FIM")
+async def FIM_completions(request):
+    body = json.loads(request.body)
+    req = ChatRequest(**body)
+
+    if args_cli.password and req.password != args_cli.password:
+        return Response(
+            status_code=401,
+            description=json.dumps({"error": "Unauthorized: invalid or missing password"}),
+            headers={"Content-Type": "application/json"}
+        )
+    
+    prompts = []
+    prefix_list = req.prefix
+    suffix_list = req.suffix
+    for prefix, suffix in zip(prefix_list, suffix_list):
+        prompt = f"✿prefix✿✿suffix✿{suffix}✿middle✿{prefix}"
+        prompts.append(prompt)
+    # print(f"[REQUEST] /FIM/v1/batch-FIM: {req.model_dump()}")
+    # print(f"[REQUEST] /FIM/v1/batch-FIM: {prompts}")
+    if len(prompts) == 1:
+        # BachSize == 1 Super Fast Infer with CUDA graph
+        if req.stream:
+            return StreamingResponse(
+                graph_infer_stream(inputs=prompts,
+                                   stop_tokens=req.stop_tokens,
+                                   max_generate_tokens=req.max_tokens,
+                                   temperature=req.temperature,
+                                   top_k=req.top_k,
+                                   top_p=req.top_p,
+                                   alpha_presence=req.alpha_presence,
+                                   alpha_frequency=req.alpha_frequency,
+                                   alpha_decay=req.alpha_decay,
+                                   chunk_size=req.chunk_size),
+                                   media_type="text/event-stream"
+            )
+        else:
+            results = await graph_generate(inputs=prompts,
+                                           stop_tokens=req.stop_tokens,
+                                           max_generate_tokens=req.max_tokens,
+                                           temperature=req.temperature,
+                                           top_k=req.top_k,
+                                           top_p=req.top_p,
+                                           alpha_presence=req.alpha_presence,
+                                           alpha_frequency=req.alpha_frequency,
+                                           alpha_decay=req.alpha_decay)
+            choices = []
+            for i, text in enumerate(results):
+                choices.append({
+                    "index": i,
+                    "message": {"role": "assistant", "content": text},
+                    "finish_reason": "stop",
+                })
+
+            response = {
+                "id": "rwkv7-batch-v3",
+                "object": "chat.completion",
+                "model": req.model,
+                "choices": choices,
+            }
+        return Response(
+            status_code=200,
+            description=json.dumps(response, ensure_ascii=False),
+            headers={"Content-Type": "application/json"}
+        )
+    else: 
+        # BachSize > 1 Fast Batch Infer
+        if req.stream:
+            return StreamingResponse(
+                batch_infer_stream(prompts, req.max_tokens, req.noise, req.temperature, req.stop_tokens),
+                media_type="text/event-stream"
+            )
+        results = batch_generate(prompts, req.max_tokens, req.noise, req.temperature, req.stop_tokens)
+        choices = []
+        for i, text in enumerate(results):
+            choices.append({
+                "index": i,
+                "message": {"role": "assistant", "content": text},
+                "finish_reason": "stop",
+            })
+
+        response = {
+            "id": "rwkv7-batch",
+            "object": "FIM.completion",
+            "model": req.model,
+            "choices": choices,
+        }
+        return Response(
+            status_code=200,
+            description=json.dumps(response, ensure_ascii=False),
+            headers={"Content-Type": "application/json"}
+        )
 if __name__ == "__main__":
     app.start(host="0.0.0.0", port=args_cli.port)
