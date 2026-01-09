@@ -49,14 +49,14 @@ curl -X POST http://localhost:8000/FIM/v1/batch-FIM \
   -H "Content-Type: application/json" \
   -d '{
     "prefix": [
-      "浔阳江头夜送客，枫叶荻花秋瑟瑟。主人下马客在船，举酒欲饮无管弦。醉不成欢惨将别，别时茫茫江浸月。",
-      "浔阳江头夜送客，枫叶荻花秋瑟瑟。主人下马客在船，举酒欲饮无管弦。醉不成欢惨将别，别时茫茫江浸月。",
-      "浔阳江头夜送客，枫叶荻花秋瑟瑟。主人下马客在船，举酒欲饮无管弦。醉不成欢惨将别，别时茫茫江浸月。"
+      "The rain had stopped, but the street still glistened like a river of broken glass.",
+      "She wasn’t sure why she’d come back.",
+      "A cat darted from the alley,"
     ],
     "suffix": [
-      "感我此言良久立，却坐促弦弦转急。凄凄不似向前声，满座重闻皆掩泣。座中泣下谁最多？江州司马青衫湿。",
-      "感我此言良久立，却坐促弦弦转急。凄凄不似向前声，满座重闻皆掩泣。座中泣下谁最多？江州司马青衫湿。",
-      "感我此言良久立，却坐促弦弦转急。凄凄不似向前声，满座重闻皆掩泣。座中泣下谁最多？江州司马青衫湿。"
+      "though everyone knew Mr. Ellis hadn’t opened that door in three years.",
+      "sounding almost like her name.",
+      "And then, from inside, a single lamp clicked on."
     ],
     "max_tokens": 1024,
     "stop_tokens": [0, 261, 24281],
@@ -78,14 +78,14 @@ curl -X POST http://localhost:8000/FIM/v1/batch-FIM \
   -H "Content-Type: application/json" \
   -d '{
     "prefix": [
-      "浔阳江头夜送客，枫叶荻花秋瑟瑟。主人下马客在船，举酒欲饮无管弦。醉不成欢惨将别，别时茫茫江浸月。",
-      "浔阳江头夜送客，枫叶荻花秋瑟瑟。主人下马客在船，举酒欲饮无管弦。醉不成欢惨将别，别时茫茫江浸月。",
-      "浔阳江头夜送客，枫叶荻花秋瑟瑟。主人下马客在船，举酒欲饮无管弦。醉不成欢惨将别，别时茫茫江浸月。"
+      "The rain had stopped, but the street still glistened like a river of broken glass.",
+      "She wasn’t sure why she’d come back.",
+      "A cat darted from the alley,"
     ],
     "suffix": [
-      "感我此言良久立，却坐促弦弦转急。凄凄不似向前声，满座重闻皆掩泣。座中泣下谁最多？江州司马青衫湿。",
-      "感我此言良久立，却坐促弦弦转急。凄凄不似向前声，满座重闻皆掩泣。座中泣下谁最多？江州司马青衫湿。",
-      "感我此言良久立，却坐促弦弦转急。凄凄不似向前声，满座重闻皆掩泣。座中泣下谁最多？江州司马青衫湿。"
+      "though everyone knew Mr. Ellis hadn’t opened that door in three years.",
+      "sounding almost like her name.",
+      "And then, from inside, a single lamp clicked on."
     ],
     "max_tokens": 1024,
     "stop_tokens": [0, 261, 24281],
@@ -125,10 +125,10 @@ curl -X POST http://localhost:8000/FIM/v1/batch-FIM \
   -H "Content-Type: application/json" \
   -d '{
     "prefix": [
-      "浔阳江头夜送客，枫叶荻花秋瑟瑟。主人下马客在船，举酒欲饮无管弦。醉不成欢惨将别，别时茫茫江浸月。"
+      "A cat darted from the alley,"
     ],
     "suffix": [
-      "感我此言良久立，却坐促弦弦转急。凄凄不似向前声，满座重闻皆掩泣。座中泣下谁最多？江州司马青衫湿。"
+      "And then, from inside, a single lamp clicked on."
     ],
     "stop_tokens": [0, 261, 24281],
     "max_tokens": 4096,
@@ -149,10 +149,10 @@ curl -X POST http://localhost:8000/FIM/v1/batch-FIM \
   -H "Content-Type: application/json" \
   -d '{
     "prefix": [
-      "浔阳江头夜送客，枫叶荻花秋瑟瑟。主人下马客在船，举酒欲饮无管弦。醉不成欢惨将别，别时茫茫江浸月。"
+      "A cat darted from the alley,"
     ],
     "suffix": [
-      "感我此言良久立，却坐促弦弦转急。凄凄不似向前声，满座重闻皆掩泣。座中泣下谁最多？江州司马青衫湿。"
+      "And then, from inside, a single lamp clicked on."
     ],
     "max_tokens": 4096,
     "stop_tokens": [0, 261, 24281],
@@ -198,8 +198,8 @@ curl -X POST http://localhost:8000/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
     "contents": [
-      "Chinese: RWKV-8 ROSA 机制：超越注意力机制的神经符号无限范围无损信息传播器，使大语言模型(LLM)能够发明自己的内心独白语言。迈向可扩展后神经方法的第一步，开启人工智能的新时代\n\nEnglish:",
-      "Chinese: 他的脸上写满了痛苦和绝望，你会发现自己对这些故事产生了共鸣\n\nEnglish:"
+      "English: After a blissful two weeks, Jane encounters Rochester in the gardens. He invites her to walk with him, and Jane, caught off guard, accepts. Rochester confides that he has finally decided to marry Blanche Ingram and tells Jane that he knows of an available governess position in Ireland that she could take.\n\nChinese:",
+      "English: That night, a bolt of lightning splits the same chestnut tree under which Rochester and Jane had been sitting that evening.\n\nChinese:"
     ],
     "max_tokens": 1024,
     "stop_tokens": [0, 261, 24281],
@@ -219,8 +219,8 @@ curl -X POST http://localhost:8000/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
     "contents": [
-      "Chinese: RWKV-8 ROSA 机制：超越注意力机制的神经符号无限范围无损信息传播器，使大语言模型(LLM)能够发明自己的内心独白语言。迈向可扩展后神经方法的第一步，开启人工智能的新时代\n\nEnglish:",
-      "Chinese: 他的脸上写满了痛苦和绝望，你会发现自己对这些故事产生了共鸣\n\nEnglish:"
+      "English: After a blissful two weeks, Jane encounters Rochester in the gardens. He invites her to walk with him, and Jane, caught off guard, accepts. Rochester confides that he has finally decided to marry Blanche Ingram and tells Jane that he knows of an available governess position in Ireland that she could take.\n\nChinese:",
+      "English: That night, a bolt of lightning splits the same chestnut tree under which Rochester and Jane had been sitting that evening.\n\nChinese:"
     ],
     "max_tokens": 1024,
     "stop_tokens": [0, 261, 24281],
@@ -245,8 +245,8 @@ curl -X POST http://localhost:8000/v2/chat/completions \
   -N \
   -d '{
     "contents": [
-      "Chinese: RWKV-8 ROSA 机制：超越注意力机制的神经符号无限范围无损信息传播器，使大语言模型(LLM)能够发明自己的内心独白语言。迈向可扩展后神经方法的第一步，开启人工智能的新时代\n\nEnglish:",
-      "Chinese: 他的脸上写满了痛苦和绝望，你会发现自己对这些故事产生了共鸣\n\nEnglish:"
+      "English: After a blissful two weeks, Jane encounters Rochester in the gardens. He invites her to walk with him, and Jane, caught off guard, accepts. Rochester confides that he has finally decided to marry Blanche Ingram and tells Jane that he knows of an available governess position in Ireland that she could take.\n\nChinese:",
+      "English: That night, a bolt of lightning splits the same chestnut tree under which Rochester and Jane had been sitting that evening.\n\nChinese:"
     ],
     "max_tokens": 1024,
     "stop_tokens": [0, 261, 24281],
@@ -268,8 +268,8 @@ curl -X POST http://localhost:8000/v2/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
     "contents": [
-      "Chinese: RWKV-8 ROSA 机制：超越注意力机制的神经符号无限范围无损信息传播器，使大语言模型(LLM)能够发明自己的内心独白语言。迈向可扩展后神经方法的第一步，开启人工智能的新时代\n\nEnglish:",
-      "Chinese: 他的脸上写满了痛苦和绝望，你会发现自己对这些故事产生了共鸣\n\nEnglish:"
+      "English: After a blissful two weeks, Jane encounters Rochester in the gardens. He invites her to walk with him, and Jane, caught off guard, accepts. Rochester confides that he has finally decided to marry Blanche Ingram and tells Jane that he knows of an available governess position in Ireland that she could take.\n\nChinese:",
+      "English: That night, a bolt of lightning splits the same chestnut tree under which Rochester and Jane had been sitting that evening.\n\nChinese:"
     ],
     "max_tokens": 1024,
     "stop_tokens": [0, 261, 24281],
