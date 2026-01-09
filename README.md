@@ -1,6 +1,6 @@
 # rwkv_lightning 🕊️ ⚡
 RWKV Batch infer backend Base on [Albatross](https://github.com/BlinkDL/Albatross) 🕊️ and [Robyn](https://github.com/sparckles/Robyn) 🦀 
-
+- Thanks to [Rapid-Sampling](https://github.com/Triang-jyed-driung/Rapid-Sampling) Kernel From [Triang-jyed-driung](https://github.com/Triang-jyed-driung), it also have native HIP kerel compatible with ROCm😎
 ## Install requirements
 **For Nvidia CUDA**
 ```bash
@@ -58,10 +58,14 @@ curl -X POST http://localhost:8000/FIM/v1/batch-FIM \
       "感我此言良久立，却坐促弦弦转急。凄凄不似向前声，满座重闻皆掩泣。座中泣下谁最多？江州司马青衫湿。",
       "感我此言良久立，却坐促弦弦转急。凄凄不似向前声，满座重闻皆掩泣。座中泣下谁最多？江州司马青衫湿。"
     ],
-    "max_tokens": 4096,
+    "max_tokens": 1024,
     "stop_tokens": [0, 261, 24281],
     "temperature": 0.8,
-    "noise": 0,
+    "top_k": 50,
+    "top_p": 0.6,
+    "alpha_presence": 1.0,
+    "alpha_frequency": 0.1,
+    "alpha_decay": 0.99,
     "stream": true,
     "password": "rwkv7_7.2b"
   }'
@@ -83,10 +87,14 @@ curl -X POST http://localhost:8000/FIM/v1/batch-FIM \
       "感我此言良久立，却坐促弦弦转急。凄凄不似向前声，满座重闻皆掩泣。座中泣下谁最多？江州司马青衫湿。",
       "感我此言良久立，却坐促弦弦转急。凄凄不似向前声，满座重闻皆掩泣。座中泣下谁最多？江州司马青衫湿。"
     ],
-    "max_tokens": 4096,
+    "max_tokens": 1024,
     "stop_tokens": [0, 261, 24281],
     "temperature": 0.8,
-    "noise": 0,
+    "top_k": 50,
+    "top_p": 0.6,
+    "alpha_presence": 1.0,
+    "alpha_frequency": 0.1,
+    "alpha_decay": 0.99,
     "stream": false,
     "password": "rwkv7_7.2b"
   }'
@@ -94,12 +102,23 @@ curl -X POST http://localhost:8000/FIM/v1/batch-FIM \
 
 **BachSize == 1 Super Fast stream Infer with CUDA graph**
 
-When BatchSize == 1 , make sure 
+make sure 
     "temperature": 0.8,
     "top_k": 1,
     "top_p": 0,
     "alpha_presence": 0,
     "alpha_frequency": 0,
+    "alpha_decay": 0.96,
+For Text Generation
+
+make sure 
+    "temperature": 0.5,
+    "top_k": 100,
+    "top_p": 0.5,
+    "alpha_presence": 1.0,
+    "alpha_frequency": 0.1,
+    "alpha_decay": 0.99,
+For Coding
 
 ```bash
 curl -X POST http://localhost:8000/FIM/v1/batch-FIM \
@@ -171,7 +190,7 @@ curl -X POST http://localhost:8000/translate/v1/batch-translate \
 ```
 
 
-### 2. ```v1/chat/completions``` [Fastest Speed But Only support noise temperature decode] 
+### 2. ```v1/chat/completions``` 
 **--- Very stable 🚀 ---** 
 - Streaming synchronous batch processing 
 ```bash
@@ -184,8 +203,12 @@ curl -X POST http://localhost:8000/v1/chat/completions \
     ],
     "max_tokens": 1024,
     "stop_tokens": [0, 261, 24281],
-    "temperature": 1.0,
-    "noise": 0,
+    "temperature": 0.8,
+    "top_k": 50,
+    "top_p": 0.6,
+    "alpha_presence": 1.0,
+    "alpha_frequency": 0.1,
+    "alpha_decay": 0.99,
     "stream": true,
     "password": "rwkv7_7.2b"
   }'
@@ -201,15 +224,19 @@ curl -X POST http://localhost:8000/v1/chat/completions \
     ],
     "max_tokens": 1024,
     "stop_tokens": [0, 261, 24281],
-    "temperature": 1.0,
-    "noise": 0,
+    "temperature": 0.8,
+    "top_k": 50,
+    "top_p": 0.6,
+    "alpha_presence": 1.0,
+    "alpha_frequency": 0.1,
+    "alpha_decay": 0.99,
     "stream": false,
     "password": "rwkv7_7.2b"
   }'
 ```
 
 
-### 3. ```v2/chat/completions``` [Little slower than V1 But Only support all decode parameters]
+### 3. ```v2/chat/completions``` 
 **--- Very stable 🚀 ---** 
 - Streaming synchronous continuous batching processing 
 ```bash

@@ -8,6 +8,7 @@ from robyn import Robyn, Response, StreamingResponse, ALLOW_CORS
 from pydantic import BaseModel
 from rwkv_batch.rwkv7 import RWKV_x070
 from rwkv_batch.utils import TRIE_TOKENIZER, sampler_simple_batch, sampler_simple
+from rwkv_batch.sampler import sample
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from threading import Lock
@@ -106,18 +107,24 @@ def torch_top_k_top_p(logits, top_k, top_p):
     return sampled_tokens
 
 
-def batch_generate(prompts, max_length=512, noise=1.5 ,temperature=1.0, stop_tokens=[0, 261, 24281]):
+def batch_generate(prompts, max_length=512, temperature=1.0, top_k=50, top_p=0.6, alpha_presence=1.0, alpha_frequency=0.1, alpha_decay=0.996, stop_tokens=[0, 261, 24281]):
     B = len(prompts)
     state = model.generate_zero_state(B)
     encoded_prompts = [tokenizer.encode(p) for p in prompts]
-    out = model.forward_batch(encoded_prompts, state)
+    out = model.forward_batch(encoded_prompts, state).float()
 
     finished = [False] * B
     generated_tokens = [[] for _ in range(B)]
 
     for step in range(max_length):
-        new_tokens = sampler_simple_batch(out, noise=noise, temp=temperature).tolist()
-        out = model.forward_batch(new_tokens, state)
+        sample_rand_states = sample.setup_rand(0, B)
+        penalties = torch.zeros(B, 65536).to(0)
+        new_tokens = sample.batch_sampling_repetition_temperature_topk_topp(out, penalties, sample_rand_states,
+                                                                     alpha_presence, alpha_frequency, alpha_decay,
+                                                                     temperature, top_k, top_p).tolist()
+        # new_tokens = sampler_simple_batch(out, noise=noise, temp=temperature).tolist()
+        new_tokens = [[token] for token in new_tokens]
+        out = model.forward_batch(new_tokens, state).float()
 
         for i in range(B):
             tok = new_tokens[i][0] if isinstance(new_tokens[i], list) else new_tokens[i]
@@ -139,11 +146,11 @@ def batch_generate(prompts, max_length=512, noise=1.5 ,temperature=1.0, stop_tok
         decoded.append(text)
     return decoded
 
-async def batch_infer_stream(prompts, max_length=512, noise=1.5, temperature=1.0, stop_tokens=[0, 261, 24281]):
+async def batch_infer_stream(prompts, max_length=512, temperature=1.0, top_k=50, top_p=0.6, alpha_presence=1.0, alpha_frequency=0.1, alpha_decay=0.996, stop_tokens=[0, 261, 24281], chunk_size=32):
     B = len(prompts)
     state = model.generate_zero_state(B)
     encoded_prompts = [tokenizer.encode(p) for p in prompts]
-    out = model.forward_batch(encoded_prompts, state)
+    out = model.forward_batch(encoded_prompts, state).float()
 
     finished = [False] * B
     generated_tokens = [[] for _ in range(B)]
@@ -151,8 +158,14 @@ async def batch_infer_stream(prompts, max_length=512, noise=1.5, temperature=1.0
 
     try:
         while not all(finished) and max_length > 0:
-            new_tokens = sampler_simple_batch(out, noise=noise, temp=temperature).tolist()
-            out = model.forward_batch(new_tokens, state)
+            sample_rand_states = sample.setup_rand(0, B)
+            penalties = torch.zeros(B, 65536).to(0)
+            new_tokens = sample.batch_sampling_repetition_temperature_topk_topp(out, penalties, sample_rand_states,
+                                                                         alpha_presence, alpha_frequency, alpha_decay,
+                                                                         temperature, top_k, top_p).tolist()
+            # new_tokens = sampler_simple_batch(out, noise=noise, temp=temperature).tolist()
+            new_tokens = [[token] for token in new_tokens]
+            out = model.forward_batch(new_tokens, state).float()
             max_length -= 1
 
             contents_to_send = [""] * B
@@ -173,7 +186,7 @@ async def batch_infer_stream(prompts, max_length=512, noise=1.5, temperature=1.0
                 token_buffers[i].append(tok)
                 generated_tokens[i].append(tok)
                 
-                if len(token_buffers[i]) >= 32:
+                if len(token_buffers[i]) >= chunk_size:
                     contents_to_send[i] = tokenizer.decode(token_buffers[i], utf8_errors="ignore")
                     token_buffers[i].clear()
             
@@ -229,14 +242,12 @@ async def graph_generate(
     encoded_prompt = tokenizer.encode(prompt)
     state = model.generate_zero_state(0)
     
-    # 3. Prefill
     out = model.forward(encoded_prompt, state)
     
     # 初始采样 (获取 prefill 后的第一个 token)
     # 用 sampler_simple 取值用于构建 graph 反正只是 prepare CUDA Graph 又没事哈哈，后续循环会用完整采样逻辑
     token = sampler_simple(out, noise=0, temp=temperature).item()
     
-    # prepare CUDA Graph 
     x_emb = model.z['emb.weight'][token]
     
     static_input = torch.empty_like(x_emb, device="cuda")
@@ -249,7 +260,6 @@ async def graph_generate(
     # Warmup run 
     static_output = model.forward(static_input, static_state)
 
-    # Capture Graph
     g = torch.cuda.CUDAGraph()
     with torch.cuda.graph(g):
         static_output = model.forward(static_input, static_state)
@@ -262,11 +272,8 @@ async def graph_generate(
     static_output.copy_(out)
     
     generated_tokens = [token]
-    occurrence = {} 
     
     for _ in range(max_generate_tokens):
-        if token in stop_tokens:
-            break
             
         x_emb = model.z['emb.weight'][token]
         static_input.copy_(x_emb)
@@ -274,36 +281,19 @@ async def graph_generate(
         # Replay Graph
         g.replay()
         
-        # sampling (必须在 Graph 外进行, 否则会被这该死的随机数生成器炸了的)
-        logits = static_output
-        
-        # 经典加惩罚，求求模型不要再复读了 Please!!!
-        for t, count in occurrence.items():
-             logits[t] -= (alpha_presence + count * alpha_frequency)
-        
-        if temperature != 1.0:
-             logits /= temperature
-        
+        # sampling (必须在 Graph 外进行, 否则会被这该死的随机数生成器炸了的)        
         # 增加 batch 维度适配采样函数 [Vocab] -> [1, Vocab]
-        logits_reshaped = logits.unsqueeze(0)
+        logits_reshaped = static_output.unsqueeze(0).float()
         
-        if ROCm_Flag:
-             next_token_tensor = torch_top_k_top_p(logits_reshaped, top_k, top_p)
-        else:
-            try:
-                import flashinfer # type: ignore
-                next_token_tensor = flashinfer.sampling.top_k_top_p_sampling_from_logits(logits_reshaped, top_k, top_p)
-            except:
-                next_token_tensor = torch_top_k_top_p(logits_reshaped, top_k, top_p)
-        
-        token = next_token_tensor.item()
-        
+        sample_rand_states = sample.setup_rand(0, 1)
+        penalties = torch.zeros(1, 65536).to(0)
+        new_tokens = sample.batch_sampling_repetition_temperature_topk_topp(logits_reshaped, penalties, sample_rand_states,
+                                                                     alpha_presence, alpha_frequency, alpha_decay,
+                                                                     temperature, top_k, top_p).tolist()
+        token = new_tokens[0]
         generated_tokens.append(token)
-        
-        if token not in occurrence:
-            occurrence[token] = 0
-        occurrence[token] += 1
-        occurrence[token] *= alpha_decay
+        if token in stop_tokens:
+            break
 
     del state
     del static_state
@@ -333,14 +323,12 @@ async def graph_infer_stream(
     
     state = model.generate_zero_state(0)
     
-    # 3. Prefill
     out = model.forward(encoded_prompt, state)
     
     # 初始采样 (获取 prefill 后的第一个 token)
     # 用 sampler_simple 取值用于构建 graph 反正只是 prepare CUDA Graph 又没事哈哈，后续循环会用完整采样逻辑
     token = sampler_simple(out, noise=0, temp=temperature).item()
     
-    # 4. 准备 CUDA Graph (严格照搬 Benchmark)
     x_emb = model.z['emb.weight'][token]
     
     static_input = torch.empty_like(x_emb, device="cuda")
@@ -350,29 +338,23 @@ async def graph_infer_stream(
     static_state[2] = torch.empty_like(state[2], device="cuda")
     static_output = torch.empty_like(out, device="cuda")
 
-    # Warmup
     static_output = model.forward(static_input, static_state)
 
-    # 5. Capture
     g = torch.cuda.CUDAGraph()
     with torch.cuda.graph(g):
         static_output = model.forward(static_input, static_state)
         
-    # 6. Copy Context
     static_input.copy_(x_emb)
     static_state[0].copy_(state[0])
     static_state[1].copy_(state[1])
     static_state[2].copy_(state[2])
     static_output.copy_(out)
     
-    generated_tokens = [token]
-    token_buffer = [token]
-    occurrence = {}
+    token_buffer = [token]  # 只在buffer中维护需要输出的token
     
     try:
-        if token in stop_tokens:
-            pass 
-        else:
+        # 检查初始token是否为停止token
+        if token not in stop_tokens:
             if len(token_buffer) >= chunk_size:
                 content = tokenizer.decode(token_buffer, utf8_errors="ignore")
                 token_buffer.clear()
@@ -383,70 +365,49 @@ async def graph_infer_stream(
                 yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
 
         for _ in range(max_generate_tokens):
-            if token in stop_tokens:
-                break
-            
             x_emb = model.z['emb.weight'][token]
             static_input.copy_(x_emb)
             
             # cuda graph Replay
             g.replay()
 
-            # sampling (必须在 Graph 外进行, 否则会被这该死的随机数生成器炸了的)
-            logits = static_output
-            
-            # 经典加惩罚，求求模型不要再复读了 Please!!!
-            for t, count in occurrence.items():
-                logits[t] -= (alpha_presence + count * alpha_frequency)
-            
-            if temperature != 1.0:
-                logits /= temperature
+            # sampling (必须在 Graph 外进行, 否则会被这该死的随机数生成器炸了的)        
             # 增加 batch 维度适配采样函数 [Vocab] -> [1, Vocab]
-            logits_reshaped = logits.unsqueeze(0)
+            logits_reshaped = static_output.unsqueeze(0).float()
             
-            if ROCm_Flag:
-                next_token_tensor = torch_top_k_top_p(logits_reshaped, top_k, top_p)
-            else:
-                try:
-                    import flashinfer # type: ignore
-                    next_token_tensor = flashinfer.sampling.top_k_top_p_sampling_from_logits(logits_reshaped, top_k, top_p)
-                except:
-                    next_token_tensor = torch_top_k_top_p(logits_reshaped, top_k, top_p)
-            
-            token = next_token_tensor.item()
-            
+            sample_rand_states = sample.setup_rand(0, 1)
+            penalties = torch.zeros(1, 65536).to(0)
+            new_tokens = sample.batch_sampling_repetition_temperature_topk_topp(logits_reshaped, penalties, sample_rand_states,
+                                                                         alpha_presence, alpha_frequency, alpha_decay,
+                                                                         temperature, top_k, top_p).tolist()
+            token = new_tokens[0]  
             if token in stop_tokens:
                 break
 
-            generated_tokens.append(token)
+            # 添加到buffer中准备输出
             token_buffer.append(token)
-            
-            # 更新惩罚记录
-            if token not in occurrence:
-                occurrence[token] = 0
-            occurrence[token] += 1
-            occurrence[token] *= alpha_decay
             
             # 发送 Chunk
             if len(token_buffer) >= chunk_size:
                 content = tokenizer.decode(token_buffer, utf8_errors="ignore")
                 token_buffer.clear()
-                chunk = {
-                    "object": "chat.completion.chunk",
-                    "choices": [{"index": 0, "delta": {"content": content}}]
-                }
-                yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+                if content:  # 只有在内容非空时才发送
+                    chunk = {
+                        "object": "chat.completion.chunk",
+                        "choices": [{"index": 0, "delta": {"content": content}}]
+                    }
+                    yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
             
             await asyncio.sleep(0) # 让出控制权
             
         # 发送剩余 buffer
         if token_buffer:
             content = tokenizer.decode(token_buffer, utf8_errors="ignore")
-            chunk = {
-                "object": "chat.completion.chunk",
-                "choices": [{"index": 0, "delta": {"content": content}}]
-            }
-            if chunk["choices"][0]["delta"]["content"]:
+            if content:  # 只有在内容非空时才发送
+                chunk = {
+                    "object": "chat.completion.chunk",
+                    "choices": [{"index": 0, "delta": {"content": content}}]
+                }
                 yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
                 
     finally:
@@ -946,11 +907,32 @@ async def chat_completions(request):
 
     if req.stream:
         return StreamingResponse(
-            batch_infer_stream(prompts, req.max_tokens, req.noise, req.temperature, req.stop_tokens),
+            batch_infer_stream(
+                prompts = prompts,
+                max_length = req.max_tokens,
+                temperature = req.temperature,
+                top_k = req.top_k,
+                top_p = req.top_p,
+                alpha_presence = req.alpha_presence,
+                alpha_frequency = req.alpha_frequency,
+                alpha_decay = req.alpha_decay,
+                stop_tokens=req.stop_tokens,
+                chunk_size = req.chunk_size,
+            ),
             media_type="text/event-stream"
         )
 
-    results = batch_generate(prompts, req.max_tokens, req.noise, req.temperature, req.stop_tokens)
+    results = batch_generate(                
+                prompts = prompts,
+                max_length = req.max_tokens,
+                temperature = req.temperature,
+                top_k = req.top_k,
+                top_p = req.top_p,
+                alpha_presence = req.alpha_presence,
+                alpha_frequency = req.alpha_frequency,
+                alpha_decay = req.alpha_decay,
+                stop_tokens=req.stop_tokens,
+            )
     choices = []
     for i, text in enumerate(results):
         choices.append({
@@ -1188,7 +1170,7 @@ async def batch_translate(request):
     body = json.loads(request.body)
     req = TranslateRequest(**body)
 
-    print(f"[REQUEST] /translate/v1/batch-translate: {req.model_dump()}")
+    # print(f"[REQUEST] /translate/v1/batch-translate: {req.model_dump()}")
 
     try:
         processed_texts = req.text_list
@@ -1201,7 +1183,17 @@ async def batch_translate(request):
         max_tokens = 2048
         temperature = 1.0
 
-        translated_texts = batch_generate(prompts, max_length=max_tokens, noise=0, temperature=temperature)
+        translated_texts = batch_generate(                
+                prompts = prompts,
+                max_length = max_tokens,
+                temperature = temperature,
+                top_k = 1,
+                top_p = 0,
+                alpha_presence = 0,
+                alpha_frequency = 0,
+                alpha_decay = 0.996,
+                stop_tokens=[0],
+        )
                 
         translations_result = []
         for i, translation in enumerate(translated_texts):
@@ -1214,7 +1206,7 @@ async def batch_translate(request):
             translations=translations_result,
         )
         
-        print(f"[RESPONSE] /translate/v1/batch-translate: {response.model_dump()}")
+        # print(f"[RESPONSE] /translate/v1/batch-translate: {response.model_dump()}")
 
         return Response(
             status_code=200,
@@ -1301,10 +1293,30 @@ async def FIM_completions(request):
         # BachSize > 1 Fast Batch Infer
         if req.stream:
             return StreamingResponse(
-                batch_infer_stream(prompts, req.max_tokens, req.noise, req.temperature, req.stop_tokens),
-                media_type="text/event-stream"
+                batch_infer_stream(
+                    prompts = prompts,
+                    max_length = req.max_tokens,
+                    temperature = req.temperature,
+                    top_k = req.top_k,
+                    top_p = req.top_p,
+                    alpha_presence = req.alpha_presence,
+                    alpha_frequency = req.alpha_frequency,
+                    alpha_decay = req.alpha_decay,
+                    stop_tokens=req.stop_tokens,
+                    chunk_size = req.chunk_size,),
+                    media_type="text/event-stream"
             )
-        results = batch_generate(prompts, req.max_tokens, req.noise, req.temperature, req.stop_tokens)
+        results = batch_generate(
+            prompts = prompts,
+            max_length = req.max_tokens,
+            temperature = req.temperature,
+            top_k = req.top_k,
+            top_p = req.top_p,
+            alpha_presence = req.alpha_presence,
+            alpha_frequency = req.alpha_frequency,
+            alpha_decay = req.alpha_decay,
+            stop_tokens=req.stop_tokens,
+        )
         choices = []
         for i, text in enumerate(results):
             choices.append({

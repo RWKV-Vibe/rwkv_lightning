@@ -51,9 +51,13 @@ curl -X POST http://localhost:8000/v1/chat/completions \
     ],
     "max_tokens": 1024,
     "stop_tokens": [0, 261, 24281],
-    "temperature": 1.0,
-    "noise": 0,
-    "stream": false,
+    "temperature": 0.8,
+    "top_k": 50,
+    "top_p": 0.6,
+    "alpha_presence": 1.0,
+    "alpha_frequency": 0.1,
+    "alpha_decay": 0.99,
+    "stream": true,
     "password": "rwkv7_7.2b"
   }'
 echo -e "\n[测试 3/7] V1 流式批处理\n"
@@ -66,8 +70,12 @@ curl -X POST http://localhost:8000/v1/chat/completions \
     ],
     "max_tokens": 1024,
     "stop_tokens": [0, 261, 24281],
-    "temperature": 1.0,
-    "noise": 0,
+    "temperature": 0.8,
+    "top_k": 50,
+    "top_p": 0.6,
+    "alpha_presence": 1.0,
+    "alpha_frequency": 0.1,
+    "alpha_decay": 0.99,
     "stream": true,
     "password": "rwkv7_7.2b"
   }'
