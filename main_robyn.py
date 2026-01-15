@@ -144,6 +144,7 @@ def batch_generate(prompts, max_length=512, temperature=1.0, top_k=50, top_p=0.6
     for i in range(B):
         text = tokenizer.decode(generated_tokens[i], utf8_errors="ignore")
         decoded.append(text)
+    torch.cuda.empty_cache()
     return decoded
 
 async def batch_infer_stream(prompts, max_length=512, temperature=1.0, top_k=50, top_p=0.6, alpha_presence=1.0, alpha_frequency=0.1, alpha_decay=0.996, stop_tokens=[0, 261, 24281], chunk_size=32):
@@ -222,6 +223,7 @@ async def batch_infer_stream(prompts, max_length=512, temperature=1.0, top_k=50,
                 
     finally:
         del state
+        torch.cuda.empty_cache()
         gc.collect()
 
     yield "data: [DONE]\n\n"
@@ -301,6 +303,7 @@ async def graph_generate(
     del static_output
     del g
     gc.collect()
+    torch.cuda.empty_cache()
 
     decoded = tokenizer.decode(generated_tokens, utf8_errors="ignore")
     return [decoded]
@@ -417,6 +420,7 @@ async def graph_infer_stream(
         del static_output
         del g
         gc.collect()
+        torch.cuda.empty_cache()
 
     yield "data: [DONE]\n\n"
 
@@ -623,6 +627,7 @@ def _continuous_batching_stream_sync(
         del occurrence
         del alpha_presence_vector
         gc.collect()
+        torch.cuda.empty_cache()
         output_queue.put("EOF")  # 发送结束信号
 
 
@@ -806,6 +811,7 @@ def _continuous_batching_sync(
         del occurrence
         del alpha_presence_vector
         gc.collect()
+        torch.cuda.empty_cache()
     
     # 返回结果列表，按照输入顺序
     return [results.get(i, "") for i in range(len(inputs))]
