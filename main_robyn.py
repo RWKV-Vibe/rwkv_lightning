@@ -1,6 +1,7 @@
 import argparse
 import torch
 import types
+import random
 import json
 import gc, re
 import asyncio
@@ -117,7 +118,7 @@ def batch_generate(prompts, max_length=512, temperature=1.0, top_k=50, top_p=0.6
     generated_tokens = [[] for _ in range(B)]
 
     for step in range(max_length):
-        sample_rand_states = sample.setup_rand(0, B)
+        sample_rand_states = sample.setup_rand(random.randint(0, 2**63 - 1), B)
         penalties = torch.zeros(B, 65536).to(0)
         new_tokens = sample.batch_sampling_repetition_temperature_topk_topp(out, penalties, sample_rand_states,
                                                                      alpha_presence, alpha_frequency, alpha_decay,
@@ -159,7 +160,7 @@ async def batch_infer_stream(prompts, max_length=512, temperature=1.0, top_k=50,
 
     try:
         while not all(finished) and max_length > 0:
-            sample_rand_states = sample.setup_rand(0, B)
+            sample_rand_states = sample.setup_rand(random.randint(0, 2**63 - 1), B)
             penalties = torch.zeros(B, 65536).to(0)
             new_tokens = sample.batch_sampling_repetition_temperature_topk_topp(out, penalties, sample_rand_states,
                                                                          alpha_presence, alpha_frequency, alpha_decay,
@@ -287,7 +288,7 @@ async def graph_generate(
         # 增加 batch 维度适配采样函数 [Vocab] -> [1, Vocab]
         logits_reshaped = static_output.unsqueeze(0).float()
         
-        sample_rand_states = sample.setup_rand(0, 1)
+        sample_rand_states = sample.setup_rand(random.randint(0, 2**63 - 1), 1)
         penalties = torch.zeros(1, 65536).to(0)
         new_tokens = sample.batch_sampling_repetition_temperature_topk_topp(logits_reshaped, penalties, sample_rand_states,
                                                                      alpha_presence, alpha_frequency, alpha_decay,
@@ -378,7 +379,7 @@ async def graph_infer_stream(
             # 增加 batch 维度适配采样函数 [Vocab] -> [1, Vocab]
             logits_reshaped = static_output.unsqueeze(0).float()
             
-            sample_rand_states = sample.setup_rand(0, 1)
+            sample_rand_states = sample.setup_rand(random.randint(0, 2**63 - 1), 1)
             penalties = torch.zeros(1, 65536).to(0)
             new_tokens = sample.batch_sampling_repetition_temperature_topk_topp(logits_reshaped, penalties, sample_rand_states,
                                                                          alpha_presence, alpha_frequency, alpha_decay,
