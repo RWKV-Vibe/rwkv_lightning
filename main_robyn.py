@@ -13,6 +13,10 @@ from rwkv_batch.sampler import sample
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from threading import Lock
+from state_pool import get_state_manager, shutdown_state_manager, remove_session_from_any_level
+import atexit
+import signal
+import sys
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--model-path", type=str, required=True, help="RWKV model path")
@@ -50,6 +54,7 @@ def after_request(response):
 @app.options("/v3/chat/completions")
 @app.options("/translate/v1/batch-translate")
 @app.options("/FIM/v1/batch-FIM")
+@app.options("/state/chat/completions")
 async def handle_options():
     return Response(
         status_code=204,
@@ -83,8 +88,13 @@ class ChatRequest(BaseModel):
     alpha_frequency: float = 0.5
     alpha_decay: float = 0.996
     enable_think: bool = False
-    chunk_size: int = 32
+    chunk_size: int = 4
     password: str = None
+    session_id: str = None
+
+####################################################################################
+### Model Inference 
+####################################################################################
 
 def torch_top_k_top_p(logits, top_k, top_p):
     if top_k > 0:
@@ -138,6 +148,9 @@ def batch_generate(prompts, max_length=512, temperature=1.0, top_k=50, top_p=0.6
 
         if all(finished):
             break
+    # print(state[0].flatten()[:10])
+    # print(state[1].flatten()[:10])
+    # print(state[2].flatten()[:10])
     del state
     gc.collect()
 
@@ -223,6 +236,112 @@ async def batch_infer_stream(prompts, max_length=512, temperature=1.0, top_k=50,
                 yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
                 
     finally:
+        del state
+        torch.cuda.empty_cache()
+        gc.collect()
+
+    yield "data: [DONE]\n\n"
+
+def batch_generate_state(prompts, state, max_length=512, temperature=1.0, top_k=50, top_p=0.6, alpha_presence=1.0, alpha_frequency=0.1, alpha_decay=0.996, stop_tokens=[0, 261, 24281]):
+    encoded_prompts = [tokenizer.encode(p) for p in prompts]
+    
+    tokens = encoded_prompts[0]
+    # print(tokens)
+    out = model.forward(tokens, state).float()
+    
+    generated_tokens = []
+    for step in range(max_length):
+        if out.dim() == 1:
+            out = out.unsqueeze(0)
+        
+        sample_rand_states = sample.setup_rand(random.randint(0, 2**63 - 1), 1)
+        penalties = torch.zeros(1, 65536).to(out.device)
+        new_tokens = sample.batch_sampling_repetition_temperature_topk_topp(
+            out, penalties, sample_rand_states,
+            alpha_presence, alpha_frequency, alpha_decay,
+            temperature, top_k, top_p
+        ).tolist()
+        
+        tok = new_tokens[0]
+        
+        if tok in stop_tokens:
+            break
+        
+        generated_tokens.append(tok)
+        out = model.forward(tok, state).float()
+    decoded = [tokenizer.decode(generated_tokens, utf8_errors="ignore")]        
+
+    gc.collect()
+    torch.cuda.empty_cache()
+    return decoded
+
+async def batch_infer_stream_state(prompts, state, max_length=512, temperature=1.0, top_k=50, top_p=0.6, alpha_presence=1.0, alpha_frequency=0.1, alpha_decay=0.996, stop_tokens=[0, 261, 24281], chunk_size=32, session_id = None, state_manager = None):
+    encoded_prompts = [tokenizer.encode(p) for p in prompts]
+    
+    try:
+        tokens = encoded_prompts[0]
+        out = model.forward(tokens, state).float()
+        
+        token_buffer = []
+        
+        while max_length > 0:
+            max_length -= 1
+            if out.dim() == 1:
+                out = out.unsqueeze(0)
+            
+            sample_rand_states = sample.setup_rand(random.randint(0, 2**63 - 1), 1)
+            penalties = torch.zeros(1, 65536).to(out.device)
+            new_tokens = sample.batch_sampling_repetition_temperature_topk_topp(
+                out, penalties, sample_rand_states,
+                alpha_presence, alpha_frequency, alpha_decay,
+                temperature, top_k, top_p
+            ).tolist()
+            
+            tok = new_tokens[0]
+            
+            if tok in stop_tokens:
+                if token_buffer:
+                    content = tokenizer.decode(token_buffer, utf8_errors="ignore")
+                    token_buffer.clear()  
+                    chunk = {
+                        "object": "chat.completion.chunk",
+                        "choices": [{"index": 0, "delta": {"content": content}}]
+                    }
+                    yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+                break
+            
+            token_buffer.append(tok)
+            if len(token_buffer) >= chunk_size:
+                content = tokenizer.decode(token_buffer, utf8_errors="ignore")
+                token_buffer.clear()
+                if content:  
+                    chunk = {
+                        "object": "chat.completion.chunk",
+                        "choices": [{"index": 0, "delta": {"content": content}}]
+                    }
+                    yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+            
+            out = model.forward(tok, state).float()
+            
+            await asyncio.sleep(0)
+
+        if token_buffer:
+            content = tokenizer.decode(token_buffer, utf8_errors="ignore")
+            token_buffer.clear() 
+            if content: 
+                chunk = {
+                    "object": "chat.completion.chunk",
+                    "choices": [{"index": 0, "delta": {"content": content}}]
+                }
+                yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+
+    finally:
+        if state_manager and session_id:
+            state_manager.put_state(session_id, state)
+            # print("[RESPONSE] /state/chat/completions state[0]: ", state[0].flatten()[:10])
+            # print("[RESPONSE] /state/chat/completions state[1]: ", state[1].flatten()[:10])
+            print("[RESPONSE] /state/chat/completions state[2]: ", state[2], "\n")
+
         del state
         torch.cuda.empty_cache()
         gc.collect()
@@ -895,6 +1014,11 @@ async def continuous_batching_stream(
     
     yield "data: [DONE]\n\n"
 
+
+####################################################################################
+### API interface 
+####################################################################################
+
 @app.post("/v1/chat/completions")
 async def chat_completions(request):
     body = json.loads(request.body)
@@ -1343,5 +1467,243 @@ async def FIM_completions(request):
             description=json.dumps(response, ensure_ascii=False),
             headers={"Content-Type": "application/json"}
         )
+    
+@app.post("/state/chat/completions")
+async def state_chat_completions(request):
+    body = json.loads(request.body)
+    req = ChatRequest(**body)
+    session_id = req.session_id
+    B = len(req.contents)
+    # state = model.generate_zero_state(B)
+    if B > 1:
+        return Response(
+            status_code=500,
+            description=json.dumps({"error": "Server Error: Requst must be single prompt !"}),
+            headers={"Content-Type": "application/json"}
+        )
+    if args_cli.password and req.password != args_cli.password:
+        return Response(
+            status_code=401,
+            description=json.dumps({"error": "Unauthorized: invalid or missing password"}),
+            headers={"Content-Type": "application/json"}
+        )
+
+    prompts = req.contents
+
+    state_manager = get_state_manager()
+    state = state_manager.get_state(session_id)
+
+    if state is None:
+        B = len(prompts)
+        if B > 1:
+            return Response(
+                status_code=500,
+                description=json.dumps({"error": "Server Error: Request must be single prompt when initializing new session!"}),
+                headers={"Content-Type": "application/json"}
+            )
+        state = model.generate_zero_state(0)
+        state_manager.put_state(session_id, state)
+        print(f"[INIT] Created new state for session: {session_id}")
+    else:
+        print(f"[REUSE] Reusing existing state for session: {session_id}")
+
+    if req.stream:
+        return StreamingResponse(
+            batch_infer_stream_state(
+                prompts = prompts,
+                state = state,
+                max_length = req.max_tokens,
+                temperature = req.temperature,
+                top_k = req.top_k,
+                top_p = req.top_p,
+                alpha_presence = req.alpha_presence,
+                alpha_frequency = req.alpha_frequency,
+                alpha_decay = req.alpha_decay,
+                stop_tokens=req.stop_tokens,
+                chunk_size = req.chunk_size,
+                session_id = session_id,
+                state_manager = state_manager
+            ),
+            media_type="text/event-stream"
+        )
+
+    results = batch_generate_state(                
+                prompts = prompts,
+                state= state,
+                max_length = req.max_tokens,
+                temperature = req.temperature,
+                top_k = req.top_k,
+                top_p = req.top_p,
+                alpha_presence = req.alpha_presence,
+                alpha_frequency = req.alpha_frequency,
+                alpha_decay = req.alpha_decay,
+                stop_tokens=req.stop_tokens,
+            )
+    state_manager.put_state(session_id, state)
+    choices = []
+    for i, text in enumerate(results):
+        choices.append({
+            "index": i,
+            "message": {"role": "assistant", "content": text},
+            "finish_reason": "stop",
+        })
+
+    response = {
+        "id": "rwkv7-batch",
+        "object": "chat.completion",
+        "model": req.model,
+        "choices": choices,
+    }
+    # print("[RESPONSE] /state/chat/completions state[0]: ",state[0].flatten()[:10])
+    # print("[RESPONSE] /state/chat/completions state[1]: ",state[1].flatten()[:10])
+    print("[RESPONSE] /state/chat/completions state[2]: ",state[2], "\n")
+    del state
+    return Response(
+        status_code=200,
+        description=json.dumps(response, ensure_ascii=False),
+        headers={"Content-Type": "application/json"}
+    )
+
+@app.post("/state/status")
+async def state_status(request):
+    try:
+        body = json.loads(request.body) if request.body else {}
+        # 检查认证
+        if args_cli.password and body.get('password') != args_cli.password:
+            return Response(
+                status_code=401,
+                description=json.dumps({"error": "Unauthorized: invalid or missing password"}),
+                headers={"Content-Type": "application/json"}
+            )
+        
+        manager = get_state_manager()
+        all_states = manager.list_all_states()
+        
+        from datetime import datetime
+        detailed_states = []
+        
+        for session_id in all_states['l1_cache']:
+            detailed_states.append({
+                "session_id": session_id,
+                "cache_level": "L1 (VRAM)",
+                "last_updated": "In Memory",
+                "timestamp": datetime.now().timestamp()
+            })
+        
+        for session_id in all_states['l2_cache']:
+            detailed_states.append({
+                "session_id": session_id,
+                "cache_level": "L2 (RAM)",
+                "last_updated": "In Memory",
+                "timestamp": datetime.now().timestamp()
+            })
+        
+        for session_id in all_states['database']:
+            manager.db_cursor.execute("SELECT last_updated FROM sessions WHERE session_id = ?", (session_id,))
+            row = manager.db_cursor.fetchone()
+            if row:
+                timestamp = row[0]
+                readable_time = datetime.fromtimestamp(timestamp).strftime('%Y-%m-%d %H:%M:%S')
+                detailed_states.append({
+                    "session_id": session_id,
+                    "cache_level": "Database (Disk)",
+                    "last_updated": readable_time,
+                    "timestamp": timestamp
+                })
+        
+        response_data = {
+            "status": "success",
+            "total_sessions": all_states['total_count'],
+            "l1_cache_count": len(all_states['l1_cache']),
+            "l2_cache_count": len(all_states['l2_cache']),
+            "database_count": len(all_states['database']),
+            "sessions": detailed_states
+        }
+        
+        print(f"[StatePool] Status requested. Total sessions: {all_states['total_count']}, "
+              f"L1: {len(all_states['l1_cache'])}, L2: {len(all_states['l2_cache'])}, "
+              f"DB: {len(all_states['database'])}")
+        
+        return Response(
+            status_code=200,
+            description=json.dumps(response_data, ensure_ascii=False),
+            headers={"Content-Type": "application/json"}
+        )
+    except Exception as e:
+        print(f"[ERROR] /state/status: {e}")
+        return Response(
+            status_code=500,
+            description=json.dumps({"error": str(e)}),
+            headers={"Content-Type": "application/json"}
+        )
+
+@app.post("/state/delete")
+async def state_delete(request):
+    try:
+        body = json.loads(request.body)
+        session_id = body.get("session_id")
+        
+        if not session_id:
+            return Response(
+                status_code=400,
+                description=json.dumps({"error": "Missing session_id parameter"}),
+                headers={"Content-Type": "application/json"}
+            )
+        
+        if args_cli.password and body.get('password') != args_cli.password:
+            return Response(
+                status_code=401,
+                description=json.dumps({"error": "Unauthorized: invalid or missing password"}),
+                headers={"Content-Type": "application/json"}
+            )
+        
+        success = remove_session_from_any_level(session_id)
+        
+        if success:
+            response_data = {
+                "status": "success",
+                "message": f"Session {session_id} deleted successfully"
+            }
+            status_code = 200
+        else:
+            response_data = {
+                "status": "not_found",
+                "message": f"Session {session_id} not found in database"
+            }
+            status_code = 404
+        
+        print(f"[StatePool] Delete session {session_id}: {'Success' if success else 'Not Found'}")
+        
+        return Response(
+            status_code=status_code,
+            description=json.dumps(response_data, ensure_ascii=False),
+            headers={"Content-Type": "application/json"}
+        )
+    except Exception as e:
+        print(f"[ERROR] /state/delete: {e}")
+        return Response(
+            status_code=500,
+            description=json.dumps({"error": str(e)}),
+            headers={"Content-Type": "application/json"}
+        )
+
+####################################################################################
+### API Shutdown Handler
+####################################################################################
+
+def cleanup_handler(signum, frame):
+    print("\nShutting down server and persisting all states to database...")
+    shutdown_state_manager()
+    sys.exit(0)
+
+signal.signal(signal.SIGINT, cleanup_handler)
+signal.signal(signal.SIGTERM, cleanup_handler)
+
+def cleanup_at_exit():
+    shutdown_state_manager()
+    print("All states persisted to database.")
+
+atexit.register(cleanup_at_exit)
+
 if __name__ == "__main__":
     app.start(host="0.0.0.0", port=args_cli.port)

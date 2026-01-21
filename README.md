@@ -42,6 +42,9 @@ MyStatic = torch.compile(mode='max-autotune-no-cudagraphs')
 
 ### FIM ( For RWKV7_G1c series model )
 
+<details>
+<summary>curl examples</summary>
+
 **Batch stream inference using [FIM/v1/batch-FIM interface]**
 
 ```bash
@@ -167,7 +170,14 @@ curl -X POST http://localhost:8000/FIM/v1/batch-FIM \
   }'
 ```
 
+</details>
+
+
 ### 1. Batch synchronous Translate 
+
+<details>
+<summary>curl examples</summary>
+
 **Compatible with immersive translation custom API**
 **--- Very stable 🚀 ---** 
 ```bash
@@ -188,9 +198,14 @@ curl -X POST http://localhost:8000/translate/v1/batch-translate \
            "text_list": ["你好世界", "早上好"]
          }'
 ```
+</details>
 
 
-### 2. ```v1/chat/completions``` 
+### 2. ```v1/chat/completions```  [Support all decode parameters]
+
+<details>
+<summary>curl examples</summary>
+
 **--- Very stable 🚀 ---** 
 - Streaming synchronous batch processing 
 ```bash
@@ -235,8 +250,14 @@ curl -X POST http://localhost:8000/v1/chat/completions \
   }'
 ```
 
+</details>
 
-### 3. ```v2/chat/completions``` 
+
+### 3. ```v2/chat/completions``` [Support all decode parameters]
+
+<details>
+<summary>curl examples</summary>
+
 **--- Very stable 🚀 ---** 
 - Streaming synchronous continuous batching processing 
 ```bash
@@ -286,8 +307,13 @@ curl -X POST http://localhost:8000/v2/chat/completions \
   }'
 ```
 
+</details>
+
 
 ### 4. ```v3/chat/completions``` [Support all decode parameters]
+
+<details>
+<summary>curl examples</summary>
 
 - Streaming asynchronous batch processing With CUDA Graph For Bsz=1
 ```bash
@@ -342,3 +368,104 @@ curl -X POST http://localhost:8000/v3/chat/completions \
     "password": "rwkv7_7.2b"
   }'
 ```
+
+</details>
+
+
+### 5. ```state/chat/completions``` [Support state cache manager] 😜
+
+#### Have 3 Levels Cache design 🤓
+- **L1 cache(VRAM) 16**
+- **L2 cache(RAM) 32**
+- **L3 cache(Sqlite3 database)**
+#### The all cached state will be stored in the database when shout down the server 😋
+- could modify the cache size in ```./state_pool.py``` in line 14-16
+
+***Need to add a unique "session_id": "XXX" in the request body as a unique identifier for each session***👆
+
+**ONLY support for bsz = 1 one session** 🤫
+
+<details>
+<summary>curl examples</summary>
+
+- Streaming asynchronous batch processing With CUDA Graph For Bsz=1
+```bash
+curl -X POST http://localhost:8000/state/chat/completions \
+  -H "Content-Type: application/json" \
+  -N \
+  -d '{
+    "contents": [
+      "User: What should we eat for dinner? Any brief suggestions?\\n\\nAssistant: <think>\\n</think>\\n"
+    ],
+    "max_tokens": 1024,
+    "stop_tokens": [0, 261, 24281],
+    "temperature": 0.8,
+    "top_k": 50,
+    "top_p": 0.6,
+    "alpha_presence": 1.0,
+    "alpha_frequency": 0.1,
+    "alpha_decay": 0.99,
+    "stream": true,
+    "chunk_size": 128,
+    "password": "rwkv7_7.2b",
+    "session_id": "session_one"
+  }'
+```
+- Non-streaming asynchronous batch processing With CUDA Graph For Bsz=1
+```bash
+curl -X POST http://localhost:8000/state/chat/completions \
+      -H "Content-Type: application/json" \
+      -d '{
+    "contents": [
+      "User: What should we eat for dinner? Any brief suggestions?\\n\\nAssistant: <think>\\n</think>\\n"
+    ],
+    "max_tokens": 1024,
+    "stop_tokens": [0, 261, 24281],
+    "temperature": 0.8,
+    "top_k": 50,
+    "top_p": 0.6,
+    "alpha_presence": 1.0,
+    "alpha_frequency": 0.1,
+    "alpha_decay": 0.99,
+    "stream": false,
+    "password": "rwkv7_7.2b",
+    "session_id": "session_one"
+  }'
+```
+
+</details>
+
+
+### 6. **State Management API** [Support state cache manager] 😜 
+
+#### Use ```state/status```  Interface to delete the state of a session
+
+<details>
+<summary>curl examples</summary>
+
+```bash
+curl -X POST http://localhost:8000/state/status \
+  -H "Content-Type: application/json" \
+  -d '{
+    "password": "rwkv7_7.2b"
+  }'
+```
+
+</details>
+
+#### Use ```state/delete```  Interface to delete the state of a session
+
+<details>
+<summary>curl examples</summary>
+
+
+```bash
+curl -X POST http://localhost:8000/state/delete \
+  -H "Content-Type: application/json" \
+  -d '{
+    "session_id": "your_session_id_to_delete",
+    "password": "rwkv7_7.2b"
+  }'
+```
+
+</details>
