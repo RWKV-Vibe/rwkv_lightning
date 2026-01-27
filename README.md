@@ -18,14 +18,14 @@ pip install torch robyn pydantic ninja numpy
 
 ## Usage
 ```bash
-python main_robyn.py --model-path <your model path> --port <your port number> --password rwkv7_7.2b
+python app.py --model-path <your model path> --port <your port number> --password rwkv7_7.2b
 ```
 - if no password, you can do not add ```--password``` flag
 
 
 ## Test API quickly
 ```bash
-bash ./test_curl.sh 
+bash ./test/test_curl.sh
 ```
 
 ## Tips

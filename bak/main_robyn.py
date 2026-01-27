@@ -7,13 +7,13 @@ import gc, re
 import asyncio
 from robyn import Robyn, Response, StreamingResponse, ALLOW_CORS
 from pydantic import BaseModel
-from rwkv_batch.rwkv7 import RWKV_x070
-from rwkv_batch.utils import TRIE_TOKENIZER, sampler_simple_batch, sampler_simple
-from rwkv_batch.sampler import sample
+from infer.rwkv_batch.rwkv7 import RWKV_x070
+from infer.rwkv_batch.utils import TRIE_TOKENIZER, sampler_simple_batch, sampler_simple
+from infer.rwkv_batch.sampler import sample
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from threading import Lock
-from state_pool import get_state_manager, shutdown_state_manager, remove_session_from_any_level
+from state_manager.state_pool import get_state_manager, shutdown_state_manager, remove_session_from_any_level
 import atexit
 import signal
 import sys
@@ -1014,6 +1014,132 @@ async def continuous_batching_stream(
     
     yield "data: [DONE]\n\n"
 
+def batch_generate_choise(prompts, max_length=512, temperature=1.0, top_k=50, top_p=0.6, alpha_presence=1.0, alpha_frequency=0.1, alpha_decay=0.996, stop_tokens=[0, 261, 24281]):
+    B = len(prompts)
+    state = model.generate_zero_state(B)
+    encoded_prompts = [tokenizer.encode(p) for p in prompts]
+    out = model.forward_batch(encoded_prompts, state).float()
+
+    finished = [False] * B
+    generated_tokens = [[] for _ in range(B)]
+
+    for step in range(max_length):
+        sample_rand_states = sample.setup_rand(random.randint(0, 2**63 - 1), B)
+        penalties = torch.zeros(B, 65536).to(0)
+        new_tokens = sample.batch_sampling_repetition_temperature_topk_topp(out, penalties, sample_rand_states,
+                                                                     alpha_presence, alpha_frequency, alpha_decay,
+                                                                     temperature, top_k, top_p).tolist()
+        # new_tokens = sampler_simple_batch(out, noise=noise, temp=temperature).tolist()
+        new_tokens = [[token] for token in new_tokens]
+        out = model.forward_batch(new_tokens, state).float()
+
+        for i in range(B):
+            tok = new_tokens[i][0] if isinstance(new_tokens[i], list) else new_tokens[i]
+            if finished[i]:
+                continue
+            if tok in stop_tokens:
+                finished[i] = True
+                continue
+            generated_tokens[i].append(tok)
+
+        if all(finished):
+            break
+    # print(state[0].flatten()[:10])
+    # print(state[1].flatten()[:10])
+    # print(state[2].flatten()[:10])
+    del state
+    gc.collect()
+
+    decoded = []
+    for i in range(B):
+        text = tokenizer.decode(generated_tokens[i], utf8_errors="ignore")
+        decoded.append(text)
+    torch.cuda.empty_cache()
+    return decoded
+
+async def batch_infer_stream_choise(prompts, max_length=512, temperature=1.0, top_k=50, top_p=0.6, alpha_presence=1.0, alpha_frequency=0.1, alpha_decay=0.996, stop_tokens=[0, 261, 24281], chunk_size=32):
+    B = len(prompts)
+    state = model.generate_zero_state(B)
+    encoded_prompts = [tokenizer.encode(p) for p in prompts]
+    out = model.forward_batch(encoded_prompts, state).float()
+
+    finished = [False] * B
+    generated_tokens = [[] for _ in range(B)]
+    token_buffers = [[] for _ in range(B)] 
+
+    try:
+        while not all(finished) and max_length > 0:
+            sample_rand_states = sample.setup_rand(random.randint(0, 2**63 - 1), B)
+            penalties = torch.zeros(B, 65536).to(0)
+            new_tokens = sample.batch_sampling_repetition_temperature_topk_topp(out, penalties, sample_rand_states,
+                                                                         alpha_presence, alpha_frequency, alpha_decay,
+                                                                         temperature, top_k, top_p).tolist()
+            # new_tokens = sampler_simple_batch(out, noise=noise, temp=temperature).tolist()
+            new_tokens = [[token] for token in new_tokens]
+            out = model.forward_batch(new_tokens, state).float()
+            max_length -= 1
+
+            contents_to_send = [""] * B
+            
+            for i in range(B):
+                if finished[i]:
+                    continue
+                    
+                tok = new_tokens[i][0] if isinstance(new_tokens[i], list) else new_tokens[i]
+                
+                if tok in stop_tokens:
+                    finished[i] = True
+                    if token_buffers[i]:
+                        contents_to_send[i] = tokenizer.decode(token_buffers[i], utf8_errors="ignore")
+                        token_buffers[i].clear()
+                    continue
+                
+                token_buffers[i].append(tok)
+                generated_tokens[i].append(tok)
+                
+                if len(token_buffers[i]) >= chunk_size:
+                    contents_to_send[i] = tokenizer.decode(token_buffers[i], utf8_errors="ignore")
+                    token_buffers[i].clear()
+            
+            if any(contents_to_send):
+                chunk = {
+                    "object": "chat.completion.chunk",
+                    "choices": [
+                        {"index": i, "delta": {"content": contents_to_send[i]}} 
+                        for i in range(B) if contents_to_send[i]
+                    ]
+                }
+                if chunk["choices"]:
+                    yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+            
+            await asyncio.sleep(0)
+        
+        remaining_contents = [""] * B
+        for i in range(B):
+            if token_buffers[i]:
+                remaining_contents[i] = tokenizer.decode(token_buffers[i], utf8_errors="ignore")
+                token_buffers[i].clear()
+        
+        if any(remaining_contents):
+            chunk = {
+                "object": "chat.completion.chunk",
+                "choices": [
+                    {"index": i, "delta": {"content": remaining_contents[i]}}
+                    for i in range(B) if remaining_contents[i]
+                ]
+            }
+            if chunk["choices"]:
+                yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+                
+    finally:
+        del state
+        torch.cuda.empty_cache()
+        gc.collect()
+
+    yield "data: [DONE]\n\n"
+
+
+
 
 ####################################################################################
 ### API interface 
@@ -1686,6 +1812,10 @@ async def state_delete(request):
             description=json.dumps({"error": str(e)}),
             headers={"Content-Type": "application/json"}
         )
+
+@app.post("/batch_state/choice")
+
+@app.post("/batch_state/chat/completions")
 
 ####################################################################################
 ### API Shutdown Handler

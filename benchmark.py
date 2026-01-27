@@ -33,7 +33,7 @@ args.MODEL_NAME = "/mnt/3f7ab3b2-e663-407a-831c-ee4789165577/rwkv_translate/rwkv
 
 print(f'\nUsing CUDA fp16. Loading {args.MODEL_NAME} ...\n')
 
-from rwkv_batch.rwkv7 import RWKV_x070
+from infer.rwkv_batch.rwkv7 import RWKV_x070
 model = RWKV_x070(args)
 
 PARAM_BYTES = 2
@@ -44,8 +44,8 @@ for k,v in model.z.items():
 active_GB = active_params/1e9*PARAM_BYTES
 print(f'\nActive params = {round(active_params/1e9,2)} B = {round(active_GB,2)} GB (gigabytes)')
 
-from rwkv_batch.utils import TRIE_TOKENIZER, sampler_simple, sampler_simple_batch
-tokenizer = TRIE_TOKENIZER("rwkv_batch/rwkv_vocab_v20230424.txt")
+from infer.rwkv_batch.utils import TRIE_TOKENIZER, sampler_simple, sampler_simple_batch
+tokenizer = TRIE_TOKENIZER("infer/rwkv_batch/rwkv_vocab_v20230424.txt")
 
 ########################################################################################################
 
