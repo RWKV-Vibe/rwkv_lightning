@@ -200,3 +200,52 @@ curl -X POST http://localhost:8000/v3/chat/completions \
 echo -e "\n\n========================================\n\n"
 echo "[完成] 所有测试已完成！"
 echo "========================================\n"
+
+curl -X POST http://localhost:8000/batch_state/chat/completions \
+  -H "Content-Type: application/json" \
+  -N \
+  -d '{
+    "contents": [
+      "User: 你现在是一只可爱的猫娘，说话要带喵\n\nAssistant: <think>\n</think>\n",
+      "User: 晚上建议吃点什么呢？\n\nAssistant: <think>\n</think>\n"
+    ],
+    "max_tokens": 1024,
+    "stop_tokens": [0, 261, 24281],
+    "temperature": [1.0, 1.0],
+    "top_k": [50, 50],
+    "top_p": [0.3, 0.3],
+    "pad_zero": true,
+    "alpha_presence": [1.0, 1.0],
+    "alpha_frequency": [0.1, 0.1],
+    "alpha_decay": [0.996, 0.996],
+    "chunk_size": 128,
+    "stream": false,
+    "password": "rwkv7_7.2b",
+    "session_id": "test_1",
+    "next_content_idx": 0
+  }'
+
+curl -X POST http://localhost:8000/batch_state/chat/completions \
+  -H "Content-Type: application/json" \
+  -N \
+  -d '{
+    "contents": [
+      "\n\nUser: 来点清淡的？\n\nAssistant: <think>\n</think>\n",
+      "\n\nUser: 来点清淡的？\n\nAssistant: <think>\n</think>\n",
+      "\n\nUser: 来点清淡的？\n\nAssistant: <think>\n</think>\n"
+    ],
+    "max_tokens": 1024,
+    "stop_tokens": [0, 261, 24281],
+    "temperature": [1.0, 0.8, 1.2],
+    "top_k": [50, 50, 50],
+    "top_p": [0.3, 0.1, 0.6],
+    "pad_zero": true,
+    "alpha_presence": [2.0, 2.0, 2.0],
+    "alpha_frequency": [0.1, 0.1, 0.1],
+    "alpha_decay": [0.996, 0.996, 0.996],
+    "chunk_size": 128,
+    "stream": false,
+    "password": "rwkv7_7.2b",
+    "session_id": "test_1",
+    "next_content_idx": 1
+  }'

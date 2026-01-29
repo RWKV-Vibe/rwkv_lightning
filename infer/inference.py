@@ -25,6 +25,49 @@ class InferenceEngine:
         self.executor.shutdown(wait=False)
 
     @staticmethod
+    def _expand_batch_param(param, batch_size, name):
+        if isinstance(param, torch.Tensor):
+            if param.numel() == 1:
+                return [param.item()] * batch_size
+            if param.numel() != batch_size:
+                raise ValueError(f"{name} length {param.numel()} does not match batch size {batch_size}")
+            return param.detach().cpu().tolist()
+        if isinstance(param, (list, tuple)):
+            if len(param) != batch_size:
+                raise ValueError(f"{name} length {len(param)} does not match batch size {batch_size}")
+            return list(param)
+        return [param] * batch_size
+
+    @staticmethod
+    def batch_sampling(logits, alpha_presence, alpha_frequency, alpha_decay, temperature, top_k, top_p):
+        batch_size = logits.shape[0]
+        vocab_size = logits.shape[-1]
+        alpha_presence_list = InferenceEngine._expand_batch_param(alpha_presence, batch_size, "alpha_presence")
+        alpha_frequency_list = InferenceEngine._expand_batch_param(alpha_frequency, batch_size, "alpha_frequency")
+        alpha_decay_list = InferenceEngine._expand_batch_param(alpha_decay, batch_size, "alpha_decay")
+        temperature_list = InferenceEngine._expand_batch_param(temperature, batch_size, "temperature")
+        top_k_list = InferenceEngine._expand_batch_param(top_k, batch_size, "top_k")
+        top_p_list = InferenceEngine._expand_batch_param(top_p, batch_size, "top_p")
+
+        new_tokens = []
+        for i in range(batch_size):
+            sample_rand_states = sample.setup_rand(random.randint(0, 2**63 - 1), 1)
+            penalties = torch.zeros(1, vocab_size, device=logits.device)
+            token = sample.batch_sampling_repetition_temperature_topk_topp(
+                logits[i].unsqueeze(0),
+                penalties,
+                sample_rand_states,
+                alpha_presence_list[i],
+                alpha_frequency_list[i],
+                alpha_decay_list[i],
+                temperature_list[i],
+                top_k_list[i],
+                top_p_list[i],
+            ).tolist()[0]
+            new_tokens.append([token])
+        return new_tokens
+
+    @staticmethod
     def _torch_top_k_top_p(logits, top_k, top_p):
         if top_k > 0:
             top_k = min(top_k, logits.size(-1))
@@ -45,6 +88,28 @@ class InferenceEngine:
         sampled_tokens = torch.multinomial(probabilities, 1).squeeze(-1)
 
         return sampled_tokens
+
+    def clone_batch_state_from_index(self, state, next_content_idx, batch_size):
+        if state is None:
+            raise ValueError("state is None")
+        current_batch = state[2].numel()
+        if current_batch < 1:
+            raise ValueError("state batch size must be >= 1 for slicing")
+        if next_content_idx < 0 or next_content_idx >= current_batch:
+            raise ValueError(
+                f"next_content_idx {next_content_idx} out of range for state batch size {current_batch}"
+            )
+        if state[0].dim() < 4 or state[1].dim() < 5:
+            raise ValueError("state does not have batch dimension for slicing")
+
+        base0 = state[0][:, :, next_content_idx:next_content_idx + 1, :]
+        base1 = state[1][:, next_content_idx:next_content_idx + 1, :, :, :]
+        base2 = state[2][next_content_idx:next_content_idx + 1]
+
+        new0 = base0.repeat(1, 1, batch_size, 1).contiguous()
+        new1 = base1.repeat(1, batch_size, 1, 1, 1).contiguous()
+        new2 = base2.repeat(batch_size).contiguous()
+        return [new0, new1, new2]
 
     def batch_generate(
         self,
@@ -1006,3 +1071,160 @@ class InferenceEngine:
             alpha_frequency=alpha_frequency,
             alpha_decay=alpha_decay,
         )
+
+    def batch_generate_choise(
+        self,
+        prompts,
+        max_length=512,
+        temperature=1.0,
+        top_k=50,
+        top_p=0.6,
+        alpha_presence=1.0,
+        alpha_frequency=0.1,
+        alpha_decay=0.996,
+        stop_tokens=[0, 261, 24281],
+        state=None,
+    ):
+        B = len(prompts)
+        encoded_prompts = [self.tokenizer.encode(p) for p in prompts]
+        out = self.model.forward_batch(encoded_prompts, state).float()
+
+        finished = [False] * B
+        generated_tokens = [[] for _ in range(B)]
+
+        for step in range(max_length):
+            new_tokens = self.batch_sampling(
+                out,
+                alpha_presence,
+                alpha_frequency,
+                alpha_decay,
+                temperature,
+                top_k,
+                top_p,
+            )
+            out = self.model.forward_batch(new_tokens, state).float()
+
+            for i in range(B):
+                tok = new_tokens[i][0] if isinstance(new_tokens[i], list) else new_tokens[i]
+                if finished[i]:
+                    continue
+                if tok in stop_tokens:
+                    finished[i] = True
+                    continue
+                generated_tokens[i].append(tok)
+
+            if all(finished):
+                break
+        # print(state[0].flatten()[:10])
+        # print(state[1].flatten()[:10])
+        # print(state[2].flatten()[:10])
+        del state
+        gc.collect()
+
+        decoded = []
+        for i in range(B):
+            text = self.tokenizer.decode(generated_tokens[i], utf8_errors="ignore")
+            decoded.append(text)
+        torch.cuda.empty_cache()
+        return decoded
+
+    async def batch_infer_stream_choise(
+        self,
+        prompts,
+        max_length=512,
+        temperature=1.0,
+        top_k=50,
+        top_p=0.6,
+        alpha_presence=1.0,
+        alpha_frequency=0.1,
+        alpha_decay=0.996,
+        stop_tokens=[0, 261, 24281],
+        chunk_size=32,
+        state=None,
+        session_id=None,
+        state_manager=None,
+    ):
+        B = len(prompts)
+
+        encoded_prompts = [self.tokenizer.encode(p) for p in prompts]
+        out = self.model.forward_batch(encoded_prompts, state).float()
+
+        finished = [False] * B
+        generated_tokens = [[] for _ in range(B)]
+        token_buffers = [[] for _ in range(B)] 
+
+        try:
+            while not all(finished) and max_length > 0:
+                new_tokens = self.batch_sampling(
+                    out,
+                    alpha_presence,
+                    alpha_frequency,
+                    alpha_decay,
+                    temperature,
+                    top_k,
+                    top_p,
+                )
+                out = self.model.forward_batch(new_tokens, state).float()
+                max_length -= 1
+
+                contents_to_send = [""] * B
+
+                for i in range(B):
+                    if finished[i]:
+                        continue
+
+                    tok = new_tokens[i][0] if isinstance(new_tokens[i], list) else new_tokens[i]
+
+                    if tok in stop_tokens:
+                        finished[i] = True
+                        if token_buffers[i]:
+                            contents_to_send[i] = self.tokenizer.decode(token_buffers[i], utf8_errors="ignore")
+                            token_buffers[i].clear()
+                        continue
+                    
+                    token_buffers[i].append(tok)
+                    generated_tokens[i].append(tok)
+
+                    if len(token_buffers[i]) >= chunk_size:
+                        contents_to_send[i] = self.tokenizer.decode(token_buffers[i], utf8_errors="ignore")
+                        token_buffers[i].clear()
+
+                if any(contents_to_send):
+                    chunk = {
+                        "object": "chat.completion.chunk",
+                        "choices": [
+                            {"index": i, "delta": {"content": contents_to_send[i]}} 
+                            for i in range(B) if contents_to_send[i]
+                        ]
+                    }
+                    if chunk["choices"]:
+                        yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+
+                await asyncio.sleep(0)
+
+            remaining_contents = [""] * B
+            for i in range(B):
+                if token_buffers[i]:
+                    remaining_contents[i] = self.tokenizer.decode(token_buffers[i], utf8_errors="ignore")
+                    token_buffers[i].clear()
+
+            if any(remaining_contents):
+                chunk = {
+                    "object": "chat.completion.chunk",
+                    "choices": [
+                        {"index": i, "delta": {"content": remaining_contents[i]}}
+                        for i in range(B) if remaining_contents[i]
+                    ]
+                }
+                if chunk["choices"]:
+                    yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+
+        finally:
+            if state_manager and session_id:
+                state_manager.put_state(session_id, state)
+            del state
+            torch.cuda.empty_cache()
+            gc.collect()
+
+        yield "data: [DONE]\n\n"
+

@@ -1,5 +1,5 @@
 import json
-from typing import Optional
+from typing import Optional, Union
 
 from pydantic import BaseModel
 from robyn import Robyn, Response, StreamingResponse
@@ -27,6 +27,28 @@ class ChatRequest(BaseModel):
     chunk_size: int = 4
     password: Optional[str] = None
     session_id: Optional[str] = None
+
+class ChatRequest_batch_sample(BaseModel):
+    model: str = "rwkv7"
+    contents: list[str] = []
+    prefix: list[str] = []
+    suffix: list[str] = []
+    max_tokens: int = 50
+    stop_tokens: list[int] = [0, 261, 24281]
+    temperature: Union[float, list[float]] = 1.0
+    top_k: Union[int, list[int]] = 1
+    top_p: Union[float, list[float]] = 0.3
+    noise: float = 1.5
+    stream: bool = False
+    pad_zero: bool = True
+    alpha_presence: Union[float, list[float]] = 0.5
+    alpha_frequency: Union[float, list[float]] = 0.5
+    alpha_decay: Union[float, list[float]] = 0.996
+    enable_think: bool = False
+    chunk_size: int = 4
+    password: Optional[str] = None
+    session_id: Optional[str] = None
+    next_content_idx: int = 0
 
 
 class TranslateRequest(BaseModel):
@@ -742,5 +764,120 @@ def create_app(engine, password=None):
                 description=json.dumps({"error": str(exc)}),
                 headers={"Content-Type": "application/json"},
             )
+
+    @app.post("/batch_state/chat/completions")
+    async def batch_state_chat(request):
+        body = json.loads(request.body)
+        req = ChatRequest_batch_sample(**body)
+        session_id = req.session_id
+
+        if not session_id:
+            return Response(
+                status_code=400,
+                description=json.dumps({"error": "Missing session_id parameter"}),
+                headers={"Content-Type": "application/json"},
+            )
+
+        if password and req.password != password:
+            return Response(
+                status_code=401,
+                description=json.dumps({"error": "Unauthorized: invalid or missing password"}),
+                headers={"Content-Type": "application/json"},
+            )
+
+        prompts = req.contents
+        if not prompts:
+            return Response(
+                status_code=400,
+                description=json.dumps({"error": "Empty prompts list"}),
+                headers={"Content-Type": "application/json"},
+            )
+
+        batch_size = len(prompts)
+        for name, value in [
+            ("temperature", req.temperature),
+            ("top_k", req.top_k),
+            ("top_p", req.top_p),
+            ("alpha_presence", req.alpha_presence),
+            ("alpha_frequency", req.alpha_frequency),
+            ("alpha_decay", req.alpha_decay),
+        ]:
+            if isinstance(value, (list, tuple)) and len(value) != batch_size:
+                return Response(
+                    status_code=400,
+                    description=json.dumps(
+                        {"error": f"{name} length {len(value)} does not match batch size {batch_size}"}
+                    ),
+                    headers={"Content-Type": "application/json"},
+                )
+        state_manager = get_state_manager()
+        state = state_manager.get_state(session_id)
+
+        if state is None:
+            state = engine.model.generate_zero_state(batch_size)
+            print(f"[INIT] Created new batch state for session: {session_id}")
+        else:
+            state = engine.clone_batch_state_from_index(state, req.next_content_idx, batch_size)
+            print(
+                "[REUSE] Cloned batch state for session: "
+                f"[{session_id}] from batch state idx [{req.next_content_idx}] to {batch_size} batch"
+            )
+
+
+        if req.stream:
+            return StreamingResponse(
+                engine.batch_infer_stream_choise(
+                    prompts=prompts,
+                    state=state,
+                    max_length=req.max_tokens,
+                    temperature=req.temperature,
+                    top_k=req.top_k,
+                    top_p=req.top_p,
+                    alpha_presence=req.alpha_presence,
+                    alpha_frequency=req.alpha_frequency,
+                    alpha_decay=req.alpha_decay,
+                    stop_tokens=req.stop_tokens,
+                    chunk_size=req.chunk_size,
+                    session_id=session_id,
+                    state_manager=state_manager,
+                ),
+                media_type="text/event-stream",
+            )
+
+        results = engine.batch_generate_choise(
+            prompts=prompts,
+            state=state,
+            max_length=req.max_tokens,
+            temperature=req.temperature,
+            top_k=req.top_k,
+            top_p=req.top_p,
+            alpha_presence=req.alpha_presence,
+            alpha_frequency=req.alpha_frequency,
+            alpha_decay=req.alpha_decay,
+            stop_tokens=req.stop_tokens,
+        )
+        state_manager.put_state(session_id, state)
+        choices = []
+        for i, text in enumerate(results):
+            choices.append(
+                {
+                    "index": i,
+                    "message": {"role": "assistant", "content": text},
+                    "finish_reason": "stop",
+                }
+            )
+
+        response = {
+            "id": "rwkv7-batch-state",
+            "object": "chat.completion",
+            "model": req.model,
+            "choices": choices,
+        }
+        return Response(
+            status_code=200,
+            description=json.dumps(response, ensure_ascii=False),
+            headers={"Content-Type": "application/json"},
+        )
+    
 
     return app
