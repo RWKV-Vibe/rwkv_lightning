@@ -72,6 +72,10 @@ class StateCacheManager:
         # map_location='cpu' 避免反序列化时直接占用显存，由上层逻辑决定何时搬运
         return torch.load(buffer, map_location='cpu', weights_only=True)
 
+    def _clone_state(self, state: List[torch.Tensor]) -> List[torch.Tensor]:
+        """深拷贝状态，避免多线程共享导致污染"""
+        return [t.clone() for t in state]
+
     def _persist_task(self, session_id: str, state_cpu: List[torch.Tensor]):
         """异步任务：序列化并写入数据库"""
         try:
@@ -131,7 +135,7 @@ class StateCacheManager:
             # Case 1: L1 Hit (VRAM)
             if session_id in self.l1_cache:
                 self.l1_cache.move_to_end(session_id) # 标记为最近使用
-                return self.l1_cache[session_id]
+                return self._clone_state(self.l1_cache[session_id])
             
             # Case 2: L2 Hit (RAM)
             if session_id in self.l2_cache:
@@ -139,7 +143,7 @@ class StateCacheManager:
                 state_gpu = [t.to('cuda', non_blocking=True) for t in state_cpu]
                 
                 self.put_state(session_id, state_gpu)
-                return state_gpu
+                return self._clone_state(state_gpu)
 
         blob = None
         with self.db_lock:
@@ -153,7 +157,7 @@ class StateCacheManager:
                 state_cpu = self._deserialize(blob)
                 state_gpu = [t.to('cuda') for t in state_cpu]
                 self.put_state(session_id, state_gpu)
-                return state_gpu
+                return self._clone_state(state_gpu)
             except Exception as e:
                 print(f"[StatePool] Failed to deserialize session {session_id}: {e}")
                 return None

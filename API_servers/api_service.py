@@ -1,4 +1,5 @@
 import json
+from threading import Lock
 from typing import Optional
 
 from pydantic import BaseModel
@@ -27,6 +28,7 @@ class ChatRequest(BaseModel):
     chunk_size: int = 4
     password: Optional[str] = None
     session_id: Optional[str] = None
+    dialogue_idx: Optional[int] = 0
 
 
 class TranslateRequest(BaseModel):
@@ -61,6 +63,32 @@ def create_translation_prompt(source_lang, target_lang, text):
 
 def create_app(engine, password=None):
     app = Robyn(__file__)
+    dialogue_idx_lock = Lock()
+    dialogue_idx_counters: dict[str, int] = {}
+
+    def _collect_session_indices(state_manager, session_index: str) -> list[int]:
+        prefix = f"{session_index}:"
+        all_states = state_manager.list_all_states()
+        indices = []
+        for key in all_states["l1_cache"] + all_states["l2_cache"] + all_states["database"]:
+            if key.startswith(prefix):
+                tail = key[len(prefix) :]
+                if tail.isdigit():
+                    indices.append(int(tail))
+        return indices
+
+    def _allocate_next_dialogue_idx(state_manager, session_index: str) -> int:
+        with dialogue_idx_lock:
+            if session_index in dialogue_idx_counters:
+                next_idx = dialogue_idx_counters[session_index]
+                dialogue_idx_counters[session_index] = next_idx + 1
+                return next_idx
+
+            indices = _collect_session_indices(state_manager, session_index)
+            max_idx = max(indices) if indices else 0
+            next_idx = max_idx + 1
+            dialogue_idx_counters[session_index] = next_idx + 1
+            return next_idx
 
     @app.after_request()
     def after_request(response):
@@ -76,6 +104,7 @@ def create_app(engine, password=None):
     @app.options("/translate/v1/batch-translate")
     @app.options("/FIM/v1/batch-FIM")
     @app.options("/state/chat/completions")
+    @app.options("/multi_state/chat/completions")
     async def handle_options():
         return Response(
             status_code=204,
@@ -612,6 +641,145 @@ def create_app(engine, password=None):
             headers={"Content-Type": "application/json"},
         )
 
+    @app.post("/multi_state/chat/completions")
+    async def multi_state_chat_completions(request):
+        body = json.loads(request.body)
+        req = ChatRequest(**body)
+
+        if password and req.password != password:
+            return Response(
+                status_code=401,
+                description=json.dumps({"error": "Unauthorized: invalid or missing password"}),
+                headers={"Content-Type": "application/json"},
+            )
+
+        if "dialogue_idx" not in body:
+            return Response(
+                status_code=400,
+                description=json.dumps({"error": "Missing dialogue_idx parameter"}),
+                headers={"Content-Type": "application/json"},
+            )
+
+        session_index = req.session_id
+        if not session_index:
+            return Response(
+                status_code=400,
+                description=json.dumps({"error": "Missing session_id parameter"}),
+                headers={"Content-Type": "application/json"},
+            )
+
+        prompts = req.contents
+        batch_size = len(prompts)
+        if batch_size != 1:
+            return Response(
+                status_code=500,
+                description=json.dumps({"error": "Server Error: Request must be single prompt!"}),
+                headers={"Content-Type": "application/json"},
+            )
+
+        dialogue_idx = int(req.dialogue_idx or 0)
+        state_key = f"{session_index}:{dialogue_idx}"
+
+        state_manager = get_state_manager()
+        state = state_manager.get_state(state_key)
+
+        if state is None:
+            if dialogue_idx != 0:
+                return Response(
+                    status_code=404,
+                    description=json.dumps({"error": f"State not found for dialogue_idx={dialogue_idx}"}),
+                    headers={"Content-Type": "application/json"},
+                )
+            state = engine.model.generate_zero_state(0)
+            print(f"[INIT] Created new root state for session: {session_index}")
+        else:
+            print(f"[REUSE] Reusing state for session: {state_key}")
+
+        if req.stream:
+            async def stream_with_dialogue_idx():
+                stored = False
+                try:
+                    async for chunk in engine.batch_infer_stream_state(
+                        prompts=prompts,
+                        state=state,
+                        max_length=req.max_tokens,
+                        temperature=req.temperature,
+                        top_k=req.top_k,
+                        top_p=req.top_p,
+                        alpha_presence=req.alpha_presence,
+                        alpha_frequency=req.alpha_frequency,
+                        alpha_decay=req.alpha_decay,
+                        stop_tokens=req.stop_tokens,
+                        chunk_size=req.chunk_size,
+                        session_id=None,
+                        state_manager=None,
+                    ):
+                        if chunk == "data: [DONE]\n\n" and not stored:
+                            new_dialogue_idx = _allocate_next_dialogue_idx(state_manager, session_index)
+                            new_session_id = f"{session_index}:{new_dialogue_idx}"
+                            state_manager.put_state(new_session_id, state)
+                            stored = True
+                            meta = {
+                                "object": "multi_state.dialogue_idx",
+                                "session_id": new_session_id,
+                                "dialogue_idx": new_dialogue_idx,
+                            }
+                            yield f"data: {json.dumps(meta, ensure_ascii=False)}\n\n"
+                        yield chunk
+                finally:
+                    if not stored:
+                        new_dialogue_idx = _allocate_next_dialogue_idx(state_manager, session_index)
+                        new_session_id = f"{session_index}:{new_dialogue_idx}"
+                        state_manager.put_state(new_session_id, state)
+                        print("[RESPONSE] /multi_state/chat/completions state[2]: ", state[2], "\n")
+
+            return StreamingResponse(
+                stream_with_dialogue_idx(),
+                media_type="text/event-stream",
+            )
+
+        results = engine.batch_generate_state(
+            prompts=prompts,
+            state=state,
+            max_length=req.max_tokens,
+            temperature=req.temperature,
+            top_k=req.top_k,
+            top_p=req.top_p,
+            alpha_presence=req.alpha_presence,
+            alpha_frequency=req.alpha_frequency,
+            alpha_decay=req.alpha_decay,
+            stop_tokens=req.stop_tokens,
+        )
+        new_dialogue_idx = _allocate_next_dialogue_idx(state_manager, session_index)
+        new_session_id = f"{session_index}:{new_dialogue_idx}"
+        state_manager.put_state(new_session_id, state)
+
+        choices = []
+        for i, text in enumerate(results):
+            choices.append(
+                {
+                    "index": i,
+                    "message": {"role": "assistant", "content": text},
+                    "finish_reason": "stop",
+                }
+            )
+
+        response = {
+            "id": "rwkv7-multi-state",
+            "object": "chat.completion",
+            "model": req.model,
+            "choices": choices,
+            "dialogue_idx": new_dialogue_idx,
+        }
+        print("[RESPONSE] /multi_state/chat/completions state[2]: ", state[2], "\n")
+        del state
+        return Response(
+            status_code=200,
+            description=json.dumps(response, ensure_ascii=False),
+            headers={"Content-Type": "application/json"},
+        )
+
+
     @app.post("/state/status")
     async def state_status(request):
         try:
@@ -698,6 +866,7 @@ def create_app(engine, password=None):
         try:
             body = json.loads(request.body)
             session_id = body.get("session_id")
+            delete_prefix = body.get("delete_prefix", False)
 
             if not session_id:
                 return Response(
@@ -714,8 +883,19 @@ def create_app(engine, password=None):
                 )
 
             success = remove_session_from_any_level(session_id)
+            if delete_prefix:
+                manager = get_state_manager()
+                prefix = f"{session_id}:"
+                all_states = manager.list_all_states()
+                ids = set()
+                ids.update(all_states["l1_cache"])
+                ids.update(all_states["l2_cache"])
+                ids.update(all_states["database"])
+                for sid in ids:
+                    if isinstance(sid, str) and sid.startswith(prefix):
+                        remove_session_from_any_level(sid)
 
-            if success:
+            if success or delete_prefix:
                 response_data = {
                     "status": "success",
                     "message": f"Session {session_id} deleted successfully",
