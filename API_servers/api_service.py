@@ -1,4 +1,5 @@
 import json
+import os
 from threading import Lock
 from typing import Optional
 
@@ -98,6 +99,7 @@ def create_app(engine, password=None):
         return response
 
     @app.options("/")
+    @app.options("/v1/models")
     @app.options("/v1/chat/completions")
     @app.options("/v2/chat/completions")
     @app.options("/v3/chat/completions")
@@ -115,6 +117,25 @@ def create_app(engine, password=None):
                 "Access-Control-Allow-Headers": "Content-Type, Authorization",
                 "Access-Control-Max-Age": "86400",
             },
+        )
+
+    @app.get("/v1/models")
+    async def list_models():
+        model_name = os.path.basename(f"{engine.args.MODEL_NAME}")
+        response = {
+            "object": "list",
+            "data": [
+                {
+                    "id": model_name,
+                    "object": "model",
+                    "owned_by": "rwkv_lightning",
+                }
+            ],
+        }
+        return Response(
+            status_code=200,
+            description=json.dumps(response, ensure_ascii=False),
+            headers={"Content-Type": "application/json"},
         )
 
     @app.post("/v1/chat/completions")
