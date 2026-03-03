@@ -105,6 +105,8 @@ def create_app(engine, password=None):
     @app.options("/FIM/v1/batch-FIM")
     @app.options("/state/chat/completions")
     @app.options("/multi_state/chat/completions")
+    @app.options("/big_batch/completions")
+
     async def handle_options():
         return Response(
             status_code=204,
@@ -922,5 +924,30 @@ def create_app(engine, password=None):
                 description=json.dumps({"error": str(exc)}),
                 headers={"Content-Type": "application/json"},
             )
+
+    @app.post("/big_batch/completions")
+    async def big_batch_completions(request):
+        body = json.loads(request.body)
+        req = ChatRequest(**body)
+
+        if password and req.password != password:
+            return Response(
+                status_code=401,
+                description=json.dumps({"error": "Unauthorized: invalid or missing password"}),
+                headers={"Content-Type": "application/json"},
+            )
+
+        prompts = req.contents
+
+        return StreamingResponse(
+            engine.big_batch_stream(
+                prompts=prompts,
+                max_length=req.max_tokens,
+                temperature=req.temperature,
+                stop_tokens=req.stop_tokens,
+                chunk_size=req.chunk_size,
+            ),
+            media_type="text/event-stream",
+        )
 
     return app

@@ -40,6 +40,15 @@ def sample_logits(logits, temperature:float=1.0, top_p:float=1.0, top_k:int=0):
 
     return torch.multinomial(probs, num_samples=1).item()
 
+@torch.no_grad() # !!! will modify logits inplace !!!
+@MyStatic
+def sampler_gumbel_batch(logits: torch.Tensor, temp: float = 1.0, eps: float = 6.2e-5) -> torch.Tensor:
+    if temp > 0:
+        if temp != 1: logits.mul_(1.0 / temp)
+        noise = torch.empty_like(logits).exponential_().clamp_(min=eps).log_().neg_()
+        logits.add_(noise)
+    return torch.argmax(logits, dim=-1, keepdim=True)
+
 @MyStatic # !!! will modify logits inplace !!!
 def sampler_simple_batch(logits: torch.Tensor, noise: float = 0.0, temp: float = 1.0):
     assert temp > 0, "use noise=0 for greedy decoding"

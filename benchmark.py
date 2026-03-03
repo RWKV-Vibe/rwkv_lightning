@@ -29,11 +29,11 @@ args.head_size = 64
 # args.MODEL_NAME = "/mnt/e/RWKV-Runner/models/rwkv7-g1a-0.4b-20250905-ctx4096"
 # args.MODEL_NAME = "/mnt/e/RWKV-Runner/models/rwkv7-g1-1.5b-20250429-ctx4096"
 # args.MODEL_NAME = "/mnt/e/RWKV-Runner/models/rwkv7-g1-2.9b-20250519-ctx4096"
-args.MODEL_NAME = "/mnt/pc411_data/rwkv_translate/rwkv7-g1c-2.9b-20251231-ctx8192"
+args.MODEL_NAME = "/mnt/pc411_data/rwkv_translate/rwkv7-g1d-2.9b-20260131-ctx8192"
 
 print(f'\nUsing CUDA fp16. Loading {args.MODEL_NAME} ...\n')
 
-from infer.rwkv_batch.rwkv7 import RWKV_x070
+from infer.rwkv_batch.rwkv7_int8 import RWKV_x070
 model = RWKV_x070(args)
 
 PARAM_BYTES = 2
@@ -44,7 +44,7 @@ for k,v in model.z.items():
 active_GB = active_params/1e9*PARAM_BYTES
 print(f'\nActive params = {round(active_params/1e9,2)} B = {round(active_GB,2)} GB (gigabytes)')
 
-from infer.rwkv_batch.utils import TRIE_TOKENIZER, sampler_simple, sampler_simple_batch
+from infer.rwkv_batch.utils import TRIE_TOKENIZER, sampler_simple, sampler_gumbel_batch
 tokenizer = TRIE_TOKENIZER("infer/rwkv_batch/rwkv_vocab_v20230424.txt")
 
 ########################################################################################################
@@ -143,76 +143,76 @@ print(f'\n\nToken/s = {round(1/times,2)} (forward), {round(1/all_times,2)} (full
 
 # #######################################################################################################
 
-xprint("Decode (CUDAGraph)")
+# xprint("Decode (CUDAGraph)")
 
 
-prompt = "User: simulate SpaceX mars landing using python\n\nAssistant: <think"
-LENGTH_PER_TRIAL = 256
-TEMPERATURE = 1.0
-TOP_P = 0.0
-print(prompt, end="")
+# prompt = "User: simulate SpaceX mars landing using python\n\nAssistant: <think"
+# LENGTH_PER_TRIAL = 256
+# TEMPERATURE = 1.0
+# TOP_P = 0.0
+# print(prompt, end="")
 
-all_tokens = []
-out_last = 0
-state = model.generate_zero_state(0)
-out = model.forward(tokenizer.encode(prompt), state)
-token = sampler_simple(out, noise=0).item()
+# all_tokens = []
+# out_last = 0
+# state = model.generate_zero_state(0)
+# out = model.forward(tokenizer.encode(prompt), state)
+# token = sampler_simple(out, noise=0).item()
 
-x = model.z['emb.weight'][token]
+# x = model.z['emb.weight'][token]
 
-static_input = torch.empty_like(x, device="cuda")
-static_state = [None, None, None]
-static_state[0] = torch.empty_like(state[0], device="cuda")
-static_state[1] = torch.empty_like(state[1], device="cuda")
-static_state[2] = torch.empty_like(state[2], device="cuda")
-static_output = torch.empty_like(out, device="cuda")
+# static_input = torch.empty_like(x, device="cuda")
+# static_state = [None, None, None]
+# static_state[0] = torch.empty_like(state[0], device="cuda")
+# static_state[1] = torch.empty_like(state[1], device="cuda")
+# static_state[2] = torch.empty_like(state[2], device="cuda")
+# static_output = torch.empty_like(out, device="cuda")
 
-static_output = model.forward(static_input, static_state)
+# static_output = model.forward(static_input, static_state)
 
-g = torch.cuda.CUDAGraph()
-with torch.cuda.graph(g):
-    static_output = model.forward(static_input, static_state)
+# g = torch.cuda.CUDAGraph()
+# with torch.cuda.graph(g):
+#     static_output = model.forward(static_input, static_state)
 
-static_input.copy_(x)
-static_state[0].copy_(state[0])
-static_state[1].copy_(state[1])
-static_state[2].copy_(state[2])
-static_output.copy_(out)
+# static_input.copy_(x)
+# static_state[0].copy_(state[0])
+# static_state[1].copy_(state[1])
+# static_state[2].copy_(state[2])
+# static_output.copy_(out)
 
-times = []
-all_times = []
-t000 = time.perf_counter()
-for i in range(0, LENGTH_PER_TRIAL):
-    t00 = time.perf_counter()
-    token = sampler_simple(static_output, noise=0).item()
-    all_tokens += [token]
-    try:
-        tmp = tokenizer.decode(all_tokens[out_last:], utf8_errors="strict")
-        print(tmp, end="", flush=True) # only print when we have a valid utf-8 string
-        out_last = i+1
-    except:
-        pass
+# times = []
+# all_times = []
+# t000 = time.perf_counter()
+# for i in range(0, LENGTH_PER_TRIAL):
+#     t00 = time.perf_counter()
+#     token = sampler_simple(static_output, noise=0).item()
+#     all_tokens += [token]
+#     try:
+#         tmp = tokenizer.decode(all_tokens[out_last:], utf8_errors="strict")
+#         print(tmp, end="", flush=True) # only print when we have a valid utf-8 string
+#         out_last = i+1
+#     except:
+#         pass
 
-    x = model.z['emb.weight'][token]
-    static_input.copy_(x)
+#     x = model.z['emb.weight'][token]
+#     static_input.copy_(x)
 
-    torch.cuda.synchronize()
-    t0 = time.perf_counter()
-    g.replay()
-    torch.cuda.synchronize()
-    t1 = time.perf_counter()
-    times.append(t1 - t0)
-    all_times.append(t1 - t00)
-times = np.percentile(times, SHOW_SPEED_PERCENTILE)
-all_times = np.percentile(all_times, SHOW_SPEED_PERCENTILE)
-print(f'\n\nToken/s = {round(1/times,2)} (forward), {round(1/all_times,2)} (full) || Bandwidth = {round(active_GB/times,2)} GB/s || {round(time.perf_counter()-t000,3)}s')
+#     torch.cuda.synchronize()
+#     t0 = time.perf_counter()
+#     g.replay()
+#     torch.cuda.synchronize()
+#     t1 = time.perf_counter()
+#     times.append(t1 - t0)
+#     all_times.append(t1 - t00)
+# times = np.percentile(times, SHOW_SPEED_PERCENTILE)
+# all_times = np.percentile(all_times, SHOW_SPEED_PERCENTILE)
+# print(f'\n\nToken/s = {round(1/times,2)} (forward), {round(1/all_times,2)} (full) || Bandwidth = {round(active_GB/times,2)} GB/s || {round(time.perf_counter()-t000,3)}s')
 
 #######################################################################################################
 
 xprint("Decode (batch)")
 
 # for BSZ in [2**n for n in range(1,8)] + [128 + n for n in range(8, 512+8, 8)]:
-for BSZ in [512, 768, 920, 1024, 1248, 1536, 1792, 2048, 2304, 2560]:
+for BSZ in [8, 16, 16, 16, 32, 32, 32, 64, 64, 64]:
     torch.cuda.empty_cache()
     gc.collect()
     torch.cuda.empty_cache()
@@ -241,7 +241,7 @@ for BSZ in [512, 768, 920, 1024, 1248, 1536, 1792, 2048, 2304, 2560]:
     t000 = time.perf_counter()
     for i in range(LENGTH_PER_TRIAL):
         t00 = time.perf_counter()
-        token = sampler_simple_batch(out, noise=0).tolist()
+        token = sampler_gumbel_batch(out, temp=1.2).tolist()
         all_tokens += [token]
         if BSZ == 2:
             print('.', end='', flush=True)
@@ -274,98 +274,168 @@ for BSZ in [512, 768, 920, 1024, 1248, 1536, 1792, 2048, 2304, 2560]:
 
     print(f'Bsz {BSZ} || Token/s = {round(nnn/times,2)} (forward), {round(nnn/all_times,2)} (full) || {round(time.perf_counter()-t000,3)}s')
 
+########################################################################################################
+
+xprint('MMLU')
+
+from datasets import load_from_disk
+mmlu_test = load_from_disk("/home/alic-li/Albatross/eval/mmlu_test_dataset/")
+
+TEMPLATE = '''User: You are a very talented expert in <SUBJECT>. Answer this question:
+<Q>
+A. <|A|>
+B. <|B|>
+C. <|C|>
+D. <|D|>
+
+Assistant: The answer is'''
+
+CHOICES = [" A", " B", " C", " D"]
+
+SHUFFLE = False
+
+correct = 0
+total = 0
+pbar = tqdm(total=len(mmlu_test))
+
+choices_token = [tokenizer.encode(x) for x in CHOICES]
+assert all([len(x) == 1 for x in choices_token])
+choices_token = [x[0] for x in choices_token]
+
+for idx, sample in enumerate(mmlu_test):
+    question = sample["question"]
+    choices = sample["choices"]
+    subject = sample["subject"]
+    gt = sample["answer"]
+
+    if SHUFFLE and not any(["Both" in x for x in choices]):  # exclude choices like "Both A and B"
+        original_gt_text = choices[gt]
+        np.random.shuffle(choices)
+        gt = choices.index(original_gt_text)
+
+    all_prefix = (
+        TEMPLATE.replace("<Q>", question)
+        .replace("<|A|>", choices[0])
+        .replace("<|B|>", choices[1])
+        .replace("<|C|>", choices[2])
+        .replace("<|D|>", choices[3])
+        .replace("<SUBJECT>", subject.replace("_", " "))
+    )
+
+    if idx == 0:
+        print(f"Format example:")
+        print("-" * 80)
+        print(all_prefix)
+        print("-" * 80)
+        format_example = all_prefix
+
+    all_prefix_ids = [0] + tokenizer.encode(all_prefix.replace('\r\n','\n').strip())
+
+    logits = model.forward(all_prefix_ids, model.generate_zero_state(0), full_output=False)
+    
+    neg_log_prob = F.log_softmax(logits, dim=-1)
+    target_prob = neg_log_prob[choices_token]
+    
+    if torch.argmax(target_prob).item() == gt:
+        correct += 1
+    total += 1
+    pbar.set_description(f"Correct: {correct} - Total: {total} - Accuracy: {correct / total:.5f}")
+    pbar.update(1)
+pbar.close()
+print()
+
 ######################################################################################################
 
-xprint("Prefill")
+# xprint("Prefill")
 
-base_memory = torch.cuda.memory_allocated()
-print(f'Base memory after model loading: {base_memory/1e9:.2f} GB')
+# base_memory = torch.cuda.memory_allocated()
+# print(f'Base memory after model loading: {base_memory/1e9:.2f} GB')
 
-raw = open("test_batch_scripts/calibration_data_v5_rc.txt").read()
-tokens = tokenizer.encode(raw)
+# raw = open("test_batch_scripts/calibration_data_v5_rc.txt").read()
+# tokens = tokenizer.encode(raw)
 
-for stage in range(8, 12+1):
-    CTX_LEN = 2**stage
-    loss = 0
-    a = 0
-    cnt = 0
+# for stage in range(8, 12+1):
+#     CTX_LEN = 2**stage
+#     loss = 0
+#     a = 0
+#     cnt = 0
     
-    torch.cuda.reset_peak_memory_stats()
+#     torch.cuda.reset_peak_memory_stats()
     
-    times = []
-    while a+CTX_LEN < len(tokens):
-        src = tokens[a:a+CTX_LEN]
+#     times = []
+#     while a+CTX_LEN < len(tokens):
+#         src = tokens[a:a+CTX_LEN]
 
-        torch.cuda.synchronize()
-        t0 = time.perf_counter()
-        prob = model.forward(src[:-1], model.generate_zero_state(0), full_output=True)
-        torch.cuda.synchronize()
-        t1 = time.perf_counter()
-        times.append(t1 - t0)
+#         torch.cuda.synchronize()
+#         t0 = time.perf_counter()
+#         prob = model.forward(src[:-1], model.generate_zero_state(0), full_output=True)
+#         torch.cuda.synchronize()
+#         t1 = time.perf_counter()
+#         times.append(t1 - t0)
             
-        prob = F.softmax(prob.float(), dim=-1)
-        for j in range(CTX_LEN-1):
-            loss -= math.log(prob[j][src[j+1]])
-            cnt += 1
-        a += CTX_LEN
+#         prob = F.softmax(prob.float(), dim=-1)
+#         for j in range(CTX_LEN-1):
+#             loss -= math.log(prob[j][src[j+1]])
+#             cnt += 1
+#         a += CTX_LEN
 
-    final_memory = torch.cuda.memory_allocated()
-    peak_memory = torch.cuda.max_memory_allocated()
+#     final_memory = torch.cuda.memory_allocated()
+#     peak_memory = torch.cuda.max_memory_allocated()
     
-    memory_delta_peak = peak_memory - base_memory
-    memory_delta_final = final_memory - base_memory
+#     memory_delta_peak = peak_memory - base_memory
+#     memory_delta_final = final_memory - base_memory
     
-    times = np.percentile(times, SHOW_SPEED_PERCENTILE)
-    print(f'CTX_LEN {CTX_LEN} : avg loss {round(loss/cnt,4)} || prefill {round((CTX_LEN-1)/times)} token/s = {round((CTX_LEN-1)/times * active_params * 2/1e12, 2)} TFLOPS || Memory: +peak {memory_delta_peak/1e9:.2f}GB, +final {memory_delta_final/1e9:.2f}GB')
+#     times = np.percentile(times, SHOW_SPEED_PERCENTILE)
+#     print(f'CTX_LEN {CTX_LEN} : avg loss {round(loss/cnt,4)} || prefill {round((CTX_LEN-1)/times)} token/s = {round((CTX_LEN-1)/times * active_params * 2/1e12, 2)} TFLOPS || Memory: +peak {memory_delta_peak/1e9:.2f}GB, +final {memory_delta_final/1e9:.2f}GB')
 
 
-xprint("Batch Prefill")
+# xprint("Batch Prefill")
 
-raw = open("test_batch_scripts/calibration_data_v5_rc.txt").read()
-tokens = tokenizer.encode(raw)
-base_memory = torch.cuda.memory_allocated()
-print(f'Base memory after model loading: {base_memory/1e9:.2f} GB')
+# raw = open("test_batch_scripts/calibration_data_v5_rc.txt").read()
+# tokens = tokenizer.encode(raw)
+# base_memory = torch.cuda.memory_allocated()
+# print(f'Base memory after model loading: {base_memory/1e9:.2f} GB')
 
-for batch_size in [8, 16, 32, 64, 128, 256]:
-    CTX_LEN = 4096
-    total_loss = 0
-    total_tokens = 0  
+# for batch_size in [8, 16, 32, 64, 128, 256]:
+#     CTX_LEN = 4096
+#     total_loss = 0
+#     total_tokens = 0  
     
-    src = tokens[:CTX_LEN] 
-    batch_tokens = [src for _ in range(batch_size)]  
-    torch.cuda.reset_peak_memory_stats()
+#     src = tokens[:CTX_LEN] 
+#     batch_tokens = [src for _ in range(batch_size)]  
+#     torch.cuda.reset_peak_memory_stats()
     
-    times = []
-    torch.cuda.synchronize()
-    t0 = time.perf_counter()
-    with torch.no_grad():
-        probs = model.forward_seq_batch_chunk(batch_tokens, model.generate_zero_state(batch_size), chunk_len=64)
-    torch.cuda.synchronize()
-    t1 = time.perf_counter()
-    times.append(t1 - t0)
+#     times = []
+#     torch.cuda.synchronize()
+#     t0 = time.perf_counter()
+#     with torch.no_grad():
+#         probs = model.forward_seq_batch_chunk(batch_tokens, model.generate_zero_state(batch_size), chunk_len=64)
+#     torch.cuda.synchronize()
+#     t1 = time.perf_counter()
+#     times.append(t1 - t0)
     
-    probs = F.softmax(probs.float(), dim=-1)
-    # for b in range(batch_size):
-    #     for j in range(CTX_LEN-1):
-    #         total_loss -= math.log(probs[b][j][batch_tokens[b][j+1]].item())
-    #         total_tokens += 1
+#     probs = F.softmax(probs.float(), dim=-1)
+#     # for b in range(batch_size):
+#     #     for j in range(CTX_LEN-1):
+#     #         total_loss -= math.log(probs[b][j][batch_tokens[b][j+1]].item())
+#     #         total_tokens += 1
 
-    final_memory = torch.cuda.memory_allocated()
-    peak_memory = torch.cuda.max_memory_allocated()
+#     final_memory = torch.cuda.memory_allocated()
+#     peak_memory = torch.cuda.max_memory_allocated()
     
-    memory_delta_peak = peak_memory - base_memory
-    memory_delta_final = final_memory - base_memory
+#     memory_delta_peak = peak_memory - base_memory
+#     memory_delta_final = final_memory - base_memory
     
-    avg_time = np.mean(times)
-    processed_tokens = batch_size * (CTX_LEN - 1)
-    tokens_per_sec = processed_tokens / avg_time
+#     avg_time = np.mean(times)
+#     processed_tokens = batch_size * (CTX_LEN - 1)
+#     tokens_per_sec = processed_tokens / avg_time
     
-    # avg_loss = total_loss / total_tokens 
+#     # avg_loss = total_loss / total_tokens 
     
-    print(f'Batch Size {batch_size}, CTX_LEN {CTX_LEN} : batch prefill {round(tokens_per_sec)} token/s || Memory: +peak {memory_delta_peak/1e9:.5f}GB, +final {memory_delta_final/1e9:.5f}GB')
+#     print(f'Batch Size {batch_size}, CTX_LEN {CTX_LEN} : batch prefill {round(tokens_per_sec)} token/s || Memory: +peak {memory_delta_peak/1e9:.5f}GB, +final {memory_delta_final/1e9:.5f}GB')
     
-    del probs
-    torch.cuda.empty_cache()
-    gc.collect()
+#     del probs
+#     torch.cuda.empty_cache()
+#     gc.collect()
 
 exit(0)

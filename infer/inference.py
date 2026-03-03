@@ -9,7 +9,7 @@ from threading import Lock
 import torch
 
 from infer.rwkv_batch.sampler import sample
-from infer.rwkv_batch.utils import sampler_simple
+from infer.rwkv_batch.utils import sampler_gumbel_batch
 
 
 class InferenceEngine:
@@ -366,7 +366,7 @@ class InferenceEngine:
 
         out = self.model.forward(encoded_prompt, state)
 
-        token = sampler_simple(out, noise=0, temp=temperature).item()
+        token = sampler_gumbel_batch(logits=out, temp=temperature).item()
 
         x_emb = self.model.z["emb.weight"][token]
 
@@ -448,7 +448,7 @@ class InferenceEngine:
 
         out = self.model.forward(encoded_prompt, state)
 
-        token = sampler_simple(out, noise=0, temp=temperature).item()
+        token = sampler_gumbel_batch(logits=out, temp=temperature).item()
 
         x_emb = self.model.z["emb.weight"][token]
 
@@ -1006,3 +1006,86 @@ class InferenceEngine:
             alpha_frequency=alpha_frequency,
             alpha_decay=alpha_decay,
         )
+
+    async def big_batch_stream(
+        self,
+        prompts,
+        max_length=512,
+        temperature=1.0,
+        stop_tokens=(0, 261, 24281),
+        chunk_size=32,
+    ):
+        batch_size = len(prompts)
+        state = self.model.generate_zero_state(batch_size)
+        encoded_prompts = [self.tokenizer.encode(p) for p in prompts]
+        out = self.model.forward_batch(encoded_prompts, state)
+
+        finished = [False] * batch_size
+        generated_tokens = [[] for _ in range(batch_size)]
+        token_buffers = [[] for _ in range(batch_size)]
+
+        try:
+            while not all(finished) and max_length > 0:
+                new_tokens = sampler_gumbel_batch(logits=out, temp=temperature).tolist()
+                out = self.model.forward_batch(new_tokens, state)
+                max_length -= 1
+
+                contents_to_send = [""] * batch_size
+
+                for i in range(batch_size):
+                    if finished[i]:
+                        continue
+
+                    tok = new_tokens[i][0] if isinstance(new_tokens[i], list) else new_tokens[i]
+
+                    if tok in stop_tokens:
+                        finished[i] = True
+                        if token_buffers[i]:
+                            contents_to_send[i] = self.tokenizer.decode(token_buffers[i], utf8_errors="ignore")
+                            token_buffers[i].clear()
+                        continue
+
+                    token_buffers[i].append(tok)
+                    generated_tokens[i].append(tok)
+
+                    if len(token_buffers[i]) >= chunk_size:
+                        contents_to_send[i] = self.tokenizer.decode(token_buffers[i], utf8_errors="ignore")
+                        token_buffers[i].clear()
+
+                if any(contents_to_send):
+                    chunk = {
+                        "object": "chat.completion.chunk",
+                        "choices": [
+                            {"index": i, "delta": {"content": contents_to_send[i]}}
+                            for i in range(batch_size)
+                            if contents_to_send[i]
+                        ],
+                    }
+                    if chunk["choices"]:
+                        yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+
+                await asyncio.sleep(0)
+
+            remaining_contents = [""] * batch_size
+            for i in range(batch_size):
+                if token_buffers[i]:
+                    remaining_contents[i] = self.tokenizer.decode(token_buffers[i], utf8_errors="ignore")
+                    token_buffers[i].clear()
+
+            if any(remaining_contents):
+                chunk = {
+                    "object": "chat.completion.chunk",
+                    "choices": [
+                        {"index": i, "delta": {"content": remaining_contents[i]}}
+                        for i in range(batch_size)
+                        if remaining_contents[i]
+                    ],
+                }
+                if chunk["choices"]:
+                    yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+        finally:
+            del state
+            torch.cuda.empty_cache()
+            gc.collect()
+
+        yield "data: [DONE]\n\n"
