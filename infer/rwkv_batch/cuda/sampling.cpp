@@ -2,7 +2,13 @@
 at::Tensor batch_sampling_repetition_temperature_topk_topp(at::Tensor& logits, at::Tensor& penalties, at::Tensor& states, double presence_penalty, double repetition_penalty, double penalty_decay, double temperature, int64_t top_k, double top_p);
 at::Tensor batch_sampling_temperature_topk_topp(at::Tensor& logits, at::Tensor& states, double temperature, int64_t top_k, double top_p);
 at::Tensor setup_rand(int64_t seed, int64_t B);
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+PYBIND11_MODULE(sample, m) {
+    m.def("setup_rand", setup_rand);
+    m.def("batch_sampling_repetition_temperature_topk_topp", batch_sampling_repetition_temperature_topk_topp);
+    m.def("batch_sampling_temperature_topk_topp", batch_sampling_temperature_topk_topp);
+}
+
+TORCH_LIBRARY(sample, m) {
     m.def("setup_rand", setup_rand);
     m.def("batch_sampling_repetition_temperature_topk_topp", batch_sampling_repetition_temperature_topk_topp);
     m.def("batch_sampling_temperature_topk_topp", batch_sampling_temperature_topk_topp);

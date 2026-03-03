@@ -260,8 +260,8 @@ __global__ void __launch_bounds__(BLOCKDIM_X_SAMPLE, 1) batch_sampling_repetitio
     // if(t==0) P0f(pmax);
     unsigned left =  __float_as_uint(pmin), right =  __float_as_uint(pmax) + 1;
 
-    uint4 cnt = {.x=(unsigned)V, .y=0, .z=0, .w=0};
-    l4 = {.x=1, .y=0, .z=0, .w=0};
+    uint4 cnt = make_uint4((unsigned)V, 0, 0, 0);
+    l4 = make_float4(1, 0, 0, 0);
     uint4 pivot;
     while ((cnt.x > top_k || l4.x > top_p) && left < right-1) {
         // if(t==0){
@@ -381,10 +381,10 @@ __global__ void __launch_bounds__(BLOCKDIM_X_SAMPLE, 1) batch_sampling_repetitio
     if (t==0){
         idxt = 0;
         rand4 = curand_uniform4(states);
-        randp = sum_p * rand4.x; // only once 
+        randp = sum_p * rand4.x; // only once
     }
     __syncthreads();
-    
+
     bool u = (randp <= cumu_p);
     // at last thread: randp = sum_p * rand4.x < cumu_p == sum_p, u == 1
     if(l==31) ((unsigned*)reduce_buf)[w] = u;
@@ -424,7 +424,7 @@ __global__ void __launch_bounds__(BLOCKDIM_X_SAMPLE, 1) batch_sampling_repetitio
     __syncthreads();
     idn = out_id;
     if (t==0) *outputs = idn;
-    // 7. Update penalties 
+    // 7. Update penalties
     for (int i=t; i<V4; i+=d) {
         p4 = ((float4*)penalties)[i];
         #pragma unroll
@@ -451,7 +451,7 @@ at::Tensor batch_sampling_repetition_temperature_topk_topp(
     int B, T, V;
     if (logits.dtype() != at::kFloat) {
         throw std::invalid_argument(
-            "Logits tensor must be of type float32 (FP32), got " + 
+            "Logits tensor must be of type float32 (FP32), got " +
             std::string(logits.dtype().name()) + " !\n"
         );
     }
@@ -460,7 +460,7 @@ at::Tensor batch_sampling_repetition_temperature_topk_topp(
     T = (logits.dim() == 3)? logits.size(1): 1;
     if (!(V > 0 && V <= 1048576 && V % 4 == 0)){
         throw std::invalid_argument(
-            "Vocabulary size must be multiple of 4, and no larger than 1048576, got " + std::to_string(V) 
+            "Vocabulary size must be multiple of 4, and no larger than 1048576, got " + std::to_string(V)
             + " !\n"
         );
     }
@@ -496,9 +496,9 @@ at::Tensor batch_sampling_repetition_temperature_topk_topp(
         cudaStreamSetAttribute(stream, cudaStreamAttributeAccessPolicyWindow, &stream_attribute);
     }
     auto out = at::empty({B}, at::TensorOptions().dtype(at::kInt).device(at::kCUDA));
-    
+
     batch_sampling_repetition_temperature_topk_topp_kernel<<<B, 1024, 0, stream>>>(
-        B, T, V, 
+        B, T, V,
         (float*)logits.data_ptr(),
         (float*)penalties.data_ptr(),
         (int*)  out.data_ptr(),
@@ -592,8 +592,8 @@ __global__ void __launch_bounds__(BLOCKDIM_X_SAMPLE, 1) batch_sampling_temperatu
     // if(t==0) P0f(pmax);
     unsigned left =  __float_as_uint(pmin), right =  __float_as_uint(pmax) + 1;
 
-    uint4 cnt = {.x=(unsigned)V, .y=0, .z=0, .w=0};
-    l4 = {.x=1, .y=0, .z=0, .w=0};
+    uint4 cnt = make_uint4((unsigned)V, 0, 0, 0);
+    l4 = make_float4(1, 0, 0, 0);
     uint4 pivot;
     while ((cnt.x > top_k || l4.x > top_p) && left < right-1) {
         pivot.x = left;
@@ -706,10 +706,10 @@ __global__ void __launch_bounds__(BLOCKDIM_X_SAMPLE, 1) batch_sampling_temperatu
     if (t==0){
         idxt = 0;
         rand4 = curand_uniform4(states);
-        randp = sum_p * rand4.x; // only once 
+        randp = sum_p * rand4.x; // only once
     }
     __syncthreads();
-    
+
     bool u = (randp <= cumu_p);
     // at last thread: randp = sum_p * rand4.x < cumu_p == sum_p, u == 1
     if(l==31) ((unsigned*)reduce_buf)[w] = u;
@@ -828,8 +828,8 @@ __global__ void __launch_bounds__(BLOCKDIM_X_SAMPLE, 1) batch_sampling_topp_kern
     // if(t==0) P0f(pmax);
     unsigned left =  __float_as_uint(pmin), right =  __float_as_uint(pmax) + 1;
 
-    // uint4 cnt = {.x=(unsigned)V, .y=0, .z=0, .w=0};
-    l4 = {.x=1, .y=0, .z=0, .w=0};
+    // uint4 cnt = make_uint4((unsigned)V, 0, 0, 0);
+    l4 = make_float4(1, 0, 0, 0);
     uint4 pivot;
     while ((l4.x > top_p) && left < right-1) {
         pivot.x = left;
