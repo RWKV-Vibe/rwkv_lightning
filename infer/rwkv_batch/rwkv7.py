@@ -47,8 +47,15 @@ if ROCm_flag == True:
     load(name="rwkv7_state_fwd_fp16", sources=[f"{current_path}/hip/rwkv7_state_fwd_fp16_op.hip", f"{current_path}/hip/rwkv7_state_fwd_fp16.hip"], is_python_module=False,
                     verbose=True, extra_cuda_cflags=['-fopenmp', '-ffast-math', '-O3', '-munsafe-fp-atomics', f"-D_N_={HEAD_SIZE}"])
 else:
-    load(name="rwkv7_state_fwd_fp16", sources=[f"{current_path}/cuda/rwkv7_state_fwd_fp16.cpp", f"{current_path}/cuda/rwkv7_state_fwd_fp16.cu"], is_python_module=False,
-                    verbose=True, extra_cuda_cflags=["-res-usage", "--use_fast_math", "-O3", "--extra-device-vectorization", f"-D_N_={HEAD_SIZE}"] + (["-Xptxas -O3"] if os.name != "nt" else []))
+    # load(name="rwkv7_state_fwd_fp16", sources=[f"{current_path}/cuda/rwkv7_state_fwd_fp16.cpp", f"{current_path}/cuda/rwkv7_state_fwd_fp16.cu"], is_python_module=False,
+    #                 verbose=True, extra_cuda_cflags=["-res-usage", "--use_fast_math", "-O3", "--extra-device-vectorization", f"-D_N_={HEAD_SIZE}"] + (["-Xptxas -O3"] if os.name != "nt" else []))
+    load(name="rwkv7_state_fwd_fp16",
+         sources=[f"{current_path}/cuda/rwkv7_state_fwd_fp16.cpp", f"{current_path}/cuda/rwkv7_state_fwd_fp16.cu"],
+         is_python_module=False,
+         verbose=True, extra_cuda_cflags=["-allow-unsupported-compiler", "-res-usage", "--use_fast_math", "-O3",
+                                          "--extra-device-vectorization", f"-D_N_={HEAD_SIZE}"] + (
+                                             ["-Xptxas -O3"] if os.name != "nt" else []))
+
 
 class SPMV(torch.autograd.Function):
     @staticmethod

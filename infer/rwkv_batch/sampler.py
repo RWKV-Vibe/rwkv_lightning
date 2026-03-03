@@ -13,8 +13,10 @@ if ROCm_flag:
 else:
     sample = load(
         name="sample",
-        sources = [f"{current_path}/cuda/sampling.cpp",f"{current_path}/cuda/sampling.cu"],
-        extra_cuda_cflags=["-O3", "-res-usage", "--extra-device-vectorization", "-Xptxas -O3"],
+        sources=[f"{current_path}/cuda/sampling.cpp", f"{current_path}/cuda/sampling.cu"],
+        # extra_cuda_cflags=["-O3", "-res-usage", "--extra-device-vectorization", "-Xptxas -O3"],
+        extra_cuda_cflags=["-allow-unsupported-compiler", "-O3", "-res-usage", "--extra-device-vectorization"] + (
+            ["-Xptxas -O3"] if os.name != "nt" else []),
         verbose=True,
     )
 
