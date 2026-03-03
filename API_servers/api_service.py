@@ -129,6 +129,8 @@ def create_app(engine, password=None):
                     "id": model_name,
                     "object": "model",
                     "owned_by": "rwkv_lightning",
+                    "model_size": engine.args.MODEL_SIZE,
+                    "file_size": engine.args.FILE_SIZE,
                 }
             ],
         }
