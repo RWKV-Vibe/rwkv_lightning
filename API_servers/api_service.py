@@ -1,4 +1,7 @@
 import json
+import os
+import time
+import uuid
 from threading import Lock
 from typing import Optional
 
@@ -11,6 +14,8 @@ from state_manager.state_pool import get_state_manager, remove_session_from_any_
 class ChatRequest(BaseModel):
     model: str = "rwkv7"
     contents: list[str] = []
+    messages: list[dict] = []
+    system: Optional[str] = None
     prefix: list[str] = []
     suffix: list[str] = []
     max_tokens: int = 50
@@ -66,6 +71,114 @@ def create_app(engine, password=None):
     dialogue_idx_lock = Lock()
     dialogue_idx_counters: dict[str, int] = {}
 
+    def _json_response(status_code: int, payload: dict):
+        return Response(
+            status_code=status_code,
+            description=json.dumps(payload, ensure_ascii=False),
+            headers={"Content-Type": "application/json"},
+        )
+
+    def _extract_bearer_token(request) -> Optional[str]:
+        headers = getattr(request, "headers", {}) or {}
+        auth_header = headers.get("authorization") or headers.get("Authorization")
+        if not auth_header or not auth_header.startswith("Bearer "):
+            return None
+        return auth_header.split(" ", 1)[1].strip()
+
+    def _check_openai_auth(request, body: dict):
+        if not password:
+            return None
+        bearer_token = _extract_bearer_token(request)
+        body_password = body.get("password")
+        if bearer_token == password or body_password == password:
+            return None
+        return _json_response(401, {"error": "Unauthorized: invalid or missing password"})
+
+    def _normalize_message_content(content) -> str:
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            text_parts = []
+            for item in content:
+                if isinstance(item, dict) and item.get("type") == "text":
+                    text_parts.append(item.get("text", ""))
+                elif isinstance(item, str):
+                    text_parts.append(item)
+            return "".join(text_parts)
+        if content is None:
+            return ""
+        return str(content)
+
+    def _extract_openai_prompt(body: dict) -> str:
+        contents = body.get("contents") or []
+        if contents:
+            return str(contents[0])
+
+        messages = body.get("messages") or []
+        if messages:
+            return _normalize_message_content(messages[-1].get("content", ""))
+        return ""
+
+    def _format_openai_prompt(body: dict, enable_think: bool) -> str:
+        messages = body.get("messages") or []
+        system_field = body.get("system")
+        if not messages:
+            prompt = _extract_openai_prompt(body)
+            prompt_parts = []
+            if system_field:
+                prompt_parts.append(f"System: {system_field}")
+            prompt_parts.append(f"User: {prompt}")
+            prompt_text = "\n\n".join(prompt_parts)
+            if enable_think:
+                return f"{prompt_text}\n\nAssistant: <think"
+            return f"{prompt_text}\n\nAssistant: <think>\n</think>"
+
+        system_parts = []
+        if system_field:
+            system_parts.append(str(system_field))
+        dialogue_parts = []
+        role_map = {
+            "user": "User",
+            "assistant": "Assistant",
+            "system": "System",
+            "tool": "Tool",
+            "developer": "Developer",
+        }
+
+        for message in messages:
+            role = str(message.get("role", "user")).lower()
+            content = _normalize_message_content(message.get("content", ""))
+            if not content:
+                continue
+            if role == "system":
+                system_parts.append(content)
+                continue
+            dialogue_role = role_map.get(role, role.capitalize() or "User")
+            dialogue_parts.append(f"{dialogue_role}: {content}")
+
+        prompt_parts = []
+        if system_parts:
+            prompt_parts.append(f"System: {'\n\n'.join(system_parts)}")
+        if dialogue_parts:
+            prompt_parts.append("\n\n".join(dialogue_parts))
+
+        prompt_text = "\n\n".join(part for part in prompt_parts if part).strip()
+        if not prompt_text:
+            prompt_text = _extract_openai_prompt(body)
+
+        if enable_think:
+            return f"{prompt_text}\n\nAssistant: <think"
+        return f"{prompt_text}\n\nAssistant: <think>\n</think>"
+
+    def _build_openai_usage(prompt_text: str, completion_text: str) -> dict:
+        prompt_tokens = len(engine.tokenizer.encode(prompt_text))
+        completion_tokens = len(engine.tokenizer.encode(completion_text)) if completion_text else 0
+        return {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": prompt_tokens + completion_tokens,
+        }
+
     def _collect_session_indices(state_manager, session_index: str) -> list[int]:
         prefix = f"{session_index}:"
         all_states = state_manager.list_all_states()
@@ -98,6 +211,7 @@ def create_app(engine, password=None):
         return response
 
     @app.options("/")
+    @app.options("/v1/models")
     @app.options("/v1/chat/completions")
     @app.options("/v2/chat/completions")
     @app.options("/v3/chat/completions")
@@ -106,6 +220,7 @@ def create_app(engine, password=None):
     @app.options("/state/chat/completions")
     @app.options("/multi_state/chat/completions")
     @app.options("/big_batch/completions")
+    @app.options("/openai/chat/completions")
 
     async def handle_options():
         return Response(
@@ -117,6 +232,25 @@ def create_app(engine, password=None):
                 "Access-Control-Allow-Headers": "Content-Type, Authorization",
                 "Access-Control-Max-Age": "86400",
             },
+        )
+
+    @app.get("/v1/models")
+    async def list_models():
+        model_name = os.path.basename(f"{engine.args.MODEL_NAME}")
+        response = {
+            "object": "list",
+            "data": [
+                {
+                    "id": model_name,
+                    "object": "model",
+                    "owned_by": "rwkv_lightning",
+                }
+            ],
+        }
+        return Response(
+            status_code=200,
+            description=json.dumps(response, ensure_ascii=False),
+            headers={"Content-Type": "application/json"},
         )
 
     @app.post("/v1/chat/completions")
@@ -950,4 +1084,132 @@ def create_app(engine, password=None):
             media_type="text/event-stream",
         )
 
+    @app.post("/openai/chat/completions")
+    async def openai_chat_completions(request):
+        try:
+            body = json.loads(request.body)
+            auth_error = _check_openai_auth(request, body)
+            if auth_error is not None:
+                return auth_error
+
+            prompt = _extract_openai_prompt(body)
+            if not prompt and not (body.get("messages") or []):
+                return _json_response(400, {"error": "Empty prompt"})
+
+            req_body = {
+                "model": body.get("model", "rwkv7"),
+                "contents": [prompt],
+                "messages": body.get("messages", []),
+                "system": body.get("system"),
+                "max_tokens": body.get("max_tokens", 50),
+                "stop_tokens": body.get("stop_tokens", [0, 261, 24281]),
+                "temperature": body.get("temperature", 1.0),
+                "top_k": body.get("top_k", 1),
+                "top_p": body.get("top_p", 0.3),
+                "stream": body.get("stream", False),
+                "pad_zero": body.get("pad_zero", False),
+                "alpha_presence": body.get("alpha_presence", 0.5),
+                "alpha_frequency": body.get("alpha_frequency", 0.5),
+                "alpha_decay": body.get("alpha_decay", 0.996),
+                "enable_think": body.get("enable_think", False),
+                "chunk_size": body.get("chunk_size", 4),
+                "password": body.get("password"),
+            }
+            req = ChatRequest(**req_body)
+
+            prompt_formatted = _format_openai_prompt(body, req.enable_think)
+            response_id = f"chatcmpl-{uuid.uuid4().hex}"
+            created = int(time.time())
+            model_name = req.model or os.path.basename(f"{engine.args.MODEL_NAME}")
+
+            if req.stream:
+                async def stream_openai_chunks():
+                    start_chunk = {
+                        "id": response_id,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": model_name,
+                        "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}],
+                    }
+                    yield f"data: {json.dumps(start_chunk, ensure_ascii=False)}\n\n"
+
+                    async for item in engine.dynamic_batch_infer_stream(
+                        prompt=prompt_formatted,
+                        max_generate_tokens=req.max_tokens,
+                        stop_tokens=req.stop_tokens,
+                        pad_zero=req.pad_zero,
+                        temperature=req.temperature,
+                        top_k=req.top_k,
+                        top_p=req.top_p,
+                        alpha_presence=req.alpha_presence,
+                        alpha_frequency=req.alpha_frequency,
+                        alpha_decay=req.alpha_decay,
+                        chunk_size=req.chunk_size,
+                    ):
+                        if item["type"] == "delta" and item["text"]:
+                            chunk = {
+                                "id": response_id,
+                                "object": "chat.completion.chunk",
+                                "created": created,
+                                "model": model_name,
+                                "choices": [
+                                    {
+                                        "index": 0,
+                                        "delta": {"content": item["text"]},
+                                        "finish_reason": None,
+                                    }
+                                ],
+                            }
+                            yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+                        elif item["type"] == "done":
+                            chunk = {
+                                "id": response_id,
+                                "object": "chat.completion.chunk",
+                                "created": created,
+                                "model": model_name,
+                                "choices": [{"index": 0, "delta": {}, "finish_reason": item["finish_reason"]}],
+                            }
+                            yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+                            break
+
+                    yield "data: [DONE]\n\n"
+
+                return StreamingResponse(stream_openai_chunks(), media_type="text/event-stream")
+
+            result_text, finish_reason = await engine.dynamic_batch_generate(
+                prompt=prompt_formatted,
+                max_generate_tokens=req.max_tokens,
+                stop_tokens=req.stop_tokens,
+                pad_zero=req.pad_zero,
+                temperature=req.temperature,
+                top_k=req.top_k,
+                top_p=req.top_p,
+                alpha_presence=req.alpha_presence,
+                alpha_frequency=req.alpha_frequency,
+                alpha_decay=req.alpha_decay,
+                chunk_size=req.chunk_size,
+            )
+
+            response = {
+                "id": response_id,
+                "object": "chat.completion",
+                "created": created,
+                "model": model_name,
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {"role": "assistant", "content": result_text},
+                        "finish_reason": finish_reason,
+                    }
+                ],
+                "usage": _build_openai_usage(prompt_formatted, result_text),
+            }
+            return _json_response(200, response)
+        except json.JSONDecodeError as exc:
+            return _json_response(400, {"error": f"Invalid JSON: {str(exc)}"})
+        except Exception as exc:
+            import traceback
+
+            print(f"[ERROR] /openai/chat/completions: {traceback.format_exc()}")
+            return _json_response(500, {"error": str(exc)})
     return app

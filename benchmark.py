@@ -33,7 +33,7 @@ args.MODEL_NAME = "/mnt/pc411_data/rwkv_translate/rwkv7-g1d-2.9b-20260131-ctx819
 
 print(f'\nUsing CUDA fp16. Loading {args.MODEL_NAME} ...\n')
 
-from infer.rwkv_batch.rwkv7_int8 import RWKV_x070
+from infer.rwkv_batch.rwkv7 import RWKV_x070
 model = RWKV_x070(args)
 
 PARAM_BYTES = 2
