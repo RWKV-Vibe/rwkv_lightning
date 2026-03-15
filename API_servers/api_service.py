@@ -18,16 +18,16 @@ class ChatRequest(BaseModel):
     system: Optional[str] = None
     prefix: list[str] = []
     suffix: list[str] = []
-    max_tokens: int = 50
+    max_tokens: int = 8192
     stop_tokens: list[int] = [0, 261, 24281]
     temperature: float = 1.0
-    top_k: int = 1
-    top_p: float = 0.3
+    top_k: int = 50
+    top_p: float = 0.6
     noise: float = 1.5
     stream: bool = False
     pad_zero: bool = True
-    alpha_presence: float = 0.5
-    alpha_frequency: float = 0.5
+    alpha_presence: float = 2
+    alpha_frequency: float = 0.2
     alpha_decay: float = 0.996
     enable_think: bool = False
     chunk_size: int = 4
@@ -120,23 +120,15 @@ def create_app(engine, password=None):
         return ""
 
     def _format_openai_prompt(body: dict, enable_think: bool) -> str:
+        contents = body.get("contents") or []
         messages = body.get("messages") or []
         system_field = body.get("system")
-        if not messages:
-            prompt = _extract_openai_prompt(body)
-            prompt_parts = []
-            if system_field:
-                prompt_parts.append(f"System: {system_field}")
-            prompt_parts.append(f"User: {prompt}")
-            prompt_text = "\n\n".join(prompt_parts)
-            if enable_think:
-                return f"{prompt_text}\n\nAssistant: <think"
-            return f"{prompt_text}\n\nAssistant: <think>\n</think>"
+        current_prompt = str(contents[0]).strip() if contents else ""
 
         system_parts = []
         if system_field:
             system_parts.append(str(system_field))
-        dialogue_parts = []
+        history_messages = []
         role_map = {
             "user": "User",
             "assistant": "Assistant",
@@ -154,13 +146,21 @@ def create_app(engine, password=None):
                 system_parts.append(content)
                 continue
             dialogue_role = role_map.get(role, role.capitalize() or "User")
-            dialogue_parts.append(f"{dialogue_role}: {content}")
+            history_messages.append((dialogue_role, content))
+
+        if not current_prompt and history_messages:
+            current_prompt = history_messages[-1][1].strip()
+
+        if current_prompt and history_messages and history_messages[-1][1].strip() == current_prompt:
+            history_messages = history_messages[:-1]
 
         prompt_parts = []
         if system_parts:
             prompt_parts.append(f"System: {'\n\n'.join(system_parts)}")
-        if dialogue_parts:
-            prompt_parts.append("\n\n".join(dialogue_parts))
+        if history_messages:
+            prompt_parts.append("\n\n".join(f"{role}: {content}" for role, content in history_messages))
+        if current_prompt:
+            prompt_parts.append(f"User: {current_prompt}")
 
         prompt_text = "\n\n".join(part for part in prompt_parts if part).strip()
         if not prompt_text:
@@ -220,7 +220,7 @@ def create_app(engine, password=None):
     @app.options("/state/chat/completions")
     @app.options("/multi_state/chat/completions")
     @app.options("/big_batch/completions")
-    @app.options("/openai/chat/completions")
+    @app.options("/openai/v1/chat/completions")
 
     async def handle_options():
         return Response(
@@ -1084,7 +1084,7 @@ def create_app(engine, password=None):
             media_type="text/event-stream",
         )
 
-    @app.post("/openai/chat/completions")
+    @app.post("/openai/v1/chat/completions")
     async def openai_chat_completions(request):
         try:
             body = json.loads(request.body)
@@ -1101,23 +1101,28 @@ def create_app(engine, password=None):
                 "contents": [prompt],
                 "messages": body.get("messages", []),
                 "system": body.get("system"),
-                "max_tokens": body.get("max_tokens", 50),
+                "max_tokens": body.get("max_tokens", 4096),
                 "stop_tokens": body.get("stop_tokens", [0, 261, 24281]),
                 "temperature": body.get("temperature", 1.0),
-                "top_k": body.get("top_k", 1),
-                "top_p": body.get("top_p", 0.3),
+                "top_k": body.get("top_k", 20),
+                "top_p": body.get("top_p", 0.6),
                 "stream": body.get("stream", False),
                 "pad_zero": body.get("pad_zero", False),
-                "alpha_presence": body.get("alpha_presence", 0.5),
-                "alpha_frequency": body.get("alpha_frequency", 0.5),
+                "alpha_presence": body.get("alpha_presence", 1),
+                "alpha_frequency": body.get("alpha_frequency", 0.1),
                 "alpha_decay": body.get("alpha_decay", 0.996),
                 "enable_think": body.get("enable_think", False),
-                "chunk_size": body.get("chunk_size", 4),
+                "chunk_size": body.get("chunk_size", 2),
                 "password": body.get("password"),
             }
             req = ChatRequest(**req_body)
 
+            print(f"[OpenAI] Request: {req}")
+
             prompt_formatted = _format_openai_prompt(body, req.enable_think)
+
+            print(f"[OpenAI] Prompt: {prompt_formatted}")
+
             response_id = f"chatcmpl-{uuid.uuid4().hex}"
             created = int(time.time())
             model_name = req.model or os.path.basename(f"{engine.args.MODEL_NAME}")
@@ -1210,6 +1215,6 @@ def create_app(engine, password=None):
         except Exception as exc:
             import traceback
 
-            print(f"[ERROR] /openai/chat/completions: {traceback.format_exc()}")
+            print(f"[ERROR] /openai/v1/chat/completions: {traceback.format_exc()}")
             return _json_response(500, {"error": str(exc)})
     return app

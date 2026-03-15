@@ -4,7 +4,9 @@ RWKV Batch infer backend Base on [Albatross](https://github.com/BlinkDL/Albatros
 ## Install requirements
 **For Nvidia CUDA**
 ```bash
-pip install torch robyn pydantic ninja numpy flashinfer-python
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cu130
+pip install robyn pydantic ninja numpy 
+[optional] pip install flashinfer-python
 ```
 **For AMD ROCm**
 
@@ -12,8 +14,8 @@ pip install torch robyn pydantic ninja numpy flashinfer-python
 
 **No problem! This could work too. It's not that it can't be used 🫣**
 ```bash
-pip3 install torch torchvision --index-url https://download.pytorch.org/whl/rocm6.4
-pip install torch robyn pydantic ninja numpy 
+pip install torch torchvision --index-url https://download.pytorch.org/whl/rocm6.4
+pip install robyn pydantic ninja numpy 
 ```
 
 ## Usage
@@ -438,7 +440,7 @@ curl -X POST http://localhost:8000/state/chat/completions \
 
 ### 6. **State Management API** [Support state cache manager] 😜 
 
-#### Use ```state/status```  Interface to delete the state of a session
+#### Use ```state/status```  Interface to check the state pool status of a session
 
 <details>
 <summary>curl examples</summary>
@@ -468,4 +470,68 @@ curl -X POST http://localhost:8000/state/delete \
   }'
 ```
 
+</details>
+
+### 7. ```/openai/v1/chat/completions``` [Open AI format support]
+- "could be used for chat fronted which OpenAI API compatibility. Such as Cherry studio."
+<details>
+<summary>curl examples</summary>
+
+- Streaming asynchronous Open AI API
+```bash
+curl -X POST 'http://localhost:8000/openai/v1/chat/completions' \
+  --header 'Content-Type: application/json' \
+  --header 'Authorization: Bearer your-password-if-set' \
+  --data '{
+    "model": "rwkv7",
+    "messages": [
+      {"role": "user", "content": "please tell me about the history of artificial intelligence"}
+    ],
+    "top_p": 0.6,
+    "max_tokens": 2048,
+    "temperature": 0.8,
+    "stream": true
+  }'
+```
+- Non-streaming asynchronous Open AI API
+```bash
+curl -X POST 'http://localhost:8000/openai/v1/chat/completions' \
+  --header 'Content-Type: application/json' \
+  --header 'Authorization: Bearer your-password-if-set' \
+  --data '{
+    "model": "rwkv7",
+    "messages": [
+      {"role": "user", "content": "please tell me about the history of artificial intelligence"}
+    ],
+    "top_p": 0.6,
+    "max_tokens": 2048,
+    "temperature": 0.8,
+    "stream": false
+  }'
+```
+</details>
+
+### 8. ```/big_batch/completions```  [Only Support noise & temperature decode parameters]
+
+<details>
+<summary>curl examples</summary>
+
+**The Fastest Batch Processing API 🚀** 
+- Streaming synchronous batch processing 
+```bash
+curl -X POST 'http://localhost:8000/big_batch/completions' \
+  --header 'Content-Type: application/json' \
+  --data '{
+    "contents": [
+      "English: That night, a bolt of lightning splits the same chestnut tree under which Rochester and Jane had been sitting that evening.\n\nChinese:",
+      "English: That night, a bolt of lightning splits the same chestnut tree under which Rochester and Jane had been sitting that evening.\n\nChinese:"
+    ],
+    "max_tokens": 1024,
+    "stop_tokens": [0, 261, 24281],
+    "temperature": 1.0,
+    "chunk_size": 8,
+    "stream": true,
+    "password": "rwkv7_7.2b"
+  }'
+```
 </details>
