@@ -154,15 +154,16 @@ def create_app(engine, password=None):
         if current_prompt and history_messages and history_messages[-1][1].strip() == current_prompt:
             history_messages = history_messages[:-1]
 
+        double_newline = '\n\n'
         prompt_parts = []
         if system_parts:
-            prompt_parts.append(f"System: {'\n\n'.join(system_parts)}")
+            prompt_parts.append(f"System: {double_newline.join(system_parts)}")
         if history_messages:
-            prompt_parts.append("\n\n".join(f"{role}: {content}" for role, content in history_messages))
+            prompt_parts.append(double_newline.join(f"{role}: {content}" for role, content in history_messages))
         if current_prompt:
             prompt_parts.append(f"User: {current_prompt}")
 
-        prompt_text = "\n\n".join(part for part in prompt_parts if part).strip()
+        prompt_text = double_newline.join(part for part in prompt_parts if part).strip()
         if not prompt_text:
             prompt_text = _extract_openai_prompt(body)
 
