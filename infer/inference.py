@@ -1451,10 +1451,14 @@ class InferenceEngine:
         token_buffers = [[] for _ in range(batch_size)]
 
         try:
+            step_count = 0
+            cleanup_interval = 100
+
             while not all(finished) and max_length > 0:
                 new_tokens = sampler_gumbel_batch(logits=out, temp=temperature).tolist()
                 out = self.model.forward_batch(new_tokens, state)
                 max_length -= 1
+                step_count += 1
 
                 contents_to_send = [""] * batch_size
 
@@ -1492,6 +1496,10 @@ class InferenceEngine:
 
                 await asyncio.sleep(0)
 
+                if step_count % cleanup_interval == 0:
+                    torch.cuda.empty_cache()
+                    gc.collect()
+
             remaining_contents = [""] * batch_size
             for i in range(batch_size):
                 if token_buffers[i]:
@@ -1509,8 +1517,14 @@ class InferenceEngine:
                 }
                 if chunk["choices"]:
                     yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+
         finally:
             del state
+            del encoded_prompts
+            del out
+            del finished
+            del generated_tokens
+            del token_buffers
             torch.cuda.empty_cache()
             gc.collect()
 

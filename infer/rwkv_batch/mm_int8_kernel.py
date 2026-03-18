@@ -10,9 +10,9 @@ MyStatic = torch.jit.script
 
 
 if ROCm_flag == True:
-    load(name="rwkv_mm8", sources=[f"{current_path}/hip/wrapper.cpp", 
+    load(name="rwkv_mm8", sources=[f"{current_path}/hip/wrapper.hip", 
                                    f"{current_path}/hip/operators.hip", 
-                                   f"{current_path}/hip/gemm_fp16_cublas.cpp"], is_python_module=False,
+                                   f"{current_path}/hip/gemm_fp16_cublas.hip"], is_python_module=False,
                     verbose=True, extra_cuda_cflags=['-fopenmp', '-ffast-math', '-O3', '-munsafe-fp-atomics'])
 else:
     load(name="rwkv_mm8", sources=[f"{current_path}/cuda/wrapper.cpp", 
