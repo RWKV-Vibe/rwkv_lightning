@@ -134,19 +134,13 @@ def _extract_tag_tool_call(text: str) -> Optional[tuple[str, str]]:
 
 
 def _extract_prefix_tool_call(text: str) -> Optional[tuple[str, str]]:
-    for line in text.splitlines():
+    lines = text.splitlines()
+    for i, line in enumerate(lines):
         stripped = line.strip()
         if not stripped.startswith("@@tool "):
             continue
         payload = stripped[len("@@tool ") :].strip()
-        remaining_lines = []
-        removed = False
-        for current_line in text.splitlines():
-            current_stripped = current_line.strip()
-            if not removed and current_stripped == stripped:
-                removed = True
-                continue
-            remaining_lines.append(current_line)
+        remaining_lines = lines[:i] + lines[i + 1 :]
         remaining = "\n".join(remaining_lines).strip()
         return payload, remaining
     return None
