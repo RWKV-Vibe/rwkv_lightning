@@ -474,6 +474,8 @@ curl -X POST http://localhost:8000/state/delete \
 
 ### 7. ```/openai/v1/chat/completions``` [Open AI format support]
 - "could be used for chat fronted which OpenAI API compatibility. Such as Cherry studio."
+- **Experimental tool-call parsing is non-streaming only.** Set `"stream": false` when you want the server to extract `tool_calls` from the model output.
+- When a tool call is parsed successfully, any text before or after the tool-call payload is preserved as the assistant message `content`.
 <details>
 <summary>curl examples</summary>
 
