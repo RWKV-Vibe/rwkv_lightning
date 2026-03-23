@@ -498,7 +498,7 @@ class InferenceEngine:
         max_generate_tokens,
         stop_tokens,
         pad_zero=True,
-        temperature=1,
+        temperature=1.0,
         top_k=50,
         top_p=0.3,
         alpha_presence=0.5,
@@ -919,131 +919,40 @@ class InferenceEngine:
         encoded_prompt = self.tokenizer.encode(prompt)
         state = self.model.generate_zero_state(0)
 
-        out = self.model.forward(encoded_prompt, state)
-
-        token = sampler_gumbel_batch(logits=out, temp=temperature).item()
-
-        x_emb = self.model.z["emb.weight"][token]
-
-        static_input = torch.empty_like(x_emb, device="cuda")
-        static_state = [None, None, None]
-        static_state[0] = torch.empty_like(state[0], device="cuda")
-        static_state[1] = torch.empty_like(state[1], device="cuda")
-        static_state[2] = torch.empty_like(state[2], device="cuda")
-        static_output = torch.empty_like(out, device="cuda")
-
-        static_output = self.model.forward(static_input, static_state)
-
-        g = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(g):
-            static_output = self.model.forward(static_input, static_state)
-
-        static_input.copy_(x_emb)
-        static_state[0].copy_(state[0])
-        static_state[1].copy_(state[1])
-        static_state[2].copy_(state[2])
-        static_output.copy_(out)
-
-        generated_tokens = [token]
-
-        for _ in range(max_generate_tokens):
-            x_emb = self.model.z["emb.weight"][token]
-            static_input.copy_(x_emb)
-
-            g.replay()
-
-            logits_reshaped = static_output.unsqueeze(0).float()
-
-            sample_rand_states = sample.setup_rand(random.randint(0, 2**63 - 1), 1)
-            penalties = torch.zeros(1, 65536).to(0)
-            new_tokens = sample.batch_sampling_repetition_temperature_topk_topp(
-                logits_reshaped,
-                penalties,
-                sample_rand_states,
-                alpha_presence,
-                alpha_frequency,
-                alpha_decay,
-                temperature,
-                top_k,
-                top_p,
-            ).tolist()
-            token = new_tokens[0]
-            generated_tokens.append(token)
-            if token in stop_tokens:
-                break
-
-        del state
-        del static_state
-        del static_input
-        del static_output
-        del g
-        gc.collect()
-        torch.cuda.empty_cache()
-
-        decoded = self.tokenizer.decode(generated_tokens, utf8_errors="ignore")
-        return [decoded]
-
-    async def graph_infer_stream(
-        self,
-        inputs,
-        stop_tokens,
-        max_generate_tokens,
-        temperature=1.0,
-        top_k=50,
-        top_p=0.3,
-        alpha_presence=0.5,
-        alpha_frequency=0.5,
-        alpha_decay=0.996,
-        chunk_size=32,
-    ):
-        prompt = inputs[0]
-        encoded_prompt = self.tokenizer.encode(prompt)
-        finish_reason = "length"
-
-        state = self.model.generate_zero_state(0)
-
-        out = self.model.forward(encoded_prompt, state)
-
-        token = sampler_gumbel_batch(logits=out, temp=temperature).item()
-
-        x_emb = self.model.z["emb.weight"][token]
-
-        static_input = torch.empty_like(x_emb, device="cuda")
-        static_state = [None, None, None]
-        static_state[0] = torch.empty_like(state[0], device="cuda")
-        static_state[1] = torch.empty_like(state[1], device="cuda")
-        static_state[2] = torch.empty_like(state[2], device="cuda")
-        static_output = torch.empty_like(out, device="cuda")
-
-        static_output = self.model.forward(static_input, static_state)
-
-        g = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(g):
-            static_output = self.model.forward(static_input, static_state)
-
-        static_input.copy_(x_emb)
-        static_state[0].copy_(state[0])
-        static_state[1].copy_(state[1])
-        static_state[2].copy_(state[2])
-        static_output.copy_(out)
-
-        token_buffer = []
-
         try:
-            if token in stop_tokens:
-                finish_reason = "stop"
-            else:
-                content = self.tokenizer.decode([token], utf8_errors="ignore")
-                if content:
-                    chunk = {
-                        "object": "chat.completion.chunk",
-                        "choices": [{"index": 0, "delta": {"content": content}}],
-                    }
-                    yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
-                else:
-                    token_buffer.append(token)
+            if max_generate_tokens <= 0:
+                return [""]
 
-            for _ in range(max_generate_tokens):
+            out = self.model.forward(encoded_prompt, state)
+
+            token = sampler_gumbel_batch(logits=out, temp=temperature).item()
+            if token in stop_tokens:
+                return [""]
+
+            x_emb = self.model.z["emb.weight"][token]
+
+            static_input = torch.empty_like(x_emb, device="cuda")
+            static_state = [None, None, None]
+            static_state[0] = torch.empty_like(state[0], device="cuda")
+            static_state[1] = torch.empty_like(state[1], device="cuda")
+            static_state[2] = torch.empty_like(state[2], device="cuda")
+            static_output = torch.empty_like(out, device="cuda")
+
+            static_output = self.model.forward(static_input, static_state)
+
+            g = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(g):
+                static_output = self.model.forward(static_input, static_state)
+
+            static_input.copy_(x_emb)
+            static_state[0].copy_(state[0])
+            static_state[1].copy_(state[1])
+            static_state[2].copy_(state[2])
+            static_output.copy_(out)
+
+            generated_tokens = [token]
+
+            for _ in range(max_generate_tokens - 1):
                 x_emb = self.model.z["emb.weight"][token]
                 static_input.copy_(x_emb)
 
@@ -1066,22 +975,159 @@ class InferenceEngine:
                 ).tolist()
                 token = new_tokens[0]
                 if token in stop_tokens:
-                    finish_reason = "stop"
                     break
+                generated_tokens.append(token)
 
-                token_buffer.append(token)
+            decoded = self.tokenizer.decode(generated_tokens, utf8_errors="ignore")
+            return [decoded]
+        finally:
+            del state
+            gc.collect()
+            torch.cuda.empty_cache()
 
-                if len(token_buffer) >= chunk_size:
-                    content = self.tokenizer.decode(token_buffer, utf8_errors="ignore")
-                    token_buffer.clear()
-                    if content:
-                        chunk = {
-                            "object": "chat.completion.chunk",
-                            "choices": [{"index": 0, "delta": {"content": content}}],
-                        }
-                        yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+    async def graph_infer_stream(
+        self,
+        inputs,
+        stop_tokens,
+        max_generate_tokens,
+        temperature=1.0,
+        top_k=50,
+        top_p=0.3,
+        alpha_presence=0.5,
+        alpha_frequency=0.5,
+        alpha_decay=0.996,
+        chunk_size=32,
+    ):
+        prompt = inputs[0]
+        if self.rocm_flag or not torch.cuda.is_available():
+            async for item in self.dynamic_batch_infer_stream(
+                prompt=prompt,
+                max_generate_tokens=max_generate_tokens,
+                stop_tokens=stop_tokens,
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p,
+                alpha_presence=alpha_presence,
+                alpha_frequency=alpha_frequency,
+                alpha_decay=alpha_decay,
+                chunk_size=chunk_size,
+            ):
+                if item["type"] == "delta" and item["text"]:
+                    chunk = {
+                        "object": "chat.completion.chunk",
+                        "choices": [{"index": 0, "delta": {"content": item["text"]}}],
+                    }
+                    yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+                    continue
+                if item["type"] == "done":
+                    chunk = {
+                        "object": "chat.completion.chunk",
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {},
+                                "finish_reason": item["finish_reason"],
+                            }
+                        ],
+                    }
+                    yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+                    break
+            yield "data: [DONE]\n\n"
+            return
 
-                await asyncio.sleep(0)
+        encoded_prompt = self.tokenizer.encode(prompt)
+        finish_reason = "length"
+        token_buffer = []
+        state = self.model.generate_zero_state(0)
+
+        try:
+            if max_generate_tokens <= 0:
+                chunk = {
+                    "object": "chat.completion.chunk",
+                    "choices": [
+                        {"index": 0, "delta": {}, "finish_reason": finish_reason}
+                    ],
+                }
+                yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+                yield "data: [DONE]\n\n"
+                return
+
+            out = self.model.forward(encoded_prompt, state)
+            token = sampler_gumbel_batch(logits=out, temp=temperature).item()
+
+            if token in stop_tokens:
+                finish_reason = "stop"
+            else:
+                content = self.tokenizer.decode([token], utf8_errors="ignore")
+                if content:
+                    chunk = {
+                        "object": "chat.completion.chunk",
+                        "choices": [{"index": 0, "delta": {"content": content}}],
+                    }
+                    yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+                else:
+                    token_buffer.append(token)
+
+                x_emb = self.model.z["emb.weight"][token]
+
+                static_input = torch.empty_like(x_emb, device="cuda")
+                static_state = [None, None, None]
+                static_state[0] = torch.empty_like(state[0], device="cuda")
+                static_state[1] = torch.empty_like(state[1], device="cuda")
+                static_state[2] = torch.empty_like(state[2], device="cuda")
+                static_output = torch.empty_like(out, device="cuda")
+
+                static_output = self.model.forward(static_input, static_state)
+
+                g = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(g):
+                    static_output = self.model.forward(static_input, static_state)
+
+                static_input.copy_(x_emb)
+                static_state[0].copy_(state[0])
+                static_state[1].copy_(state[1])
+                static_state[2].copy_(state[2])
+                static_output.copy_(out)
+
+                for _ in range(max_generate_tokens - 1):
+                    x_emb = self.model.z["emb.weight"][token]
+                    static_input.copy_(x_emb)
+
+                    g.replay()
+
+                    logits_reshaped = static_output.unsqueeze(0).float()
+
+                    sample_rand_states = sample.setup_rand(random.randint(0, 2**63 - 1), 1)
+                    penalties = torch.zeros(1, 65536).to(0)
+                    new_tokens = sample.batch_sampling_repetition_temperature_topk_topp(
+                        logits_reshaped,
+                        penalties,
+                        sample_rand_states,
+                        alpha_presence,
+                        alpha_frequency,
+                        alpha_decay,
+                        temperature,
+                        top_k,
+                        top_p,
+                    ).tolist()
+                    token = new_tokens[0]
+                    if token in stop_tokens:
+                        finish_reason = "stop"
+                        break
+
+                    token_buffer.append(token)
+
+                    if len(token_buffer) >= chunk_size:
+                        content = self.tokenizer.decode(token_buffer, utf8_errors="ignore")
+                        token_buffer.clear()
+                        if content:
+                            chunk = {
+                                "object": "chat.completion.chunk",
+                                "choices": [{"index": 0, "delta": {"content": content}}],
+                            }
+                            yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+
+                    await asyncio.sleep(0)
 
             if token_buffer:
                 content = self.tokenizer.decode(token_buffer, utf8_errors="ignore")
@@ -1102,10 +1148,6 @@ class InferenceEngine:
 
         finally:
             del state
-            del static_state
-            del static_input
-            del static_output
-            del g
             gc.collect()
             torch.cuda.empty_cache()
 
