@@ -397,6 +397,48 @@ async def test_openai_route_stateless_stream_propagates_graph_length_finish_reas
     )
 
 
+async def test_openai_route_stateless_stream_skips_malformed_graph_json_payload() -> None:
+    app = DummyApp()
+
+    class MalformedGraphEngine(DummyEngine):
+        async def graph_infer_stream(self, **kwargs) -> AsyncIterator[str]:
+            self.graph_stream_calls.append(kwargs)
+            yield 'data: {"choices":[{"index":0,"delta":{"content":"before-bad-json"}}]}'
+            yield 'data: {"choices":['
+            yield 'data: {"choices":[{"index":0,"delta":{"content":"after-bad-json"}}]}'
+            yield 'data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}'
+            yield "data: [DONE]"
+
+    engine = MalformedGraphEngine()
+    openai_routes.register_openai_routes(
+        app, engine, password=None, chat_request_model=ChatRequest
+    )
+    route = app.routes["/openai/v1/chat/completions"]
+
+    response = await route(
+        DummyRequest(
+            {
+                "messages": [{"role": "user", "content": "Hello malformed"}],
+                "stream": True,
+            }
+        )
+    )
+    chunks = []
+    async for chunk in response.iterator:
+        chunks.append(chunk)
+
+    combined = "".join(chunks)
+    if "before-bad-json" not in combined or "after-bad-json" not in combined:
+        raise AssertionError(
+            "stateless graph stream should preserve valid chunks around malformed JSON"
+        )
+    if '"finish_reason": "stop"' not in combined or "[DONE]" not in combined:
+        raise AssertionError(
+            "stateless graph stream should still emit stop finish_reason and DONE after malformed JSON"
+        )
+    print("[PASS] test_openai_route_stateless_stream_skips_malformed_graph_json_payload")
+
+
 async def test_openai_route_stateless_stream_respects_chunk_size_override() -> None:
     app = DummyApp()
     engine = DummyEngine()
@@ -432,6 +474,7 @@ async def main() -> None:
     await test_openai_route_stateless_stream_uses_graph_stream()
     await test_openai_route_stateless_stream_falls_back_when_graph_not_supported()
     await test_openai_route_stateless_stream_propagates_graph_length_finish_reason()
+    await test_openai_route_stateless_stream_skips_malformed_graph_json_payload()
     await test_openai_route_stateless_stream_respects_chunk_size_override()
     print("All openai_routes tests passed.")
 

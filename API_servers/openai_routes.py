@@ -207,7 +207,10 @@ async def _stream_stateless_openai_chunks(
                     yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
                 break
 
-            chunk_payload = json.loads(payload)
+            try:
+                chunk_payload = json.loads(payload)
+            except json.JSONDecodeError:
+                continue
             choices = chunk_payload.get("choices") or []
             if not choices:
                 continue
