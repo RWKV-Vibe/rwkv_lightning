@@ -102,6 +102,7 @@ class DummyEngine:
         self.state_calls: list[dict] = []
         self.dynamic_stream_calls: list[dict] = []
         self.state_stream_calls: list[dict] = []
+        self.graph_stream_calls: list[dict] = []
 
     async def dynamic_batch_generate(self, **kwargs):
         self.dynamic_calls.append(kwargs)
@@ -119,6 +120,11 @@ class DummyEngine:
     async def batch_infer_stream_state(self, **kwargs):
         self.state_stream_calls.append(kwargs)
         yield 'data: {"choices":[{"index":0,"delta":{"content":"stream-stateful"}}]}'
+        yield "data: [DONE]"
+
+    async def graph_infer_stream(self, **kwargs):
+        self.graph_stream_calls.append(kwargs)
+        yield 'data: {"choices":[{"index":0,"delta":{"content":"stream-graph"}}]}'
         yield "data: [DONE]"
 
 
@@ -266,10 +272,85 @@ async def test_openai_route_stateful_stream_uses_state_stream() -> None:
     print("[PASS] test_openai_route_stateful_stream_uses_state_stream")
 
 
+async def test_openai_route_stateless_stream_uses_graph_stream() -> None:
+    app = DummyApp()
+    engine = DummyEngine()
+    openai_routes.register_openai_routes(
+        app, engine, password=None, chat_request_model=ChatRequest
+    )
+    route = app.routes["/openai/v1/chat/completions"]
+
+    response = await route(
+        DummyRequest(
+            {
+                "messages": [{"role": "user", "content": "Hello stream"}],
+                "stream": True,
+            }
+        )
+    )
+    chunks = []
+    async for chunk in response.iterator:
+        chunks.append(chunk)
+
+    combined = "".join(chunks)
+    if "stream-graph" not in combined or "[DONE]" not in combined:
+        raise AssertionError(
+            "stateless streaming response should contain graph content and DONE marker"
+        )
+    if combined.count("[DONE]") != 1:
+        raise AssertionError("stateless streaming should emit a single DONE marker")
+    _assert_equal(
+        len(engine.graph_stream_calls),
+        1,
+        "stateless streaming should use graph stream when available",
+    )
+    _assert_equal(
+        len(engine.dynamic_stream_calls),
+        0,
+        "stateless streaming should not use dynamic stream when graph stream is available",
+    )
+    _assert_equal(
+        engine.graph_stream_calls[0]["chunk_size"],
+        1,
+        "stateless streaming should use updated default chunk_size",
+    )
+    print("[PASS] test_openai_route_stateless_stream_uses_graph_stream")
+
+
+async def test_openai_route_stateless_stream_respects_chunk_size_override() -> None:
+    app = DummyApp()
+    engine = DummyEngine()
+    openai_routes.register_openai_routes(
+        app, engine, password=None, chat_request_model=ChatRequest
+    )
+    route = app.routes["/openai/v1/chat/completions"]
+
+    response = await route(
+        DummyRequest(
+            {
+                "messages": [{"role": "user", "content": "Hello override"}],
+                "stream": True,
+                "chunk_size": 7,
+            }
+        )
+    )
+    async for _ in response.iterator:
+        pass
+
+    _assert_equal(
+        engine.graph_stream_calls[0]["chunk_size"],
+        7,
+        "stateless streaming should honor explicit chunk_size override",
+    )
+    print("[PASS] test_openai_route_stateless_stream_respects_chunk_size_override")
+
+
 async def main() -> None:
     await test_openai_route_stateless_non_stream_uses_dynamic_batch_generate()
     await test_openai_route_stateful_non_stream_uses_state_cache()
     await test_openai_route_stateful_stream_uses_state_stream()
+    await test_openai_route_stateless_stream_uses_graph_stream()
+    await test_openai_route_stateless_stream_respects_chunk_size_override()
     print("All openai_routes tests passed.")
 
 
