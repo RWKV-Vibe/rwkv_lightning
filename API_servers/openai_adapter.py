@@ -158,6 +158,11 @@ def build_openai_usage(tokenizer, prompt_text: str, completion_text: str) -> dic
 
 
 def build_internal_chat_request(body: dict, prompt: str) -> dict:
+    stream = body.get("stream", False)
+    chunk_size = body.get("chunk_size")
+    if chunk_size is None:
+        chunk_size = 1 if stream else 16
+
     return {
         "model": body.get("model", "rwkv7"),
         "contents": [prompt],
@@ -168,13 +173,13 @@ def build_internal_chat_request(body: dict, prompt: str) -> dict:
         "temperature": body.get("temperature", 1.0),
         "top_k": body.get("top_k", 20),
         "top_p": body.get("top_p", 0.6),
-        "stream": body.get("stream", False),
+        "stream": stream,
         "pad_zero": body.get("pad_zero", False),
         "alpha_presence": body.get("alpha_presence", 1),
         "alpha_frequency": body.get("alpha_frequency", 0.1),
         "alpha_decay": body.get("alpha_decay", 0.996),
         "enable_think": body.get("enable_think", False),
-        "chunk_size": body.get("chunk_size", 2),
+        "chunk_size": chunk_size,
         "password": body.get("password"),
         "session_id": body.get("session_id"),
     }

@@ -166,20 +166,78 @@ async def _stream_stateless_openai_chunks(
     }
     yield f"data: {json.dumps(start_chunk, ensure_ascii=False)}\n\n"
 
-    async for item in engine.dynamic_batch_infer_stream(
-        prompt=prompt_formatted,
-        max_generate_tokens=req.max_tokens,
-        stop_tokens=req.stop_tokens,
-        pad_zero=req.pad_zero,
-        temperature=req.temperature,
-        top_k=req.top_k,
-        top_p=req.top_p,
-        alpha_presence=req.alpha_presence,
-        alpha_frequency=req.alpha_frequency,
-        alpha_decay=req.alpha_decay,
-        chunk_size=req.chunk_size,
-    ):
-        if item["type"] == "delta" and item["text"]:
+    saw_done = False
+    emitted_finish_reason = False
+    use_graph_stream = hasattr(engine, "graph_infer_stream") and not getattr(
+        engine, "rocm_flag", False
+    )
+    if use_graph_stream:
+        async for item in engine.graph_infer_stream(
+            inputs=[prompt_formatted],
+            stop_tokens=req.stop_tokens,
+            max_generate_tokens=req.max_tokens,
+            temperature=req.temperature,
+            top_k=req.top_k,
+            top_p=req.top_p,
+            alpha_presence=req.alpha_presence,
+            alpha_frequency=req.alpha_frequency,
+            alpha_decay=req.alpha_decay,
+            chunk_size=req.chunk_size,
+        ):
+            if not isinstance(item, str) or not item.startswith("data: "):
+                continue
+
+            payload = item[6:]
+            if payload == "[DONE]":
+                saw_done = True
+                if not emitted_finish_reason:
+                    chunk = {
+                        "id": response_id,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": model_name,
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {},
+                                "finish_reason": "stop",
+                            }
+                        ],
+                    }
+                    yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+                break
+
+            try:
+                chunk_payload = json.loads(payload)
+            except json.JSONDecodeError:
+                continue
+            choices = chunk_payload.get("choices") or []
+            if not choices:
+                continue
+
+            finish_reason = choices[0].get("finish_reason")
+            if finish_reason is not None:
+                emitted_finish_reason = True
+                chunk = {
+                    "id": response_id,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": model_name,
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {},
+                            "finish_reason": finish_reason,
+                        }
+                    ],
+                }
+                yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+                continue
+
+            content = choices[0].get("delta", {}).get("content")
+            if not content:
+                continue
+
             chunk = {
                 "id": response_id,
                 "object": "chat.completion.chunk",
@@ -188,28 +246,57 @@ async def _stream_stateless_openai_chunks(
                 "choices": [
                     {
                         "index": 0,
-                        "delta": {"content": item["text"]},
+                        "delta": {"content": content},
                         "finish_reason": None,
                     }
                 ],
             }
             yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
-        elif item["type"] == "done":
-            chunk = {
-                "id": response_id,
-                "object": "chat.completion.chunk",
-                "created": created,
-                "model": model_name,
-                "choices": [
-                    {
-                        "index": 0,
-                        "delta": {},
-                        "finish_reason": item["finish_reason"],
-                    }
-                ],
-            }
-            yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
-            break
+    else:
+        async for item in engine.dynamic_batch_infer_stream(
+            prompt=prompt_formatted,
+            max_generate_tokens=req.max_tokens,
+            stop_tokens=req.stop_tokens,
+            pad_zero=req.pad_zero,
+            temperature=req.temperature,
+            top_k=req.top_k,
+            top_p=req.top_p,
+            alpha_presence=req.alpha_presence,
+            alpha_frequency=req.alpha_frequency,
+            alpha_decay=req.alpha_decay,
+            chunk_size=req.chunk_size,
+        ):
+            if item["type"] == "delta" and item["text"]:
+                chunk = {
+                    "id": response_id,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": model_name,
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {"content": item["text"]},
+                            "finish_reason": None,
+                        }
+                    ],
+                }
+                yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+            elif item["type"] == "done":
+                chunk = {
+                    "id": response_id,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": model_name,
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {},
+                            "finish_reason": item["finish_reason"],
+                        }
+                    ],
+                }
+                yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+                break
 
     yield "data: [DONE]\n\n"
 
