@@ -998,6 +998,7 @@ class InferenceEngine:
     ):
         prompt = inputs[0]
         encoded_prompt = self.tokenizer.encode(prompt)
+        finish_reason = "length"
 
         state = self.model.generate_zero_state(0)
 
@@ -1029,7 +1030,9 @@ class InferenceEngine:
         token_buffer = []
 
         try:
-            if token not in stop_tokens:
+            if token in stop_tokens:
+                finish_reason = "stop"
+            else:
                 content = self.tokenizer.decode([token], utf8_errors="ignore")
                 if content:
                     chunk = {
@@ -1063,6 +1066,7 @@ class InferenceEngine:
                 ).tolist()
                 token = new_tokens[0]
                 if token in stop_tokens:
+                    finish_reason = "stop"
                     break
 
                 token_buffer.append(token)
@@ -1087,6 +1091,14 @@ class InferenceEngine:
                         "choices": [{"index": 0, "delta": {"content": content}}],
                     }
                     yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+
+            chunk = {
+                "object": "chat.completion.chunk",
+                "choices": [
+                    {"index": 0, "delta": {}, "finish_reason": finish_reason}
+                ],
+            }
+            yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
 
         finally:
             del state

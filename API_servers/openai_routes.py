@@ -167,7 +167,11 @@ async def _stream_stateless_openai_chunks(
     yield f"data: {json.dumps(start_chunk, ensure_ascii=False)}\n\n"
 
     saw_done = False
-    if hasattr(engine, "graph_infer_stream"):
+    emitted_finish_reason = False
+    use_graph_stream = hasattr(engine, "graph_infer_stream") and not getattr(
+        engine, "rocm_flag", False
+    )
+    if use_graph_stream:
         async for item in engine.graph_infer_stream(
             inputs=[prompt_formatted],
             stop_tokens=req.stop_tokens,
@@ -186,6 +190,31 @@ async def _stream_stateless_openai_chunks(
             payload = item[6:]
             if payload == "[DONE]":
                 saw_done = True
+                if not emitted_finish_reason:
+                    chunk = {
+                        "id": response_id,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": model_name,
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {},
+                                "finish_reason": "stop",
+                            }
+                        ],
+                    }
+                    yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+                break
+
+            chunk_payload = json.loads(payload)
+            choices = chunk_payload.get("choices") or []
+            if not choices:
+                continue
+
+            finish_reason = choices[0].get("finish_reason")
+            if finish_reason is not None:
+                emitted_finish_reason = True
                 chunk = {
                     "id": response_id,
                     "object": "chat.completion.chunk",
@@ -195,16 +224,11 @@ async def _stream_stateless_openai_chunks(
                         {
                             "index": 0,
                             "delta": {},
-                            "finish_reason": "stop",
+                            "finish_reason": finish_reason,
                         }
                     ],
                 }
                 yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
-                break
-
-            chunk_payload = json.loads(payload)
-            choices = chunk_payload.get("choices") or []
-            if not choices:
                 continue
 
             content = choices[0].get("delta", {}).get("content")

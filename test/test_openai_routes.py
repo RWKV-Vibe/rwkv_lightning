@@ -6,7 +6,7 @@ from __future__ import annotations
 import asyncio
 import json
 import sys
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
@@ -96,6 +96,7 @@ class DummyModel:
 class DummyEngine:
     def __init__(self):
         self.args = SimpleNamespace(MODEL_NAME="dummy-model")
+        self.rocm_flag = False
         self.tokenizer = DummyTokenizer()
         self.model = DummyModel()
         self.dynamic_calls: list[dict] = []
@@ -122,9 +123,10 @@ class DummyEngine:
         yield 'data: {"choices":[{"index":0,"delta":{"content":"stream-stateful"}}]}'
         yield "data: [DONE]"
 
-    async def graph_infer_stream(self, **kwargs):
+    async def graph_infer_stream(self, **kwargs) -> AsyncIterator[str]:
         self.graph_stream_calls.append(kwargs)
         yield 'data: {"choices":[{"index":0,"delta":{"content":"stream-graph"}}]}'
+        yield 'data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}'
         yield "data: [DONE]"
 
 
@@ -297,6 +299,8 @@ async def test_openai_route_stateless_stream_uses_graph_stream() -> None:
         raise AssertionError(
             "stateless streaming response should contain graph content and DONE marker"
         )
+    if '"finish_reason": "stop"' not in combined:
+        raise AssertionError("graph streaming response should propagate stop finish_reason")
     if combined.count("[DONE]") != 1:
         raise AssertionError("stateless streaming should emit a single DONE marker")
     _assert_equal(
@@ -315,6 +319,82 @@ async def test_openai_route_stateless_stream_uses_graph_stream() -> None:
         "stateless streaming should use updated default chunk_size",
     )
     print("[PASS] test_openai_route_stateless_stream_uses_graph_stream")
+
+
+async def test_openai_route_stateless_stream_falls_back_when_graph_not_supported() -> None:
+    app = DummyApp()
+    engine = DummyEngine()
+    engine.rocm_flag = True
+    openai_routes.register_openai_routes(
+        app, engine, password=None, chat_request_model=ChatRequest
+    )
+    route = app.routes["/openai/v1/chat/completions"]
+
+    response = await route(
+        DummyRequest(
+            {
+                "messages": [{"role": "user", "content": "Hello fallback"}],
+                "stream": True,
+            }
+        )
+    )
+    chunks = []
+    async for chunk in response.iterator:
+        chunks.append(chunk)
+
+    combined = "".join(chunks)
+    if "stream-stateless" not in combined:
+        raise AssertionError(
+            "stateless streaming should fall back to dynamic stream when graph is not supported"
+        )
+    _assert_equal(
+        len(engine.graph_stream_calls),
+        0,
+        "stateless streaming should not use graph stream when graph is not supported",
+    )
+    _assert_equal(
+        len(engine.dynamic_stream_calls),
+        1,
+        "stateless streaming should use dynamic stream fallback when graph is not supported",
+    )
+    print("[PASS] test_openai_route_stateless_stream_falls_back_when_graph_not_supported")
+
+
+async def test_openai_route_stateless_stream_propagates_graph_length_finish_reason() -> None:
+    app = DummyApp()
+    class GraphLengthEngine(DummyEngine):
+        async def graph_infer_stream(self, **kwargs) -> AsyncIterator[str]:
+            self.graph_stream_calls.append(kwargs)
+            yield 'data: {"choices":[{"index":0,"delta":{"content":"stream-graph-length"}}]}'
+            yield 'data: {"choices":[{"index":0,"delta":{},"finish_reason":"length"}]}'
+            yield "data: [DONE]"
+
+    engine = GraphLengthEngine()
+    openai_routes.register_openai_routes(
+        app, engine, password=None, chat_request_model=ChatRequest
+    )
+    route = app.routes["/openai/v1/chat/completions"]
+
+    response = await route(
+        DummyRequest(
+            {
+                "messages": [{"role": "user", "content": "Hello length"}],
+                "stream": True,
+            }
+        )
+    )
+    chunks = []
+    async for chunk in response.iterator:
+        chunks.append(chunk)
+
+    combined = "".join(chunks)
+    if '"finish_reason": "length"' not in combined:
+        raise AssertionError("graph streaming response should propagate length finish_reason")
+    if '"finish_reason": "stop"' in combined:
+        raise AssertionError("graph length case should not be rewritten to stop")
+    print(
+        "[PASS] test_openai_route_stateless_stream_propagates_graph_length_finish_reason"
+    )
 
 
 async def test_openai_route_stateless_stream_respects_chunk_size_override() -> None:
@@ -350,6 +430,8 @@ async def main() -> None:
     await test_openai_route_stateful_non_stream_uses_state_cache()
     await test_openai_route_stateful_stream_uses_state_stream()
     await test_openai_route_stateless_stream_uses_graph_stream()
+    await test_openai_route_stateless_stream_falls_back_when_graph_not_supported()
+    await test_openai_route_stateless_stream_propagates_graph_length_finish_reason()
     await test_openai_route_stateless_stream_respects_chunk_size_override()
     print("All openai_routes tests passed.")
 
