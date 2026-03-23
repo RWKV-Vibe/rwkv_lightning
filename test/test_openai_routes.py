@@ -1,0 +1,277 @@
+#!/usr/bin/env python3
+"""Focused tests for OpenAI route stateful/stateless branching."""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import sys
+from collections.abc import Callable
+from pathlib import Path
+from types import ModuleType, SimpleNamespace
+
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO_ROOT))
+
+
+class DummyResponse:
+    def __init__(self, status_code: int, description: str, headers: dict | None = None):
+        self.status_code = status_code
+        self.description = description
+        self.headers = headers or {}
+
+
+class DummyStreamingResponse:
+    def __init__(self, iterator, media_type: str):
+        self.iterator = iterator
+        self.media_type = media_type
+
+
+robyn_stub = ModuleType("robyn")
+setattr(robyn_stub, "Response", DummyResponse)
+setattr(robyn_stub, "StreamingResponse", DummyStreamingResponse)
+sys.modules.setdefault("robyn", robyn_stub)
+
+state_pool_stub = ModuleType("state_manager.state_pool")
+setattr(state_pool_stub, "get_state_manager", lambda: None)
+sys.modules.setdefault("state_manager.state_pool", state_pool_stub)
+
+import API_servers.openai_routes as openai_routes
+
+
+class ChatRequest:
+    def __init__(self, **kwargs):
+        self.model = "rwkv7"
+        self.contents = []
+        self.messages = []
+        self.system = None
+        self.max_tokens = 128
+        self.stop_tokens = [0, 261, 24281]
+        self.temperature = 1.0
+        self.top_k = 20
+        self.top_p = 0.6
+        self.stream = False
+        self.pad_zero = False
+        self.alpha_presence = 1.0
+        self.alpha_frequency = 0.1
+        self.alpha_decay = 0.996
+        self.enable_think = False
+        self.chunk_size = 2
+        self.password = None
+        self.session_id = None
+
+        for key, value in kwargs.items():
+            setattr(self, key, value)
+
+
+class DummyApp:
+    def __init__(self):
+        self.routes: dict[str, Callable] = {}
+
+    def post(self, path: str):
+        def decorator(func):
+            self.routes[path] = func
+            return func
+
+        return decorator
+
+
+class DummyRequest:
+    def __init__(self, body: dict, headers: dict | None = None):
+        self.body = json.dumps(body)
+        self.headers = headers or {}
+
+
+class DummyTokenizer:
+    def encode(self, text: str):
+        return list(text.encode("utf-8"))
+
+
+class DummyModel:
+    def generate_zero_state(self, index: int):
+        return [f"state-{index}", 0, [0]]
+
+
+class DummyEngine:
+    def __init__(self):
+        self.args = SimpleNamespace(MODEL_NAME="dummy-model")
+        self.tokenizer = DummyTokenizer()
+        self.model = DummyModel()
+        self.dynamic_calls: list[dict] = []
+        self.state_calls: list[dict] = []
+        self.dynamic_stream_calls: list[dict] = []
+        self.state_stream_calls: list[dict] = []
+
+    async def dynamic_batch_generate(self, **kwargs):
+        self.dynamic_calls.append(kwargs)
+        return "stateless-ok", "stop"
+
+    def batch_generate_state(self, **kwargs):
+        self.state_calls.append(kwargs)
+        return ["stateful-ok"]
+
+    async def dynamic_batch_infer_stream(self, **kwargs):
+        self.dynamic_stream_calls.append(kwargs)
+        yield {"type": "delta", "text": "stream-stateless"}
+        yield {"type": "done", "finish_reason": "stop"}
+
+    async def batch_infer_stream_state(self, **kwargs):
+        self.state_stream_calls.append(kwargs)
+        yield 'data: {"choices":[{"index":0,"delta":{"content":"stream-stateful"}}]}'
+        yield "data: [DONE]"
+
+
+class DummyStateManager:
+    def __init__(self, initial_state=None):
+        self.state = initial_state
+        self.get_calls: list[str] = []
+        self.put_calls: list[tuple[str, object]] = []
+
+    def get_state(self, session_id: str):
+        self.get_calls.append(session_id)
+        return self.state
+
+    def put_state(self, session_id: str, state):
+        self.put_calls.append((session_id, state))
+        self.state = state
+
+
+def _assert_equal(actual, expected, message: str) -> None:
+    if actual != expected:
+        raise AssertionError(f"{message}: expected {expected!r}, got {actual!r}")
+
+
+async def test_openai_route_stateless_non_stream_uses_dynamic_batch_generate() -> None:
+    app = DummyApp()
+    engine = DummyEngine()
+    openai_routes.register_openai_routes(
+        app, engine, password=None, chat_request_model=ChatRequest
+    )
+    route = app.routes["/openai/v1/chat/completions"]
+
+    response = await route(
+        DummyRequest(
+            {
+                "messages": [{"role": "user", "content": "Hello there"}],
+                "stream": False,
+            }
+        )
+    )
+    payload = json.loads(response.description)
+    _assert_equal(
+        payload["choices"][0]["message"]["content"],
+        "stateless-ok",
+        "stateless response content mismatch",
+    )
+    _assert_equal(
+        len(engine.dynamic_calls),
+        1,
+        "stateless route should use dynamic batch generate",
+    )
+    _assert_equal(
+        len(engine.state_calls), 0, "stateless route should not use state generate"
+    )
+    print("[PASS] test_openai_route_stateless_non_stream_uses_dynamic_batch_generate")
+
+
+async def test_openai_route_stateful_non_stream_uses_state_cache() -> None:
+    app = DummyApp()
+    engine = DummyEngine()
+    manager = DummyStateManager(initial_state=None)
+    original_get_state_manager = openai_routes.get_state_manager
+    openai_routes.get_state_manager = lambda: manager
+    try:
+        openai_routes.register_openai_routes(
+            app, engine, password=None, chat_request_model=ChatRequest
+        )
+        route = app.routes["/openai/v1/chat/completions"]
+
+        response = await route(
+            DummyRequest(
+                {
+                    "messages": [{"role": "user", "content": "Only new turn"}],
+                    "session_id": "sess-1",
+                    "stream": False,
+                }
+            )
+        )
+    finally:
+        openai_routes.get_state_manager = original_get_state_manager
+
+    payload = json.loads(response.description)
+    _assert_equal(
+        payload["choices"][0]["message"]["content"],
+        "stateful-ok",
+        "stateful response content mismatch",
+    )
+    _assert_equal(
+        len(engine.dynamic_calls),
+        0,
+        "stateful route should not use dynamic batch generate",
+    )
+    _assert_equal(
+        len(engine.state_calls), 1, "stateful route should use state generate"
+    )
+    _assert_equal(manager.get_calls, ["sess-1"], "state manager lookup mismatch")
+    _assert_equal(
+        len(manager.put_calls), 2, "stateful route should initialize and persist state"
+    )
+    prompt = engine.state_calls[0]["prompts"][0]
+    if "Only new turn" not in prompt:
+        raise AssertionError("stateful prompt should include the incremental turn")
+    print("[PASS] test_openai_route_stateful_non_stream_uses_state_cache")
+
+
+async def test_openai_route_stateful_stream_uses_state_stream() -> None:
+    app = DummyApp()
+    engine = DummyEngine()
+    manager = DummyStateManager(initial_state=["existing", 0, [1]])
+    original_get_state_manager = openai_routes.get_state_manager
+    openai_routes.get_state_manager = lambda: manager
+    try:
+        openai_routes.register_openai_routes(
+            app, engine, password=None, chat_request_model=ChatRequest
+        )
+        route = app.routes["/openai/v1/chat/completions"]
+
+        response = await route(
+            DummyRequest(
+                {
+                    "messages": [{"role": "user", "content": "Next turn"}],
+                    "session_id": "sess-stream",
+                    "stream": True,
+                }
+            )
+        )
+        chunks = []
+        async for chunk in response.iterator:
+            chunks.append(chunk)
+    finally:
+        openai_routes.get_state_manager = original_get_state_manager
+
+    combined = "".join(chunks)
+    if "stream-stateful" not in combined or "[DONE]" not in combined:
+        raise AssertionError(
+            "stateful streaming response should contain content and DONE marker"
+        )
+    _assert_equal(
+        len(engine.state_stream_calls), 1, "stateful streaming should use state stream"
+    )
+    _assert_equal(
+        len(engine.dynamic_stream_calls),
+        0,
+        "stateful streaming should not use stateless stream",
+    )
+    print("[PASS] test_openai_route_stateful_stream_uses_state_stream")
+
+
+async def main() -> None:
+    await test_openai_route_stateless_non_stream_uses_dynamic_batch_generate()
+    await test_openai_route_stateful_non_stream_uses_state_cache()
+    await test_openai_route_stateful_stream_uses_state_stream()
+    print("All openai_routes tests passed.")
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

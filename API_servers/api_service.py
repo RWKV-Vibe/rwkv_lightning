@@ -1,13 +1,12 @@
 import json
 import os
-import time
-import uuid
 from threading import Lock
 from typing import Optional
 
 from pydantic import BaseModel
 from robyn import Robyn, Response, StreamingResponse
 
+from API_servers.openai_routes import register_openai_routes
 from state_manager.state_pool import get_state_manager, remove_session_from_any_level
 
 
@@ -78,113 +77,13 @@ def create_app(engine, password=None):
             headers={"Content-Type": "application/json"},
         )
 
-    def _extract_bearer_token(request) -> Optional[str]:
-        headers = getattr(request, "headers", {}) or {}
-        auth_header = headers.get("authorization") or headers.get("Authorization")
-        if not auth_header or not auth_header.startswith("Bearer "):
-            return None
-        return auth_header.split(" ", 1)[1].strip()
-
-    def _check_openai_auth(request, body: dict):
-        if not password:
-            return None
-        bearer_token = _extract_bearer_token(request)
-        body_password = body.get("password")
-        if bearer_token == password or body_password == password:
-            return None
-        return _json_response(401, {"error": "Unauthorized: invalid or missing password"})
-
-    def _normalize_message_content(content) -> str:
-        if isinstance(content, str):
-            return content
-        if isinstance(content, list):
-            text_parts = []
-            for item in content:
-                if isinstance(item, dict) and item.get("type") == "text":
-                    text_parts.append(item.get("text", ""))
-                elif isinstance(item, str):
-                    text_parts.append(item)
-            return "".join(text_parts)
-        if content is None:
-            return ""
-        return str(content)
-
-    def _extract_openai_prompt(body: dict) -> str:
-        contents = body.get("contents") or []
-        if contents:
-            return str(contents[0])
-
-        messages = body.get("messages") or []
-        if messages:
-            return _normalize_message_content(messages[-1].get("content", ""))
-        return ""
-
-    def _format_openai_prompt(body: dict, enable_think: bool) -> str:
-        contents = body.get("contents") or []
-        messages = body.get("messages") or []
-        system_field = body.get("system")
-        current_prompt = str(contents[0]).strip() if contents else ""
-
-        system_parts = []
-        if system_field:
-            system_parts.append(str(system_field))
-        history_messages = []
-        role_map = {
-            "user": "User",
-            "assistant": "Assistant",
-            "system": "System",
-            "tool": "Tool",
-            "developer": "Developer",
-        }
-
-        for message in messages:
-            role = str(message.get("role", "user")).lower()
-            content = _normalize_message_content(message.get("content", ""))
-            if not content:
-                continue
-            if role == "system":
-                system_parts.append(content)
-                continue
-            dialogue_role = role_map.get(role, role.capitalize() or "User")
-            history_messages.append((dialogue_role, content))
-
-        if not current_prompt and history_messages:
-            current_prompt = history_messages[-1][1].strip()
-
-        if current_prompt and history_messages and history_messages[-1][1].strip() == current_prompt:
-            history_messages = history_messages[:-1]
-
-        double_newline = '\n\n'
-        prompt_parts = []
-        if system_parts:
-            prompt_parts.append(f"System: {double_newline.join(system_parts)}")
-        if history_messages:
-            prompt_parts.append(double_newline.join(f"{role}: {content}" for role, content in history_messages))
-        if current_prompt:
-            prompt_parts.append(f"User: {current_prompt}")
-
-        prompt_text = double_newline.join(part for part in prompt_parts if part).strip()
-        if not prompt_text:
-            prompt_text = _extract_openai_prompt(body)
-
-        if enable_think:
-            return f"{prompt_text}\n\nAssistant: <think"
-        return f"{prompt_text}\n\nAssistant: <think>\n</think>"
-
-    def _build_openai_usage(prompt_text: str, completion_text: str) -> dict:
-        prompt_tokens = len(engine.tokenizer.encode(prompt_text))
-        completion_tokens = len(engine.tokenizer.encode(completion_text)) if completion_text else 0
-        return {
-            "prompt_tokens": prompt_tokens,
-            "completion_tokens": completion_tokens,
-            "total_tokens": prompt_tokens + completion_tokens,
-        }
-
     def _collect_session_indices(state_manager, session_index: str) -> list[int]:
         prefix = f"{session_index}:"
         all_states = state_manager.list_all_states()
         indices = []
-        for key in all_states["l1_cache"] + all_states["l2_cache"] + all_states["database"]:
+        for key in (
+            all_states["l1_cache"] + all_states["l2_cache"] + all_states["database"]
+        ):
             if key.startswith(prefix):
                 tail = key[len(prefix) :]
                 if tail.isdigit():
@@ -207,7 +106,9 @@ def create_app(engine, password=None):
     @app.after_request()
     def after_request(response):
         response.headers["Access-Control-Allow-Origin"] = "*"
-        response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS"
+        response.headers["Access-Control-Allow-Methods"] = (
+            "GET, POST, PUT, DELETE, OPTIONS"
+        )
         response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
         return response
 
@@ -222,7 +123,6 @@ def create_app(engine, password=None):
     @app.options("/multi_state/chat/completions")
     @app.options("/big_batch/completions")
     @app.options("/openai/v1/chat/completions")
-
     async def handle_options():
         return Response(
             status_code=204,
@@ -262,7 +162,9 @@ def create_app(engine, password=None):
         if password and req.password != password:
             return Response(
                 status_code=401,
-                description=json.dumps({"error": "Unauthorized: invalid or missing password"}),
+                description=json.dumps(
+                    {"error": "Unauthorized: invalid or missing password"}
+                ),
                 headers={"Content-Type": "application/json"},
             )
 
@@ -327,7 +229,9 @@ def create_app(engine, password=None):
             if password and req.password != password:
                 return Response(
                     status_code=401,
-                    description=json.dumps({"error": "Unauthorized: invalid or missing password"}),
+                    description=json.dumps(
+                        {"error": "Unauthorized: invalid or missing password"}
+                    ),
                     headers={"Content-Type": "application/json"},
                 )
 
@@ -415,7 +319,9 @@ def create_app(engine, password=None):
             body = json.loads(request.body)
             if "contents" not in body and "messages" in body:
                 msgs = body.get("messages") or []
-                user_texts = [m.get("content", "") for m in msgs if m.get("role") == "user"]
+                user_texts = [
+                    m.get("content", "") for m in msgs if m.get("role") == "user"
+                ]
                 if not user_texts and msgs:
                     user_texts = [m.get("content", "") for m in msgs]
                 body = {**body, "contents": user_texts}
@@ -425,7 +331,9 @@ def create_app(engine, password=None):
             if password and req.password != password:
                 return Response(
                     status_code=401,
-                    description=json.dumps({"error": "Unauthorized: invalid or missing password"}),
+                    description=json.dumps(
+                        {"error": "Unauthorized: invalid or missing password"}
+                    ),
                     headers={"Content-Type": "application/json"},
                 )
 
@@ -433,7 +341,9 @@ def create_app(engine, password=None):
             if req.enable_think:
                 prompts_formatted = [f"User: {q}\n\nAssistant: <think" for q in prompts]
             else:
-                prompts_formatted = [f"User: {q}\n\nAssistant: <think>\n</think>" for q in prompts]
+                prompts_formatted = [
+                    f"User: {q}\n\nAssistant: <think>\n</think>" for q in prompts
+                ]
 
             if not prompts:
                 return Response(
@@ -517,7 +427,9 @@ def create_app(engine, password=None):
 
             prompts = []
             for text in processed_texts:
-                prompt = create_translation_prompt(req.source_lang, req.target_lang, text)
+                prompt = create_translation_prompt(
+                    req.source_lang, req.target_lang, text
+                )
                 prompts.append(prompt)
 
             max_tokens = 2048
@@ -539,7 +451,9 @@ def create_app(engine, password=None):
             for translation in translated_texts:
                 translations_result.append(
                     {
-                        "detected_source_lang": req.source_lang if req.source_lang != "auto" else "en",
+                        "detected_source_lang": req.source_lang
+                        if req.source_lang != "auto"
+                        else "en",
                         "text": translation.strip(),
                     }
                 )
@@ -571,7 +485,9 @@ def create_app(engine, password=None):
         if password and req.password != password:
             return Response(
                 status_code=401,
-                description=json.dumps({"error": "Unauthorized: invalid or missing password"}),
+                description=json.dumps(
+                    {"error": "Unauthorized: invalid or missing password"}
+                ),
                 headers={"Content-Type": "application/json"},
             )
 
@@ -690,13 +606,17 @@ def create_app(engine, password=None):
         if batch_size > 1:
             return Response(
                 status_code=500,
-                description=json.dumps({"error": "Server Error: Requst must be single prompt !"}),
+                description=json.dumps(
+                    {"error": "Server Error: Requst must be single prompt !"}
+                ),
                 headers={"Content-Type": "application/json"},
             )
         if password and req.password != password:
             return Response(
                 status_code=401,
-                description=json.dumps({"error": "Unauthorized: invalid or missing password"}),
+                description=json.dumps(
+                    {"error": "Unauthorized: invalid or missing password"}
+                ),
                 headers={"Content-Type": "application/json"},
             )
 
@@ -711,7 +631,9 @@ def create_app(engine, password=None):
                 return Response(
                     status_code=500,
                     description=json.dumps(
-                        {"error": "Server Error: Request must be single prompt when initializing new session!"}
+                        {
+                            "error": "Server Error: Request must be single prompt when initializing new session!"
+                        }
                     ),
                     headers={"Content-Type": "application/json"},
                 )
@@ -786,7 +708,9 @@ def create_app(engine, password=None):
         if password and req.password != password:
             return Response(
                 status_code=401,
-                description=json.dumps({"error": "Unauthorized: invalid or missing password"}),
+                description=json.dumps(
+                    {"error": "Unauthorized: invalid or missing password"}
+                ),
                 headers={"Content-Type": "application/json"},
             )
 
@@ -810,7 +734,9 @@ def create_app(engine, password=None):
         if batch_size != 1:
             return Response(
                 status_code=500,
-                description=json.dumps({"error": "Server Error: Request must be single prompt!"}),
+                description=json.dumps(
+                    {"error": "Server Error: Request must be single prompt!"}
+                ),
                 headers={"Content-Type": "application/json"},
             )
 
@@ -824,7 +750,9 @@ def create_app(engine, password=None):
             if dialogue_idx != 0:
                 return Response(
                     status_code=404,
-                    description=json.dumps({"error": f"State not found for dialogue_idx={dialogue_idx}"}),
+                    description=json.dumps(
+                        {"error": f"State not found for dialogue_idx={dialogue_idx}"}
+                    ),
                     headers={"Content-Type": "application/json"},
                 )
             state = engine.model.generate_zero_state(0)
@@ -833,6 +761,7 @@ def create_app(engine, password=None):
             print(f"[REUSE] Reusing state for session: {state_key}")
 
         if req.stream:
+
             async def stream_with_dialogue_idx():
                 stored = False
                 try:
@@ -852,7 +781,9 @@ def create_app(engine, password=None):
                         state_manager=None,
                     ):
                         if chunk == "data: [DONE]\n\n" and not stored:
-                            new_dialogue_idx = _allocate_next_dialogue_idx(state_manager, session_index)
+                            new_dialogue_idx = _allocate_next_dialogue_idx(
+                                state_manager, session_index
+                            )
                             new_session_id = f"{session_index}:{new_dialogue_idx}"
                             state_manager.put_state(new_session_id, state)
                             stored = True
@@ -865,10 +796,16 @@ def create_app(engine, password=None):
                         yield chunk
                 finally:
                     if not stored:
-                        new_dialogue_idx = _allocate_next_dialogue_idx(state_manager, session_index)
+                        new_dialogue_idx = _allocate_next_dialogue_idx(
+                            state_manager, session_index
+                        )
                         new_session_id = f"{session_index}:{new_dialogue_idx}"
                         state_manager.put_state(new_session_id, state)
-                        print("[RESPONSE] /multi_state/chat/completions state[2]: ", state[2], "\n")
+                        print(
+                            "[RESPONSE] /multi_state/chat/completions state[2]: ",
+                            state[2],
+                            "\n",
+                        )
 
             return StreamingResponse(
                 stream_with_dialogue_idx(),
@@ -916,7 +853,6 @@ def create_app(engine, password=None):
             headers={"Content-Type": "application/json"},
         )
 
-
     @app.post("/state/status")
     async def state_status(request):
         try:
@@ -924,7 +860,9 @@ def create_app(engine, password=None):
             if password and body.get("password") != password:
                 return Response(
                     status_code=401,
-                    description=json.dumps({"error": "Unauthorized: invalid or missing password"}),
+                    description=json.dumps(
+                        {"error": "Unauthorized: invalid or missing password"}
+                    ),
                     headers={"Content-Type": "application/json"},
                 )
 
@@ -956,11 +894,16 @@ def create_app(engine, password=None):
                 )
 
             for session_id in all_states["database"]:
-                manager.db_cursor.execute("SELECT last_updated FROM sessions WHERE session_id = ?", (session_id,))
+                manager.db_cursor.execute(
+                    "SELECT last_updated FROM sessions WHERE session_id = ?",
+                    (session_id,),
+                )
                 row = manager.db_cursor.fetchone()
                 if row:
                     timestamp = row[0]
-                    readable_time = datetime.fromtimestamp(timestamp).strftime("%Y-%m-%d %H:%M:%S")
+                    readable_time = datetime.fromtimestamp(timestamp).strftime(
+                        "%Y-%m-%d %H:%M:%S"
+                    )
                     detailed_states.append(
                         {
                             "session_id": session_id,
@@ -1015,7 +958,9 @@ def create_app(engine, password=None):
             if password and body.get("password") != password:
                 return Response(
                     status_code=401,
-                    description=json.dumps({"error": "Unauthorized: invalid or missing password"}),
+                    description=json.dumps(
+                        {"error": "Unauthorized: invalid or missing password"}
+                    ),
                     headers={"Content-Type": "application/json"},
                 )
 
@@ -1045,7 +990,9 @@ def create_app(engine, password=None):
                 }
                 status_code = 404
 
-            print(f"[StatePool] Delete session {session_id}: {'Success' if success else 'Not Found'}")
+            print(
+                f"[StatePool] Delete session {session_id}: {'Success' if success else 'Not Found'}"
+            )
 
             return Response(
                 status_code=status_code,
@@ -1068,7 +1015,9 @@ def create_app(engine, password=None):
         if password and req.password != password:
             return Response(
                 status_code=401,
-                description=json.dumps({"error": "Unauthorized: invalid or missing password"}),
+                description=json.dumps(
+                    {"error": "Unauthorized: invalid or missing password"}
+                ),
                 headers={"Content-Type": "application/json"},
             )
 
@@ -1085,137 +1034,7 @@ def create_app(engine, password=None):
             media_type="text/event-stream",
         )
 
-    @app.post("/openai/v1/chat/completions")
-    async def openai_chat_completions(request):
-        try:
-            body = json.loads(request.body)
-            auth_error = _check_openai_auth(request, body)
-            if auth_error is not None:
-                return auth_error
-
-            prompt = _extract_openai_prompt(body)
-            if not prompt and not (body.get("messages") or []):
-                return _json_response(400, {"error": "Empty prompt"})
-
-            req_body = {
-                "model": body.get("model", "rwkv7"),
-                "contents": [prompt],
-                "messages": body.get("messages", []),
-                "system": body.get("system"),
-                "max_tokens": body.get("max_tokens", 4096),
-                "stop_tokens": body.get("stop_tokens", [0, 261, 24281]),
-                "temperature": body.get("temperature", 1.0),
-                "top_k": body.get("top_k", 20),
-                "top_p": body.get("top_p", 0.6),
-                "stream": body.get("stream", False),
-                "pad_zero": body.get("pad_zero", False),
-                "alpha_presence": body.get("alpha_presence", 1),
-                "alpha_frequency": body.get("alpha_frequency", 0.1),
-                "alpha_decay": body.get("alpha_decay", 0.996),
-                "enable_think": body.get("enable_think", False),
-                "chunk_size": body.get("chunk_size", 2),
-                "password": body.get("password"),
-            }
-            req = ChatRequest(**req_body)
-
-            print(f"[OpenAI] Request: {req}")
-
-            prompt_formatted = _format_openai_prompt(body, req.enable_think)
-
-            print(f"[OpenAI] Prompt: {prompt_formatted}")
-
-            response_id = f"chatcmpl-{uuid.uuid4().hex}"
-            created = int(time.time())
-            model_name = req.model or os.path.basename(f"{engine.args.MODEL_NAME}")
-
-            if req.stream:
-                async def stream_openai_chunks():
-                    start_chunk = {
-                        "id": response_id,
-                        "object": "chat.completion.chunk",
-                        "created": created,
-                        "model": model_name,
-                        "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}],
-                    }
-                    yield f"data: {json.dumps(start_chunk, ensure_ascii=False)}\n\n"
-
-                    async for item in engine.dynamic_batch_infer_stream(
-                        prompt=prompt_formatted,
-                        max_generate_tokens=req.max_tokens,
-                        stop_tokens=req.stop_tokens,
-                        pad_zero=req.pad_zero,
-                        temperature=req.temperature,
-                        top_k=req.top_k,
-                        top_p=req.top_p,
-                        alpha_presence=req.alpha_presence,
-                        alpha_frequency=req.alpha_frequency,
-                        alpha_decay=req.alpha_decay,
-                        chunk_size=req.chunk_size,
-                    ):
-                        if item["type"] == "delta" and item["text"]:
-                            chunk = {
-                                "id": response_id,
-                                "object": "chat.completion.chunk",
-                                "created": created,
-                                "model": model_name,
-                                "choices": [
-                                    {
-                                        "index": 0,
-                                        "delta": {"content": item["text"]},
-                                        "finish_reason": None,
-                                    }
-                                ],
-                            }
-                            yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
-                        elif item["type"] == "done":
-                            chunk = {
-                                "id": response_id,
-                                "object": "chat.completion.chunk",
-                                "created": created,
-                                "model": model_name,
-                                "choices": [{"index": 0, "delta": {}, "finish_reason": item["finish_reason"]}],
-                            }
-                            yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
-                            break
-
-                    yield "data: [DONE]\n\n"
-
-                return StreamingResponse(stream_openai_chunks(), media_type="text/event-stream")
-
-            result_text, finish_reason = await engine.dynamic_batch_generate(
-                prompt=prompt_formatted,
-                max_generate_tokens=req.max_tokens,
-                stop_tokens=req.stop_tokens,
-                pad_zero=req.pad_zero,
-                temperature=req.temperature,
-                top_k=req.top_k,
-                top_p=req.top_p,
-                alpha_presence=req.alpha_presence,
-                alpha_frequency=req.alpha_frequency,
-                alpha_decay=req.alpha_decay,
-                chunk_size=req.chunk_size,
-            )
-
-            response = {
-                "id": response_id,
-                "object": "chat.completion",
-                "created": created,
-                "model": model_name,
-                "choices": [
-                    {
-                        "index": 0,
-                        "message": {"role": "assistant", "content": result_text},
-                        "finish_reason": finish_reason,
-                    }
-                ],
-                "usage": _build_openai_usage(prompt_formatted, result_text),
-            }
-            return _json_response(200, response)
-        except json.JSONDecodeError as exc:
-            return _json_response(400, {"error": f"Invalid JSON: {str(exc)}"})
-        except Exception as exc:
-            import traceback
-
-            print(f"[ERROR] /openai/v1/chat/completions: {traceback.format_exc()}")
-            return _json_response(500, {"error": str(exc)})
+    register_openai_routes(
+        app=app, engine=engine, password=password, chat_request_model=ChatRequest
+    )
     return app
