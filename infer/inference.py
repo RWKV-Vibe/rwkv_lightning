@@ -21,12 +21,18 @@ class InferenceEngine:
         self.args = args
         self.rocm_flag = rocm_flag
         self.model_lock = Lock()
-        self.executor = ThreadPoolExecutor(max_workers=128, thread_name_prefix="model_inference")
+        self.executor = ThreadPoolExecutor(
+            max_workers=128, thread_name_prefix="model_inference"
+        )
         self.dynamic_batch_lock = Lock()
         self.dynamic_batch_stop_event = Event()
         self.dynamic_batch_schedulers = {}
-        self.dynamic_batch_max_size = max(1, int(getattr(args, "dynamic_batch_max_size", 32)))
-        self.dynamic_batch_wait_ms = max(0, int(getattr(args, "dynamic_batch_wait_ms", 10)))
+        self.dynamic_batch_max_size = max(
+            1, int(getattr(args, "dynamic_batch_max_size", 32))
+        )
+        self.dynamic_batch_wait_ms = max(
+            0, int(getattr(args, "dynamic_batch_wait_ms", 10))
+        )
 
     def shutdown(self):
         self.dynamic_batch_stop_event.set()
@@ -38,7 +44,9 @@ class InferenceEngine:
                 thread.join(timeout=0.2)
         self.executor.shutdown(wait=False)
 
-    def _dynamic_batch_key(self, temperature, top_k, top_p, alpha_presence, alpha_frequency, alpha_decay):
+    def _dynamic_batch_key(
+        self, temperature, top_k, top_p, alpha_presence, alpha_frequency, alpha_decay
+    ):
         return (
             float(temperature),
             int(top_k),
@@ -83,7 +91,9 @@ class InferenceEngine:
         chunk_size,
         stream,
     ):
-        key = self._dynamic_batch_key(temperature, top_k, top_p, alpha_presence, alpha_frequency, alpha_decay)
+        key = self._dynamic_batch_key(
+            temperature, top_k, top_p, alpha_presence, alpha_frequency, alpha_decay
+        )
         scheduler = self._get_dynamic_scheduler(key)
         request_queue = Queue()
         request_data = {
@@ -118,19 +128,36 @@ class InferenceEngine:
             except Empty:
                 break
 
-    def _add_dynamic_tasks(self, task_pool, pending_requests, states, occurrence, alpha_presence_vector, device):
+    def _add_dynamic_tasks(
+        self,
+        task_pool,
+        pending_requests,
+        states,
+        occurrence,
+        alpha_presence_vector,
+        device,
+    ):
         while pending_requests and len(task_pool) < self.dynamic_batch_max_size:
             request_data = pending_requests.popleft()
             states = self._append_state_slot(states, device)
 
-            zeros = torch.zeros((1, self.args.vocab_size), dtype=torch.float32, device=device)
+            zeros = torch.zeros(
+                (1, self.args.vocab_size), dtype=torch.float32, device=device
+            )
             if occurrence is None:
                 occurrence = zeros.clone()
                 alpha_presence_vector = zeros
             else:
                 occurrence = torch.cat([occurrence, zeros], dim=0)
                 alpha_presence_vector = torch.cat(
-                    [alpha_presence_vector, torch.zeros((1, self.args.vocab_size), dtype=torch.float32, device=device)],
+                    [
+                        alpha_presence_vector,
+                        torch.zeros(
+                            (1, self.args.vocab_size),
+                            dtype=torch.float32,
+                            device=device,
+                        ),
+                    ],
                     dim=0,
                 )
 
@@ -160,17 +187,25 @@ class InferenceEngine:
 
     def _finish_dynamic_task(self, task, finish_reason):
         if task["token_buffer"]:
-            text_chunk = self.tokenizer.decode(task["token_buffer"], utf8_errors="ignore")
+            text_chunk = self.tokenizer.decode(
+                task["token_buffer"], utf8_errors="ignore"
+            )
             task["token_buffer"].clear()
             self._queue_dynamic_delta(task, text_chunk)
 
-        full_text = self.tokenizer.decode(task["generated_tokens"], utf8_errors="ignore")
-        task["request"]["queue"].put({"type": "done", "text": full_text, "finish_reason": finish_reason})
+        full_text = self.tokenizer.decode(
+            task["generated_tokens"], utf8_errors="ignore"
+        )
+        task["request"]["queue"].put(
+            {"type": "done", "text": full_text, "finish_reason": finish_reason}
+        )
 
     def _dynamic_batch_worker(self, key, request_queue):
         temperature, top_k, top_p, alpha_presence, alpha_frequency, alpha_decay = key
         device = self.model.z["head.weight"].device
-        alpha_presence_val = torch.tensor(alpha_presence, dtype=torch.float32, device=device)
+        alpha_presence_val = torch.tensor(
+            alpha_presence, dtype=torch.float32, device=device
+        )
         no_penalty_token_ids = {33, 10, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58}
 
         if temperature == 0:
@@ -217,13 +252,15 @@ class InferenceEngine:
                             self.dynamic_batch_max_size - len(task_pool),
                         )
                         if len(task_pool) < self.dynamic_batch_max_size:
-                            states, occurrence, alpha_presence_vector = self._add_dynamic_tasks(
-                                task_pool,
-                                pending_requests,
-                                states,
-                                occurrence,
-                                alpha_presence_vector,
-                                device,
+                            states, occurrence, alpha_presence_vector = (
+                                self._add_dynamic_tasks(
+                                    task_pool,
+                                    pending_requests,
+                                    states,
+                                    occurrence,
+                                    alpha_presence_vector,
+                                    device,
+                                )
                             )
 
                         accomplished_task_indices = []
@@ -238,14 +275,22 @@ class InferenceEngine:
                             new_token = task["new_token"]
                             request_data = task["request"]
                             token_in_stop = new_token in request_data["stop_tokens"]
-                            length_exceed = len(task["generated_tokens"]) >= request_data["max_generate_tokens"]
+                            length_exceed = (
+                                len(task["generated_tokens"])
+                                >= request_data["max_generate_tokens"]
+                            )
 
                             if not token_in_stop and not length_exceed:
                                 task["generated_tokens"].append(new_token)
                                 task["token_buffer"].append(new_token)
 
-                                if len(task["token_buffer"]) >= request_data["chunk_size"]:
-                                    text_chunk = self.tokenizer.decode(task["token_buffer"], utf8_errors="ignore")
+                                if (
+                                    len(task["token_buffer"])
+                                    >= request_data["chunk_size"]
+                                ):
+                                    text_chunk = self.tokenizer.decode(
+                                        task["token_buffer"], utf8_errors="ignore"
+                                    )
                                     task["token_buffer"].clear()
                                     self._queue_dynamic_delta(task, text_chunk)
 
@@ -255,7 +300,9 @@ class InferenceEngine:
 
                                 if pending_requests:
                                     request_data = pending_requests.popleft()
-                                    input_tokens = self.tokenizer.encode(request_data["prompt"])
+                                    input_tokens = self.tokenizer.encode(
+                                        request_data["prompt"]
+                                    )
                                     if request_data["pad_zero"]:
                                         input_tokens = [0] + input_tokens
                                     if not input_tokens:
@@ -280,46 +327,83 @@ class InferenceEngine:
                                     state_slots_to_remove.add(task["state_pos"])
                             else:
                                 task["input_token"].append(new_token)
-                                penalty_scale = 0.0 if new_token in no_penalty_token_ids else 1.0
-                                occurrence[task["state_pos"], new_token] += penalty_scale
-                                alpha_presence_vector[task["state_pos"], new_token] = alpha_presence_val
+                                penalty_scale = (
+                                    0.0 if new_token in no_penalty_token_ids else 1.0
+                                )
+                                occurrence[task["state_pos"], new_token] += (
+                                    penalty_scale
+                                )
+                                alpha_presence_vector[task["state_pos"], new_token] = (
+                                    alpha_presence_val
+                                )
 
                         if accomplished_task_indices:
                             sorted_slots = sorted(state_slots_to_remove, reverse=True)
                             for slot in sorted_slots:
-                                states[0] = torch.cat([states[0][:, :, :slot, :], states[0][:, :, slot + 1 :, :]], dim=2)
-                                states[1] = torch.cat([states[1][:, :slot, :, :], states[1][:, slot + 1 :, :, :]], dim=1)
-                                states[2] = torch.cat([states[2][:slot], states[2][slot + 1 :]], dim=0)
-                                occurrence = torch.cat([occurrence[:slot, :], occurrence[slot + 1 :, :]], dim=0)
+                                states[0] = torch.cat(
+                                    [
+                                        states[0][:, :, :slot, :],
+                                        states[0][:, :, slot + 1 :, :],
+                                    ],
+                                    dim=2,
+                                )
+                                states[1] = torch.cat(
+                                    [
+                                        states[1][:, :slot, :, :],
+                                        states[1][:, slot + 1 :, :, :],
+                                    ],
+                                    dim=1,
+                                )
+                                states[2] = torch.cat(
+                                    [states[2][:slot], states[2][slot + 1 :]], dim=0
+                                )
+                                occurrence = torch.cat(
+                                    [occurrence[:slot, :], occurrence[slot + 1 :, :]],
+                                    dim=0,
+                                )
                                 alpha_presence_vector = torch.cat(
-                                    [alpha_presence_vector[:slot, :], alpha_presence_vector[slot + 1 :, :]],
+                                    [
+                                        alpha_presence_vector[:slot, :],
+                                        alpha_presence_vector[slot + 1 :, :],
+                                    ],
                                     dim=0,
                                 )
 
-                            for task_idx in sorted(accomplished_task_indices, reverse=True):
+                            for task_idx in sorted(
+                                accomplished_task_indices, reverse=True
+                            ):
                                 del task_pool[task_idx]
 
-                            remaining_slots = sorted(task["state_pos"] for task in task_pool)
-                            pos_map = {old_pos: new_pos for new_pos, old_pos in enumerate(remaining_slots)}
+                            remaining_slots = sorted(
+                                task["state_pos"] for task in task_pool
+                            )
+                            pos_map = {
+                                old_pos: new_pos
+                                for new_pos, old_pos in enumerate(remaining_slots)
+                            }
                             for task in task_pool:
                                 task["state_pos"] = pos_map[task["state_pos"]]
 
                         if not task_pool:
                             if pending_requests:
-                                states, occurrence, alpha_presence_vector = self._add_dynamic_tasks(
-                                    task_pool,
-                                    pending_requests,
-                                    states,
-                                    occurrence,
-                                    alpha_presence_vector,
-                                    device,
+                                states, occurrence, alpha_presence_vector = (
+                                    self._add_dynamic_tasks(
+                                        task_pool,
+                                        pending_requests,
+                                        states,
+                                        occurrence,
+                                        alpha_presence_vector,
+                                        device,
+                                    )
                                 )
                                 continue
                             break
 
                         next_tokens = [None] * len(task_pool)
                         for task in task_pool:
-                            next_tokens[task["state_pos"]] = [task["input_token"].pop(0)]
+                            next_tokens[task["state_pos"]] = [
+                                task["input_token"].pop(0)
+                            ]
 
                         out = self.model.forward_batch(next_tokens, states)
 
@@ -339,7 +423,9 @@ class InferenceEngine:
                             try:
                                 import flashinfer  # type: ignore
 
-                                new_tokens = flashinfer.sampling.top_k_top_p_sampling_from_logits(out, top_k, top_p)
+                                new_tokens = flashinfer.sampling.top_k_top_p_sampling_from_logits(
+                                    out, top_k, top_p
+                                )
                             except Exception:
                                 new_tokens = self._torch_top_k_top_p(out, top_k, top_p)
 
@@ -349,7 +435,9 @@ class InferenceEngine:
             except Exception as exc:
                 error_message = str(exc)
                 for task in task_pool:
-                    task["request"]["queue"].put({"type": "error", "error": error_message})
+                    task["request"]["queue"].put(
+                        {"type": "error", "error": error_message}
+                    )
                 while pending_requests:
                     request_data = pending_requests.popleft()
                     request_data["queue"].put({"type": "error", "error": error_message})
@@ -454,17 +542,23 @@ class InferenceEngine:
     def _torch_top_k_top_p(logits, top_k, top_p):
         if top_k > 0:
             top_k = min(top_k, logits.size(-1))
-            indices_to_remove = logits < torch.topk(logits, top_k, dim=-1)[0][..., -1, None]
+            indices_to_remove = (
+                logits < torch.topk(logits, top_k, dim=-1)[0][..., -1, None]
+            )
             logits = logits.masked_fill(indices_to_remove, -float("Inf"))
 
         if top_p < 1.0:
             sorted_logits, sorted_indices = torch.sort(logits, descending=True, dim=-1)
-            cumulative_probs = torch.cumsum(torch.softmax(sorted_logits, dim=-1), dim=-1)
+            cumulative_probs = torch.cumsum(
+                torch.softmax(sorted_logits, dim=-1), dim=-1
+            )
 
             sorted_indices_to_remove = cumulative_probs > top_p
             sorted_indices_to_remove[..., :1] = False
 
-            indices_to_remove = sorted_indices_to_remove.scatter(dim=-1, index=sorted_indices, src=sorted_indices_to_remove)
+            indices_to_remove = sorted_indices_to_remove.scatter(
+                dim=-1, index=sorted_indices, src=sorted_indices_to_remove
+            )
             logits = logits.masked_fill(indices_to_remove, -float("Inf"))
 
         probabilities = torch.softmax(logits, dim=-1)
@@ -493,7 +587,9 @@ class InferenceEngine:
         generated_tokens = [[] for _ in range(batch_size)]
 
         for _ in range(max_length):
-            sample_rand_states = sample.setup_rand(random.randint(0, 2**63 - 1), batch_size)
+            sample_rand_states = sample.setup_rand(
+                random.randint(0, 2**63 - 1), batch_size
+            )
             penalties = torch.zeros(batch_size, 65536).to(0)
             new_tokens = sample.batch_sampling_repetition_temperature_topk_topp(
                 out,
@@ -510,7 +606,11 @@ class InferenceEngine:
             out = self.model.forward_batch(new_tokens, state).float()
 
             for i in range(batch_size):
-                tok = new_tokens[i][0] if isinstance(new_tokens[i], list) else new_tokens[i]
+                tok = (
+                    new_tokens[i][0]
+                    if isinstance(new_tokens[i], list)
+                    else new_tokens[i]
+                )
                 if finished[i]:
                     continue
                 if tok in stop_tokens:
@@ -555,7 +655,9 @@ class InferenceEngine:
 
         try:
             while not all(finished) and max_length > 0:
-                sample_rand_states = sample.setup_rand(random.randint(0, 2**63 - 1), batch_size)
+                sample_rand_states = sample.setup_rand(
+                    random.randint(0, 2**63 - 1), batch_size
+                )
                 penalties = torch.zeros(batch_size, 65536).to(0)
                 new_tokens = sample.batch_sampling_repetition_temperature_topk_topp(
                     out,
@@ -578,12 +680,18 @@ class InferenceEngine:
                     if finished[i]:
                         continue
 
-                    tok = new_tokens[i][0] if isinstance(new_tokens[i], list) else new_tokens[i]
+                    tok = (
+                        new_tokens[i][0]
+                        if isinstance(new_tokens[i], list)
+                        else new_tokens[i]
+                    )
 
                     if tok in stop_tokens:
                         finished[i] = True
                         if token_buffers[i]:
-                            contents_to_send[i] = self.tokenizer.decode(token_buffers[i], utf8_errors="ignore")
+                            contents_to_send[i] = self.tokenizer.decode(
+                                token_buffers[i], utf8_errors="ignore"
+                            )
                             token_buffers[i].clear()
                         continue
 
@@ -591,7 +699,9 @@ class InferenceEngine:
                     generated_tokens[i].append(tok)
 
                     if len(token_buffers[i]) >= chunk_size:
-                        contents_to_send[i] = self.tokenizer.decode(token_buffers[i], utf8_errors="ignore")
+                        contents_to_send[i] = self.tokenizer.decode(
+                            token_buffers[i], utf8_errors="ignore"
+                        )
                         token_buffers[i].clear()
 
                 if any(contents_to_send):
@@ -611,7 +721,9 @@ class InferenceEngine:
             remaining_contents = [""] * batch_size
             for i in range(batch_size):
                 if token_buffers[i]:
-                    remaining_contents[i] = self.tokenizer.decode(token_buffers[i], utf8_errors="ignore")
+                    remaining_contents[i] = self.tokenizer.decode(
+                        token_buffers[i], utf8_errors="ignore"
+                    )
                     token_buffers[i].clear()
 
             if any(remaining_contents):
@@ -729,7 +841,9 @@ class InferenceEngine:
 
                 if tok in stop_tokens:
                     if token_buffer:
-                        content = self.tokenizer.decode(token_buffer, utf8_errors="ignore")
+                        content = self.tokenizer.decode(
+                            token_buffer, utf8_errors="ignore"
+                        )
                         token_buffer.clear()
                         chunk = {
                             "object": "chat.completion.chunk",
@@ -738,16 +852,31 @@ class InferenceEngine:
                         yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
                     break
 
-                token_buffer.append(tok)
-                if len(token_buffer) >= chunk_size:
-                    content = self.tokenizer.decode(token_buffer, utf8_errors="ignore")
-                    token_buffer.clear()
+                if not token_buffer:
+                    content = self.tokenizer.decode([tok], utf8_errors="ignore")
                     if content:
                         chunk = {
                             "object": "chat.completion.chunk",
                             "choices": [{"index": 0, "delta": {"content": content}}],
                         }
                         yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+                    else:
+                        token_buffer.append(tok)
+                else:
+                    token_buffer.append(tok)
+                    if len(token_buffer) >= chunk_size:
+                        content = self.tokenizer.decode(
+                            token_buffer, utf8_errors="ignore"
+                        )
+                        token_buffer.clear()
+                        if content:
+                            chunk = {
+                                "object": "chat.completion.chunk",
+                                "choices": [
+                                    {"index": 0, "delta": {"content": content}}
+                                ],
+                            }
+                            yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
 
                 out = self.model.forward(tok, state).float()
 
@@ -897,18 +1026,19 @@ class InferenceEngine:
         static_state[2].copy_(state[2])
         static_output.copy_(out)
 
-        token_buffer = [token]
+        token_buffer = []
 
         try:
             if token not in stop_tokens:
-                if len(token_buffer) >= chunk_size:
-                    content = self.tokenizer.decode(token_buffer, utf8_errors="ignore")
-                    token_buffer.clear()
+                content = self.tokenizer.decode([token], utf8_errors="ignore")
+                if content:
                     chunk = {
                         "object": "chat.completion.chunk",
                         "choices": [{"index": 0, "delta": {"content": content}}],
                     }
                     yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+                else:
+                    token_buffer.append(token)
 
             for _ in range(max_generate_tokens):
                 x_emb = self.model.z["emb.weight"][token]
@@ -992,7 +1122,9 @@ class InferenceEngine:
         chunk_size = chunk_size
 
         device = self.model.z["head.weight"].device
-        alpha_presence_val = torch.tensor(alpha_presence, dtype=torch.float32, device=device)
+        alpha_presence_val = torch.tensor(
+            alpha_presence, dtype=torch.float32, device=device
+        )
 
         if temperature == 0:
             temperature = 1.0
@@ -1026,9 +1158,13 @@ class InferenceEngine:
             token_buffers[prompt_idx] = []
             prompt_idx += 1
 
-        occurrence = torch.zeros((batch_size, self.args.vocab_size), dtype=torch.float32, device=device)
+        occurrence = torch.zeros(
+            (batch_size, self.args.vocab_size), dtype=torch.float32, device=device
+        )
         no_penalty_token_ids = set([33, 10, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58])
-        alpha_presence_vector = torch.zeros((batch_size, self.args.vocab_size), dtype=torch.float32, device=device)
+        alpha_presence_vector = torch.zeros(
+            (batch_size, self.args.vocab_size), dtype=torch.float32, device=device
+        )
 
         try:
             while True:
@@ -1044,21 +1180,30 @@ class InferenceEngine:
                         new_token = task["new_token"]
                         prompt_id = task["prompt_idx"]
 
-                        is_finished = new_token in stop_tokens_set or len(task["generated_tokens"]) >= max_generate_tokens
+                        is_finished = (
+                            new_token in stop_tokens_set
+                            or len(task["generated_tokens"]) >= max_generate_tokens
+                        )
 
                         if not is_finished:
                             task["generated_tokens"].append(new_token)
                             token_buffers[prompt_id].append(new_token)
 
                             if len(token_buffers[prompt_id]) >= chunk_size:
-                                text_chunk = self.tokenizer.decode(token_buffers[prompt_id], utf8_errors="ignore")
+                                text_chunk = self.tokenizer.decode(
+                                    token_buffers[prompt_id], utf8_errors="ignore"
+                                )
                                 contents_to_send[prompt_id] = text_chunk
                                 token_buffers[prompt_id].clear()
 
                         if is_finished:
                             if token_buffers[prompt_id]:
-                                text_chunk = self.tokenizer.decode(token_buffers[prompt_id], utf8_errors="ignore")
-                                contents_to_send[prompt_id] = contents_to_send.get(prompt_id, "") + text_chunk
+                                text_chunk = self.tokenizer.decode(
+                                    token_buffers[prompt_id], utf8_errors="ignore"
+                                )
+                                contents_to_send[prompt_id] = (
+                                    contents_to_send.get(prompt_id, "") + text_chunk
+                                )
                                 token_buffers[prompt_id].clear()
 
                             del token_buffers[prompt_id]
@@ -1089,7 +1234,9 @@ class InferenceEngine:
                             task["input_token"].append(new_token)
                             www = 0.0 if new_token in no_penalty_token_ids else 1.0
                             occurrence[task["state_pos"], new_token] += www
-                            alpha_presence_vector[task["state_pos"], new_token] = alpha_presence_val
+                            alpha_presence_vector[task["state_pos"], new_token] = (
+                                alpha_presence_val
+                            )
 
                 if contents_to_send:
                     chunk = {
@@ -1101,24 +1248,41 @@ class InferenceEngine:
                         ],
                     }
                     if chunk["choices"]:
-                        output_queue.put(f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n")
+                        output_queue.put(
+                            f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+                        )
 
                 if accomplished_task_indices:
                     sorted_slots = sorted(list(state_slots_to_remove), reverse=True)
 
                     for slot in sorted_slots:
-                        states[0] = torch.cat([states[0][:, :, :slot, :], states[0][:, :, slot + 1 :, :]], dim=2)
-                        states[1] = torch.cat([states[1][:, :slot, :, :], states[1][:, slot + 1 :, :, :]], dim=1)
-                        occurrence = torch.cat([occurrence[:slot, :], occurrence[slot + 1 :, :]], dim=0)
+                        states[0] = torch.cat(
+                            [states[0][:, :, :slot, :], states[0][:, :, slot + 1 :, :]],
+                            dim=2,
+                        )
+                        states[1] = torch.cat(
+                            [states[1][:, :slot, :, :], states[1][:, slot + 1 :, :, :]],
+                            dim=1,
+                        )
+                        occurrence = torch.cat(
+                            [occurrence[:slot, :], occurrence[slot + 1 :, :]], dim=0
+                        )
                         alpha_presence_vector = torch.cat(
-                            [alpha_presence_vector[:slot, :], alpha_presence_vector[slot + 1 :, :]], dim=0
+                            [
+                                alpha_presence_vector[:slot, :],
+                                alpha_presence_vector[slot + 1 :, :],
+                            ],
+                            dim=0,
                         )
 
                     for task_idx in sorted(accomplished_task_indices, reverse=True):
                         del task_pool[task_idx]
 
                     remaining_slots = sorted([t["state_pos"] for t in task_pool])
-                    pos_map = {old_pos: new_pos for new_pos, old_pos in enumerate(remaining_slots)}
+                    pos_map = {
+                        old_pos: new_pos
+                        for new_pos, old_pos in enumerate(remaining_slots)
+                    }
                     for task in task_pool:
                         task["state_pos"] = pos_map[task["state_pos"]]
 
@@ -1148,7 +1312,11 @@ class InferenceEngine:
                     try:
                         import flashinfer  # type: ignore
 
-                        new_tokens = flashinfer.sampling.top_k_top_p_sampling_from_logits(out, top_k, top_p)
+                        new_tokens = (
+                            flashinfer.sampling.top_k_top_p_sampling_from_logits(
+                                out, top_k, top_p
+                            )
+                        )
                     except Exception:
                         new_tokens = self._torch_top_k_top_p(out, top_k, top_p)
 
@@ -1186,7 +1354,9 @@ class InferenceEngine:
         pad_zero = pad_zero
 
         device = self.model.z["head.weight"].device
-        alpha_presence_val = torch.tensor(alpha_presence, dtype=torch.float32, device=device)
+        alpha_presence_val = torch.tensor(
+            alpha_presence, dtype=torch.float32, device=device
+        )
 
         if temperature == 0:
             temperature = 1.0
@@ -1219,9 +1389,13 @@ class InferenceEngine:
             )
             prompt_idx += 1
 
-        occurrence = torch.zeros((batch_size, self.args.vocab_size), dtype=torch.float32, device=device)
+        occurrence = torch.zeros(
+            (batch_size, self.args.vocab_size), dtype=torch.float32, device=device
+        )
         no_penalty_token_ids = set([33, 10, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58])
-        alpha_presence_vector = torch.zeros((batch_size, self.args.vocab_size), dtype=torch.float32, device=device)
+        alpha_presence_vector = torch.zeros(
+            (batch_size, self.args.vocab_size), dtype=torch.float32, device=device
+        )
 
         try:
             while True:
@@ -1236,14 +1410,19 @@ class InferenceEngine:
                         new_token = task["new_token"]
                         prompt_id = task["prompt_idx"]
 
-                        is_finished = new_token in stop_tokens_set or len(task["generated_tokens"]) >= max_generate_tokens
+                        is_finished = (
+                            new_token in stop_tokens_set
+                            or len(task["generated_tokens"]) >= max_generate_tokens
+                        )
 
                         if not is_finished:
                             task["generated_tokens"].append(new_token)
 
                         if is_finished:
                             if task["generated_tokens"]:
-                                text = self.tokenizer.decode(task["generated_tokens"], utf8_errors="ignore")
+                                text = self.tokenizer.decode(
+                                    task["generated_tokens"], utf8_errors="ignore"
+                                )
                                 results[prompt_id] = text
                             else:
                                 results[prompt_id] = ""
@@ -1273,24 +1452,41 @@ class InferenceEngine:
                             task["input_token"].append(new_token)
                             www = 0.0 if new_token in no_penalty_token_ids else 1.0
                             occurrence[task["state_pos"], new_token] += www
-                            alpha_presence_vector[task["state_pos"], new_token] = alpha_presence_val
+                            alpha_presence_vector[task["state_pos"], new_token] = (
+                                alpha_presence_val
+                            )
 
                 if accomplished_task_indices:
                     sorted_slots = sorted(list(state_slots_to_remove), reverse=True)
 
                     for slot in sorted_slots:
-                        states[0] = torch.cat([states[0][:, :, :slot, :], states[0][:, :, slot + 1 :, :]], dim=2)
-                        states[1] = torch.cat([states[1][:, :slot, :, :], states[1][:, slot + 1 :, :, :]], dim=1)
-                        occurrence = torch.cat([occurrence[:slot, :], occurrence[slot + 1 :, :]], dim=0)
+                        states[0] = torch.cat(
+                            [states[0][:, :, :slot, :], states[0][:, :, slot + 1 :, :]],
+                            dim=2,
+                        )
+                        states[1] = torch.cat(
+                            [states[1][:, :slot, :, :], states[1][:, slot + 1 :, :, :]],
+                            dim=1,
+                        )
+                        occurrence = torch.cat(
+                            [occurrence[:slot, :], occurrence[slot + 1 :, :]], dim=0
+                        )
                         alpha_presence_vector = torch.cat(
-                            [alpha_presence_vector[:slot, :], alpha_presence_vector[slot + 1 :, :]], dim=0
+                            [
+                                alpha_presence_vector[:slot, :],
+                                alpha_presence_vector[slot + 1 :, :],
+                            ],
+                            dim=0,
                         )
 
                     for task_idx in sorted(accomplished_task_indices, reverse=True):
                         del task_pool[task_idx]
 
                     remaining_slots = sorted([t["state_pos"] for t in task_pool])
-                    pos_map = {old_pos: new_pos for new_pos, old_pos in enumerate(remaining_slots)}
+                    pos_map = {
+                        old_pos: new_pos
+                        for new_pos, old_pos in enumerate(remaining_slots)
+                    }
                     for task in task_pool:
                         task["state_pos"] = pos_map[task["state_pos"]]
 
@@ -1320,7 +1516,11 @@ class InferenceEngine:
                     try:
                         import flashinfer  # type: ignore
 
-                        new_tokens = flashinfer.sampling.top_k_top_p_sampling_from_logits(out, top_k, top_p)
+                        new_tokens = (
+                            flashinfer.sampling.top_k_top_p_sampling_from_logits(
+                                out, top_k, top_p
+                            )
+                        )
                     except Exception:
                         new_tokens = self._torch_top_k_top_p(out, top_k, top_p)
 
@@ -1466,12 +1666,18 @@ class InferenceEngine:
                     if finished[i]:
                         continue
 
-                    tok = new_tokens[i][0] if isinstance(new_tokens[i], list) else new_tokens[i]
+                    tok = (
+                        new_tokens[i][0]
+                        if isinstance(new_tokens[i], list)
+                        else new_tokens[i]
+                    )
 
                     if tok in stop_tokens:
                         finished[i] = True
                         if token_buffers[i]:
-                            contents_to_send[i] = self.tokenizer.decode(token_buffers[i], utf8_errors="ignore")
+                            contents_to_send[i] = self.tokenizer.decode(
+                                token_buffers[i], utf8_errors="ignore"
+                            )
                             token_buffers[i].clear()
                         continue
 
@@ -1479,7 +1685,9 @@ class InferenceEngine:
                     generated_tokens[i].append(tok)
 
                     if len(token_buffers[i]) >= chunk_size:
-                        contents_to_send[i] = self.tokenizer.decode(token_buffers[i], utf8_errors="ignore")
+                        contents_to_send[i] = self.tokenizer.decode(
+                            token_buffers[i], utf8_errors="ignore"
+                        )
                         token_buffers[i].clear()
 
                 if any(contents_to_send):
@@ -1503,7 +1711,9 @@ class InferenceEngine:
             remaining_contents = [""] * batch_size
             for i in range(batch_size):
                 if token_buffers[i]:
-                    remaining_contents[i] = self.tokenizer.decode(token_buffers[i], utf8_errors="ignore")
+                    remaining_contents[i] = self.tokenizer.decode(
+                        token_buffers[i], utf8_errors="ignore"
+                    )
                     token_buffers[i].clear()
 
             if any(remaining_contents):
