@@ -11,7 +11,11 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
 
-from API_servers.openai_adapter import parse_tool_call_response
+from API_servers.openai_adapter import (
+    format_openai_prompt,
+    format_openai_state_prompt,
+    parse_tool_call_response,
+)
 
 
 def _assert_equal(actual, expected, message: str) -> None:
@@ -19,7 +23,9 @@ def _assert_equal(actual, expected, message: str) -> None:
         raise AssertionError(f"{message}: expected {expected!r}, got {actual!r}")
 
 
-def _assert_tool_call(result: dict, expected_name: str, expected_arguments: dict) -> None:
+def _assert_tool_call(
+    result: dict, expected_name: str, expected_arguments: dict
+) -> None:
     tool_calls = result.get("tool_calls")
     if not isinstance(tool_calls, list) or len(tool_calls) != 1:
         raise AssertionError(f"expected exactly one tool call, got {tool_calls!r}")
@@ -119,18 +125,49 @@ def test_parse_tool_call_response_keeps_first_tool_call_when_multiple_exist() ->
     _assert_tool_call(result, "first_tool", {"step": 1})
     _assert_equal(
         result.get("content"),
-        "before\n\nmiddle\n<tool_call>\n{\"name\":\"second_tool\",\"arguments\":{\"step\":2}}\n</tool_call>\nafter",
+        'before\n\nmiddle\n<tool_call>\n{"name":"second_tool","arguments":{"step":2}}\n</tool_call>\nafter',
         "multiple tool call residual content mismatch",
     )
-    print("[PASS] test_parse_tool_call_response_keeps_first_tool_call_when_multiple_exist")
+    print(
+        "[PASS] test_parse_tool_call_response_keeps_first_tool_call_when_multiple_exist"
+    )
+
+
+def test_format_openai_state_prompt_only_includes_incremental_messages() -> None:
+    body = {
+        "system": "Follow instructions.",
+        "messages": [
+            {"role": "system", "content": "System repeated"},
+            {"role": "assistant", "content": "Previous answer"},
+            {"role": "user", "content": "New question"},
+        ],
+    }
+    prompt = format_openai_state_prompt(body, enable_think=False)
+    if "Previous answer" not in prompt or "New question" not in prompt:
+        raise AssertionError("state prompt should include incremental messages")
+    if "System:" not in prompt:
+        raise AssertionError("state prompt should include system content")
+    print("[PASS] test_format_openai_state_prompt_only_includes_incremental_messages")
+
+
+def test_format_openai_state_prompt_rejects_empty() -> None:
+    try:
+        format_openai_state_prompt({}, enable_think=False)
+    except ValueError:
+        print("[PASS] test_format_openai_state_prompt_rejects_empty")
+        return
+    raise AssertionError("state prompt should reject empty payload")
 
 
 def main() -> None:
     print("Running openai_adapter parsing tests...")
+    _ = format_openai_prompt({"messages": [{"role": "user", "content": "hi"}]}, False)
     test_parse_tag_tool_call_with_surrounding_text()
     test_parse_prefix_tool_call_with_surrounding_text()
     test_parse_tool_call_response_returns_none_for_malformed_json()
     test_parse_tool_call_response_keeps_first_tool_call_when_multiple_exist()
+    test_format_openai_state_prompt_only_includes_incremental_messages()
+    test_format_openai_state_prompt_rejects_empty()
     print("All openai_adapter parsing tests passed.")
 
 

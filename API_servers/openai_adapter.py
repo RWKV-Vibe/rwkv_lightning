@@ -93,6 +93,60 @@ def format_openai_prompt(body: dict, enable_think: bool) -> str:
     return f"{prompt_text}\n\nAssistant: <think>\n</think>"
 
 
+def format_openai_state_prompt(body: dict, enable_think: bool) -> str:
+    contents = body.get("contents") or []
+    messages = body.get("messages") or []
+    system_field = body.get("system")
+
+    if len(contents) > 1:
+        raise ValueError("State mode only supports a single contents item")
+
+    system_parts = []
+    if system_field:
+        system_parts.append(str(system_field).strip())
+
+    role_map = {
+        "user": "User",
+        "assistant": "Assistant",
+        "system": "System",
+        "tool": "Tool",
+        "developer": "Developer",
+    }
+
+    prompt_parts = []
+    for message in messages:
+        role = str(message.get("role", "user")).lower()
+        content = normalize_message_content(message.get("content", "")).strip()
+        if not content:
+            continue
+        if role == "system":
+            system_parts.append(content)
+            continue
+        dialogue_role = role_map.get(role, role.capitalize() or "User")
+        prompt_parts.append(f"{dialogue_role}: {content}")
+
+    if contents:
+        content_prompt = str(contents[0]).strip()
+        if content_prompt:
+            prompt_parts.append(f"User: {content_prompt}")
+
+    final_parts = []
+    if system_parts:
+        final_parts.append(
+            "System: " + "\n\n".join(part for part in system_parts if part)
+        )
+    if prompt_parts:
+        final_parts.append("\n\n".join(prompt_parts))
+
+    prompt_text = "\n\n".join(part for part in final_parts if part).strip()
+    if not prompt_text:
+        raise ValueError("State mode requires incremental contents or messages")
+
+    if enable_think:
+        return f"{prompt_text}\n\nAssistant: <think"
+    return f"{prompt_text}\n\nAssistant: <think>\n</think>"
+
+
 def build_openai_usage(tokenizer, prompt_text: str, completion_text: str) -> dict:
     prompt_tokens = len(tokenizer.encode(prompt_text))
     completion_tokens = len(tokenizer.encode(completion_text)) if completion_text else 0
@@ -122,6 +176,7 @@ def build_internal_chat_request(body: dict, prompt: str) -> dict:
         "enable_think": body.get("enable_think", False),
         "chunk_size": body.get("chunk_size", 2),
         "password": body.get("password"),
+        "session_id": body.get("session_id"),
     }
 
 
