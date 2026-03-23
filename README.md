@@ -474,6 +474,10 @@ curl -X POST http://localhost:8000/state/delete \
 
 ### 7. ```/openai/v1/chat/completions``` [Open AI format support]
 - "could be used for chat fronted which OpenAI API compatibility. Such as Cherry studio."
+- **Stateless by default.** If you do not send `"session_id"`, the server handles the request as a normal non-stateful OpenAI-compatible completion.
+- **Optional state mode via `"session_id"`.** When `"session_id"` is present, the route reuses cached RWKV state for that session and treats the request as an **incremental turn**.
+- **Incremental contract in state mode.** When you send `"session_id"`, only send the **new message(s) for this turn**. Do **not** resend the full chat history, otherwise the previous context will be duplicated.
+- **Missing state auto-init.** If `"session_id"` is provided but no cached state exists yet, the server automatically creates a fresh state and treats that request as the first turn of the session.
 - **Experimental tool-call parsing is non-streaming only.** Set `"stream": false` when you want the server to extract `tool_calls` from the model output.
 - When a tool call is parsed successfully, any text before or after the tool-call payload is preserved as the assistant message `content`.
 <details>
@@ -510,6 +514,30 @@ curl -X POST 'http://localhost:8000/openai/v1/chat/completions' \
     "temperature": 0.8,
     "stream": false
   }'
+```
+
+- Stateful incremental Open AI API with `session_id`
+```bash
+curl -X POST 'http://localhost:8000/openai/v1/chat/completions' \
+  --header 'Content-Type: application/json' \
+  --header 'Authorization: Bearer your-password-if-set' \
+  --data '{
+    "model": "rwkv7",
+    "session_id": "demo-session-001",
+    "messages": [
+      {"role": "user", "content": "Please continue from our last turn and give me 3 short ideas."}
+    ],
+    "top_p": 0.6,
+    "max_tokens": 512,
+    "temperature": 0.8,
+    "stream": false
+  }'
+```
+
+- Related focused test scripts
+```bash
+python test/test_openai_adapter.py
+python test/test_openai_routes.py
 ```
 </details>
 
