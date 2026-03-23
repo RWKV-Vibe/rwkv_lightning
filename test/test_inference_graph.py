@@ -135,28 +135,30 @@ async def _collect_stream(iterator) -> list[str]:
     return chunks
 
 
-async def test_graph_generate_respects_max_generate_tokens() -> None:
-    engine = _make_engine()
-    batch_tokens = iter([12, 13])
-
+@contextmanager
+def _patch_sampler(
+    *,
+    gumbel_fn=None,
+    setup_rand_fn=None,
+    batch_sampling_fn=None,
+):
     original_sampler = inference_module.sampler_gumbel_batch
     original_setup_rand = getattr(inference_module.sample, "setup_rand")
     original_batch_sampling = getattr(
         inference_module.sample, "batch_sampling_repetition_temperature_topk_topp"
     )
     try:
-        inference_module.sampler_gumbel_batch = lambda logits, temp: FakeScalar(11)
-        setattr(inference_module.sample, "setup_rand", lambda seed, batch_size: None)
-        setattr(
-            inference_module.sample,
-            "batch_sampling_repetition_temperature_topk_topp",
-            lambda *args, **kwargs: FakeBatchTokens(next(batch_tokens)),
-        )
-        result = await engine.graph_generate(
-            inputs=["hello"],
-            stop_tokens=[0],
-            max_generate_tokens=2,
-        )
+        if gumbel_fn is not None:
+            inference_module.sampler_gumbel_batch = gumbel_fn
+        if setup_rand_fn is not None:
+            setattr(inference_module.sample, "setup_rand", setup_rand_fn)
+        if batch_sampling_fn is not None:
+            setattr(
+                inference_module.sample,
+                "batch_sampling_repetition_temperature_topk_topp",
+                batch_sampling_fn,
+            )
+        yield
     finally:
         inference_module.sampler_gumbel_batch = original_sampler
         setattr(inference_module.sample, "setup_rand", original_setup_rand)
@@ -166,6 +168,32 @@ async def test_graph_generate_respects_max_generate_tokens() -> None:
             original_batch_sampling,
         )
 
+
+@contextmanager
+def _patch_cuda_available(available: bool):
+    original_is_available = inference_module.torch.cuda.is_available
+    try:
+        inference_module.torch.cuda.is_available = lambda: available
+        yield
+    finally:
+        inference_module.torch.cuda.is_available = original_is_available
+
+
+async def test_graph_generate_respects_max_generate_tokens() -> None:
+    engine = _make_engine()
+    batch_tokens = iter([12, 13])
+
+    with _patch_sampler(
+        gumbel_fn=lambda logits, temp: FakeScalar(11),
+        setup_rand_fn=lambda seed, batch_size: None,
+        batch_sampling_fn=lambda *args, **kwargs: FakeBatchTokens(next(batch_tokens)),
+    ):
+        result = await engine.graph_generate(
+            inputs=["hello"],
+            stop_tokens=[0],
+            max_generate_tokens=2,
+        )
+
     _assert_equal(result, ["AB"], "graph_generate should cap output to max_generate_tokens")
     print("[PASS] test_graph_generate_respects_max_generate_tokens")
 
@@ -173,21 +201,13 @@ async def test_graph_generate_respects_max_generate_tokens() -> None:
 async def test_graph_infer_stream_stops_on_initial_stop_token() -> None:
     engine = _make_engine()
 
-    original_sampler = inference_module.sampler_gumbel_batch
-    original_batch_sampling = getattr(
-        inference_module.sample, "batch_sampling_repetition_temperature_topk_topp"
-    )
-    try:
-        inference_module.sampler_gumbel_batch = lambda logits, temp: FakeScalar(0)
+    def _unexpected_batch_sampling(*args, **kwargs):
+        raise AssertionError("graph_infer_stream should not sample again after initial stop token")
 
-        def _unexpected_batch_sampling(*args, **kwargs):
-            raise AssertionError("graph_infer_stream should not sample again after initial stop token")
-
-        setattr(
-            inference_module.sample,
-            "batch_sampling_repetition_temperature_topk_topp",
-            _unexpected_batch_sampling,
-        )
+    with _patch_sampler(
+        gumbel_fn=lambda logits, temp: FakeScalar(0),
+        batch_sampling_fn=_unexpected_batch_sampling,
+    ):
         chunks = await _collect_stream(
             engine.graph_infer_stream(
                 inputs=["hello"],
@@ -195,13 +215,6 @@ async def test_graph_infer_stream_stops_on_initial_stop_token() -> None:
                 max_generate_tokens=3,
                 chunk_size=2,
             )
-        )
-    finally:
-        inference_module.sampler_gumbel_batch = original_sampler
-        setattr(
-            inference_module.sample,
-            "batch_sampling_repetition_temperature_topk_topp",
-            original_batch_sampling,
         )
 
     combined = "".join(chunks)
@@ -242,9 +255,8 @@ async def test_graph_infer_stream_falls_back_without_cuda() -> None:
         args=SimpleNamespace(),
         rocm_flag=False,
     )
-    original_is_available = inference_module.torch.cuda.is_available
-    try:
-        inference_module.torch.cuda.is_available = lambda: False
+
+    with _patch_cuda_available(False):
         chunks = await _collect_stream(
             engine.graph_infer_stream(
                 inputs=["hello"],
@@ -253,8 +265,6 @@ async def test_graph_infer_stream_falls_back_without_cuda() -> None:
                 chunk_size=1,
             )
         )
-    finally:
-        inference_module.torch.cuda.is_available = original_is_available
 
     combined = "".join(chunks)
     if "fallback-stream" not in combined:

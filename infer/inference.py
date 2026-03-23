@@ -56,6 +56,63 @@ class InferenceEngine:
             float(alpha_decay),
         )
 
+    def _init_cuda_graph_state(self, token, state, out):
+        x_emb = self.model.z["emb.weight"][token]
+
+        static_input = torch.empty_like(x_emb, device="cuda")
+        static_state = [None, None, None]
+        static_state[0] = torch.empty_like(state[0], device="cuda")
+        static_state[1] = torch.empty_like(state[1], device="cuda")
+        static_state[2] = torch.empty_like(state[2], device="cuda")
+        static_output = torch.empty_like(out, device="cuda")
+
+        static_output = self.model.forward(static_input, static_state)
+
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g):
+            static_output = self.model.forward(static_input, static_state)
+
+        static_input.copy_(x_emb)
+        static_state[0].copy_(state[0])
+        static_state[1].copy_(state[1])
+        static_state[2].copy_(state[2])
+        static_output.copy_(out)
+
+        return static_input, static_state, static_output, g
+
+    def _sample_next_token(
+        self,
+        static_output,
+        alpha_presence,
+        alpha_frequency,
+        alpha_decay,
+        temperature,
+        top_k,
+        top_p,
+    ):
+        logits_reshaped = static_output.unsqueeze(0).float()
+
+        sample_rand_states = sample.setup_rand(random.randint(0, 2**63 - 1), 1)
+        penalties = torch.zeros(1, 65536).to(0)
+        new_tokens = sample.batch_sampling_repetition_temperature_topk_topp(
+            logits_reshaped,
+            penalties,
+            sample_rand_states,
+            alpha_presence,
+            alpha_frequency,
+            alpha_decay,
+            temperature,
+            top_k,
+            top_p,
+        ).tolist()
+        return new_tokens[0]
+
+    @staticmethod
+    def _cleanup_cuda_state(state):
+        del state
+        gc.collect()
+        torch.cuda.empty_cache()
+
     def _get_dynamic_scheduler(self, key):
         with self.dynamic_batch_lock:
             scheduler = self.dynamic_batch_schedulers.get(key)
@@ -929,26 +986,9 @@ class InferenceEngine:
             if token in stop_tokens:
                 return [""]
 
-            x_emb = self.model.z["emb.weight"][token]
-
-            static_input = torch.empty_like(x_emb, device="cuda")
-            static_state = [None, None, None]
-            static_state[0] = torch.empty_like(state[0], device="cuda")
-            static_state[1] = torch.empty_like(state[1], device="cuda")
-            static_state[2] = torch.empty_like(state[2], device="cuda")
-            static_output = torch.empty_like(out, device="cuda")
-
-            static_output = self.model.forward(static_input, static_state)
-
-            g = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(g):
-                static_output = self.model.forward(static_input, static_state)
-
-            static_input.copy_(x_emb)
-            static_state[0].copy_(state[0])
-            static_state[1].copy_(state[1])
-            static_state[2].copy_(state[2])
-            static_output.copy_(out)
+            static_input, _static_state, static_output, g = self._init_cuda_graph_state(
+                token, state, out
+            )
 
             generated_tokens = [token]
 
@@ -957,23 +997,15 @@ class InferenceEngine:
                 static_input.copy_(x_emb)
 
                 g.replay()
-
-                logits_reshaped = static_output.unsqueeze(0).float()
-
-                sample_rand_states = sample.setup_rand(random.randint(0, 2**63 - 1), 1)
-                penalties = torch.zeros(1, 65536).to(0)
-                new_tokens = sample.batch_sampling_repetition_temperature_topk_topp(
-                    logits_reshaped,
-                    penalties,
-                    sample_rand_states,
+                token = self._sample_next_token(
+                    static_output,
                     alpha_presence,
                     alpha_frequency,
                     alpha_decay,
                     temperature,
                     top_k,
                     top_p,
-                ).tolist()
-                token = new_tokens[0]
+                )
                 if token in stop_tokens:
                     break
                 generated_tokens.append(token)
@@ -981,9 +1013,7 @@ class InferenceEngine:
             decoded = self.tokenizer.decode(generated_tokens, utf8_errors="ignore")
             return [decoded]
         finally:
-            del state
-            gc.collect()
-            torch.cuda.empty_cache()
+            self._cleanup_cuda_state(state)
 
     async def graph_infer_stream(
         self,
@@ -1068,49 +1098,24 @@ class InferenceEngine:
                 else:
                     token_buffer.append(token)
 
-                x_emb = self.model.z["emb.weight"][token]
-
-                static_input = torch.empty_like(x_emb, device="cuda")
-                static_state = [None, None, None]
-                static_state[0] = torch.empty_like(state[0], device="cuda")
-                static_state[1] = torch.empty_like(state[1], device="cuda")
-                static_state[2] = torch.empty_like(state[2], device="cuda")
-                static_output = torch.empty_like(out, device="cuda")
-
-                static_output = self.model.forward(static_input, static_state)
-
-                g = torch.cuda.CUDAGraph()
-                with torch.cuda.graph(g):
-                    static_output = self.model.forward(static_input, static_state)
-
-                static_input.copy_(x_emb)
-                static_state[0].copy_(state[0])
-                static_state[1].copy_(state[1])
-                static_state[2].copy_(state[2])
-                static_output.copy_(out)
+                static_input, _static_state, static_output, g = (
+                    self._init_cuda_graph_state(token, state, out)
+                )
 
                 for _ in range(max_generate_tokens - 1):
                     x_emb = self.model.z["emb.weight"][token]
                     static_input.copy_(x_emb)
 
                     g.replay()
-
-                    logits_reshaped = static_output.unsqueeze(0).float()
-
-                    sample_rand_states = sample.setup_rand(random.randint(0, 2**63 - 1), 1)
-                    penalties = torch.zeros(1, 65536).to(0)
-                    new_tokens = sample.batch_sampling_repetition_temperature_topk_topp(
-                        logits_reshaped,
-                        penalties,
-                        sample_rand_states,
+                    token = self._sample_next_token(
+                        static_output,
                         alpha_presence,
                         alpha_frequency,
                         alpha_decay,
                         temperature,
                         top_k,
                         top_p,
-                    ).tolist()
-                    token = new_tokens[0]
+                    )
                     if token in stop_tokens:
                         finish_reason = "stop"
                         break
@@ -1147,9 +1152,7 @@ class InferenceEngine:
             yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
 
         finally:
-            del state
-            gc.collect()
-            torch.cuda.empty_cache()
+            self._cleanup_cuda_state(state)
 
         yield "data: [DONE]\n\n"
 
