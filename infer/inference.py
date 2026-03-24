@@ -474,7 +474,7 @@ class InferenceEngine:
                         if temperature != 1.0:
                             out /= temperature
 
-                        if self.rocm_flag:
+                        if self.rocm_flag or torch.cuda.is_current_stream_capturing():
                             new_tokens = self._torch_top_k_top_p(out, top_k, top_p)
                         else:
                             try:
