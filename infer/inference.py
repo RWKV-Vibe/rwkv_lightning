@@ -1083,7 +1083,15 @@ class InferenceEngine:
                 return
 
             out = self.model.forward(encoded_prompt, state)
-            token = sampler_gumbel_batch(logits=out, temp=temperature).item()
+            token = self._sample_next_token(
+                out,
+                alpha_presence,
+                alpha_frequency,
+                alpha_decay,
+                temperature,
+                top_k,
+                top_p,
+            )
 
             if token in stop_tokens:
                 finish_reason = "stop"
