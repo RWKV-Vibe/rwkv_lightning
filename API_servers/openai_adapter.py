@@ -1,5 +1,4 @@
 import json
-import re
 import uuid
 from typing import Any, Optional
 
@@ -29,6 +28,217 @@ def extract_openai_prompt(body: dict) -> str:
     if messages:
         return normalize_message_content(messages[-1].get("content", ""))
     return ""
+
+
+def _normalize_rwkv_tool_compat_mode(mode: Any) -> str:
+    if mode is None:
+        return "true"
+    if isinstance(mode, bool):
+        return "true" if mode else "false"
+
+    normalized = str(mode).strip().lower()
+    if normalized in {"true", "false"}:
+        return normalized
+    raise ValueError("rwkv_tool_compat_mode must be one of: true, false")
+
+
+def normalize_tool(tool: dict[str, Any]) -> dict[str, Any]:
+    if tool.get("type") != "function":
+        raise ValueError(f"Unsupported tool type: {tool.get('type')}")
+
+    function = tool.get("function")
+    if not isinstance(function, dict):
+        raise ValueError("OpenAI chat tools must include a function object")
+
+    name = function.get("name")
+    if not isinstance(name, str) or not name.strip():
+        raise ValueError("Tool function name is required")
+
+    parameters = function.get("parameters", {"type": "object", "properties": {}})
+    if not isinstance(parameters, dict):
+        raise ValueError("Tool parameters must be a JSON schema object")
+
+    description = function.get("description", "")
+    return {
+        "name": name.strip(),
+        "description": str(description or ""),
+        "parameters": parameters,
+    }
+
+
+def render_param(
+    name: str, schema: dict[str, Any], required: bool, indent: int = 0
+) -> list[str]:
+    pad = "  " * indent
+    typ = schema.get("type", "any")
+    desc = str(schema.get("description", "") or "").strip()
+    req_text = "required" if required else "optional"
+
+    line = f"{pad}- {name} ({typ}, {req_text})"
+    if desc:
+        line += f": {desc}"
+
+    lines = [line]
+
+    if "enum" in schema:
+        allowed = ", ".join(map(str, schema["enum"]))
+        lines.append(f"{pad}  Allowed values: {allowed}")
+
+    if typ == "object":
+        props = schema.get("properties", {})
+        reqs = set(schema.get("required", []))
+        if isinstance(props, dict) and props:
+            lines.append(f"{pad}  Fields:")
+            for child_name, child_schema in props.items():
+                if not isinstance(child_schema, dict):
+                    continue
+                lines.extend(
+                    render_param(
+                        child_name,
+                        child_schema,
+                        child_name in reqs,
+                        indent=indent + 2,
+                    )
+                )
+    elif typ == "array":
+        items = schema.get("items", {})
+        if not isinstance(items, dict):
+            items = {}
+        item_type = items.get("type", "any")
+        lines.append(f"{pad}  Items type: {item_type}")
+
+        if item_type == "object":
+            props = items.get("properties", {})
+            reqs = set(items.get("required", []))
+            if isinstance(props, dict) and props:
+                lines.append(f"{pad}  Item fields:")
+                for child_name, child_schema in props.items():
+                    if not isinstance(child_schema, dict):
+                        continue
+                    lines.extend(
+                        render_param(
+                            child_name,
+                            child_schema,
+                            child_name in reqs,
+                            indent=indent + 2,
+                        )
+                    )
+
+    return lines
+
+
+def render_tool(tool: dict[str, Any]) -> str:
+    name = tool["name"]
+    description = tool.get("description", "").strip() or "No description provided."
+    params = tool.get("parameters", {})
+    if not isinstance(params, dict):
+        params = {}
+    props = params.get("properties", {})
+    if not isinstance(props, dict):
+        props = {}
+    required = set(params.get("required", []))
+
+    lines = [
+        f"Tool: {name}",
+        f"Purpose: {description}",
+        "",
+        "Arguments:",
+    ]
+
+    if not props:
+        lines.append("- This tool takes no arguments.")
+    else:
+        for param_name, param_schema in props.items():
+            if not isinstance(param_schema, dict):
+                continue
+            lines.extend(render_param(param_name, param_schema, param_name in required))
+
+    example_args = {}
+    for param_name, param_schema in props.items():
+        if not isinstance(param_schema, dict):
+            example_args[param_name] = None
+            continue
+        typ = param_schema.get("type", "string")
+        if typ == "string":
+            if "enum" in param_schema and param_schema["enum"]:
+                example_args[param_name] = param_schema["enum"][0]
+            else:
+                example_args[param_name] = f"<{param_name}>"
+        elif typ == "integer":
+            example_args[param_name] = 1
+        elif typ == "number":
+            example_args[param_name] = 1
+        elif typ == "boolean":
+            example_args[param_name] = True
+        elif typ == "array":
+            example_args[param_name] = []
+        elif typ == "object":
+            example_args[param_name] = {}
+        else:
+            example_args[param_name] = None
+
+    example_json = json.dumps(
+        {"name": name, "arguments": example_args}, ensure_ascii=False
+    )
+
+    lines.extend(
+        [
+            "",
+            "Tool call format:",
+            "<tool_call>",
+            example_json,
+            "</tool_call>",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def tools_to_system_prompt(tools: list[dict[str, Any]]) -> str:
+    normalized = [normalize_tool(tool) for tool in tools]
+    header = """You may use tools when needed.
+
+Follow these rules strictly:
+1. If a tool is needed, output EXACTLY one tool call.
+2. A tool call must be wrapped in <tool_call> and </tool_call>.
+3. Inside <tool_call>, output valid JSON only.
+4. Do not use markdown code fences.
+5. Do not add any explanation before or after a tool call.
+6. If no tool is needed, answer normally.
+"""
+    body = "\n\n".join(render_tool(tool) for tool in normalized)
+    return header + "\n\nAvailable tools:\n\n" + body
+
+
+def apply_tool_compatibility(body: dict[str, Any]) -> dict[str, Any]:
+    prepared = dict(body)
+    mode = _normalize_rwkv_tool_compat_mode(prepared.get("rwkv_tool_compat_mode", True))
+    tools = prepared.get("tools")
+    prepared["_rwkv_tool_compat_active"] = False
+
+    if mode == "false":
+        prepared.pop("tools", None)
+        return prepared
+
+    if tools is None:
+        return prepared
+
+    if not isinstance(tools, list):
+        raise ValueError("tools must be a list")
+
+    if not tools:
+        prepared.pop("tools", None)
+        return prepared
+
+    tool_prompt = tools_to_system_prompt(tools)
+    existing_system = prepared.get("system")
+    if existing_system:
+        prepared["system"] = f"{existing_system}\n\n{tool_prompt}"
+    else:
+        prepared["system"] = tool_prompt
+
+    prepared["_rwkv_tool_compat_active"] = True
+    prepared.pop("tools", None)
+    return prepared
 
 
 def format_openai_prompt(body: dict, enable_think: bool) -> str:
@@ -186,78 +396,72 @@ def build_internal_chat_request(body: dict, prompt: str) -> dict:
 
 
 def _extract_tag_tool_call(text: str) -> Optional[tuple[str, str]]:
-    match = re.search(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", text, re.DOTALL)
-    if not match:
+    start_tag = "<tool_call>"
+    end_tag = "</tool_call>"
+    start_idx = text.find(start_tag)
+    if start_idx == -1:
         return None
-    remaining = (text[: match.start()] + text[match.end() :]).strip()
-    return match.group(1), remaining
+    payload_start = start_idx + len(start_tag)
+    end_idx = text.find(end_tag, payload_start)
+    if end_idx == -1:
+        return None
 
-
-def _extract_prefix_tool_call(text: str) -> Optional[tuple[str, str]]:
-    lines = text.splitlines()
-    for i, line in enumerate(lines):
-        stripped = line.strip()
-        if not stripped.startswith("@@tool "):
-            continue
-        payload = stripped[len("@@tool ") :].strip()
-        remaining_lines = lines[:i] + lines[i + 1 :]
-        remaining = "\n".join(remaining_lines).strip()
-        return payload, remaining
-    return None
+    payload = text[payload_start:end_idx].strip()
+    remaining = (text[:start_idx] + text[end_idx + len(end_tag) :]).strip()
+    return payload, remaining
 
 
 def parse_tool_call_response(
     text: str, parser_mode: str = "auto"
 ) -> Optional[dict[str, Any]]:
     mode = str(parser_mode or "auto").lower()
-    extractors = []
-    if mode in {"auto", "tag"}:
-        extractors.append(_extract_tag_tool_call)
-    if mode in {"auto", "prefix"}:
-        extractors.append(_extract_prefix_tool_call)
+    if mode not in {"auto", "tag"}:
+        return None
 
-    for extractor in extractors:
-        extracted = extractor(text)
-        if extracted is None:
-            continue
-        payload_text, remaining_content = extracted
-        try:
-            parsed = json.loads(payload_text)
-        except json.JSONDecodeError:
-            continue
+    extracted = _extract_tag_tool_call(text)
+    if extracted is None:
+        return None
 
-        if not isinstance(parsed, dict):
-            continue
+    payload_text, remaining_content = extracted
+    try:
+        parsed = json.loads(payload_text)
+    except json.JSONDecodeError:
+        return None
 
-        name = parsed.get("name")
-        arguments = parsed.get("arguments", {})
-        if not isinstance(name, str) or not name.strip():
-            continue
-        if not isinstance(arguments, dict):
-            continue
+    if not isinstance(parsed, dict):
+        return None
 
-        return {
-            "content": remaining_content or None,
-            "tool_calls": [
-                {
-                    "id": f"call_{uuid.uuid4().hex}",
-                    "type": "function",
-                    "function": {
-                        "name": name.strip(),
-                        "arguments": json.dumps(arguments, ensure_ascii=False),
-                    },
-                }
-            ],
-            "finish_reason": "tool_calls",
-        }
+    name = parsed.get("name")
+    arguments = parsed.get("arguments", {})
+    if not isinstance(name, str) or not name.strip():
+        return None
+    if not isinstance(arguments, dict):
+        return None
 
+    return {
+        "content": remaining_content or None,
+        "tool_calls": [
+            {
+                "id": f"call_{uuid.uuid4().hex}",
+                "type": "function",
+                "function": {
+                    "name": name.strip(),
+                    "arguments": json.dumps(arguments, ensure_ascii=False),
+                },
+            }
+        ],
+        "finish_reason": "tool_calls",
+    }
     return None
 
 
 def build_openai_message_response(
     result_text: str, finish_reason: str, body: dict
 ) -> tuple[dict[str, Any], str]:
-    if body.get("enable_tool_calls", False) and not body.get("stream", False):
+    if (
+        body.get("enable_tool_calls", False)
+        or body.get("_rwkv_tool_compat_active", False)
+    ) and not body.get("stream", False):
         parsed = parse_tool_call_response(
             result_text, body.get("tool_call_parser", "auto")
         )

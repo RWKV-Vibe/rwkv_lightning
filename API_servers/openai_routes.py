@@ -7,6 +7,7 @@ import uuid
 from robyn import Response, StreamingResponse
 
 from API_servers.openai_adapter import (
+    apply_tool_compatibility,
     build_internal_chat_request,
     build_openai_message_response,
     build_openai_usage,
@@ -15,6 +16,172 @@ from API_servers.openai_adapter import (
     format_openai_state_prompt,
 )
 from state_manager.state_pool import get_state_manager
+
+
+def _tool_stream_enabled(body: dict) -> bool:
+    return bool(
+        body.get("enable_tool_calls", False)
+        or body.get("_rwkv_tool_compat_active", False)
+    )
+
+
+def _parse_tool_payload(payload: str) -> dict | None:
+    try:
+        parsed = json.loads(payload)
+    except json.JSONDecodeError:
+        return None
+
+    if not isinstance(parsed, dict):
+        return None
+    name = parsed.get("name")
+    arguments = parsed.get("arguments", {})
+    if not isinstance(name, str) or not name.strip():
+        return None
+    if not isinstance(arguments, dict):
+        return None
+    return {
+        "name": name.strip(),
+        "arguments": json.dumps(arguments, ensure_ascii=False),
+    }
+
+
+class _ToolCallStreamProcessor:
+    def __init__(self):
+        self.buffer = ""
+        self.in_tool = False
+        self.tool_buffer = ""
+        self.tool_emitted = False
+
+    def ingest(self, text: str) -> list[tuple[str, str | dict]]:
+        if not text:
+            return []
+        if self.tool_emitted:
+            return [("content", text)]
+        self.buffer += text
+        return self._ingest_tag()
+
+    def flush(self) -> list[tuple[str, str | dict]]:
+        if self.in_tool:
+            raw = f"<tool_call>{self.tool_buffer}{self.buffer}"
+            self.tool_buffer = ""
+            self.buffer = ""
+            self.in_tool = False
+            return [("content", raw)]
+        if self.buffer:
+            leftover = self.buffer
+            self.buffer = ""
+            return [("content", leftover)]
+        return []
+
+    def _ingest_tag(self) -> list[tuple[str, str | dict]]:
+        events: list[tuple[str, str | dict]] = []
+        start_tag = "<tool_call>"
+        end_tag = "</tool_call>"
+        while True:
+            if not self.in_tool:
+                start_idx = self.buffer.find(start_tag)
+                if start_idx == -1:
+                    emit, keep = _split_incomplete_tag(self.buffer, start_tag)
+                    if emit:
+                        events.append(("content", emit))
+                    self.buffer = keep
+                    break
+                before = self.buffer[:start_idx]
+                if before:
+                    events.append(("content", before))
+                self.buffer = self.buffer[start_idx + len(start_tag) :]
+                self.in_tool = True
+                self.tool_buffer = ""
+
+            combined = self.tool_buffer + self.buffer
+            end_idx = combined.find(end_tag)
+            if end_idx == -1:
+                self.tool_buffer = combined
+                self.buffer = ""
+                break
+
+            payload = combined[:end_idx]
+            trailing = combined[end_idx + len(end_tag) :]
+            self.in_tool = False
+            self.tool_buffer = ""
+            self.buffer = ""
+
+            parsed = _parse_tool_payload(payload)
+            if parsed is not None:
+                events.append(("tool", parsed))
+                self.tool_emitted = True
+                if trailing:
+                    events.append(("content", trailing))
+                break
+            events.append(("content", f"{start_tag}{payload}{end_tag}"))
+            self.buffer = trailing
+        return events
+
+
+def _split_incomplete_tag(buffer: str, tag: str) -> tuple[str, str]:
+    max_keep = 0
+    for i in range(1, len(tag)):
+        if buffer.endswith(tag[:i]):
+            max_keep = i
+    if max_keep:
+        return buffer[:-max_keep], buffer[-max_keep:]
+    return buffer, ""
+
+
+def _emit_tool_call_chunk(
+    response_id: str,
+    created: int,
+    model_name: str,
+    tool_call: dict,
+) -> str:
+    chunk = {
+        "id": response_id,
+        "object": "chat.completion.chunk",
+        "created": created,
+        "model": model_name,
+        "choices": [
+            {
+                "index": 0,
+                "delta": {
+                    "tool_calls": [
+                        {
+                            "index": 0,
+                            "id": tool_call["id"],
+                            "type": "function",
+                            "function": {
+                                "name": tool_call["name"],
+                                "arguments": tool_call["arguments"],
+                            },
+                        }
+                    ]
+                },
+                "finish_reason": None,
+            }
+        ],
+    }
+    return f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+
+
+def _emit_finish_reason_chunk(
+    response_id: str,
+    created: int,
+    model_name: str,
+    finish_reason: str,
+) -> str:
+    chunk = {
+        "id": response_id,
+        "object": "chat.completion.chunk",
+        "created": created,
+        "model": model_name,
+        "choices": [
+            {
+                "index": 0,
+                "delta": {},
+                "finish_reason": finish_reason,
+            }
+        ],
+    }
+    return f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
 
 
 def _json_response(status_code: int, payload: dict):
@@ -58,12 +225,18 @@ def _get_or_init_state(engine, session_id: str):
 async def _stream_state_openai_chunks(
     engine,
     req,
+    body: dict,
     prompt_formatted: str,
     session_id: str,
     response_id: str,
     created: int,
     model_name: str,
 ):
+    tool_processor = None
+    tool_finish_reason = None
+    if _tool_stream_enabled(body):
+        tool_processor = _ToolCallStreamProcessor()
+
     start_chunk = {
         "id": response_id,
         "object": "chat.completion.chunk",
@@ -100,29 +273,69 @@ async def _stream_state_openai_chunks(
 
         payload = item[6:]
         if payload == "[DONE]":
-            chunk = {
-                "id": response_id,
-                "object": "chat.completion.chunk",
-                "created": created,
-                "model": model_name,
-                "choices": [
-                    {
-                        "index": 0,
-                        "delta": {},
-                        "finish_reason": "stop",
-                    }
-                ],
-            }
-            yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+            if tool_processor is not None:
+                for event_type, value in tool_processor.flush():
+                    if event_type == "content" and value:
+                        chunk = {
+                            "id": response_id,
+                            "object": "chat.completion.chunk",
+                            "created": created,
+                            "model": model_name,
+                            "choices": [
+                                {
+                                    "index": 0,
+                                    "delta": {"content": value},
+                                    "finish_reason": None,
+                                }
+                            ],
+                        }
+                        yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+            finish_reason = tool_finish_reason or "stop"
+            yield _emit_finish_reason_chunk(
+                response_id, created, model_name, finish_reason
+            )
             break
 
-        chunk_payload = json.loads(payload)
+        try:
+            chunk_payload = json.loads(payload)
+        except json.JSONDecodeError:
+            continue
         choices = chunk_payload.get("choices") or []
         if not choices:
             continue
 
         content = choices[0].get("delta", {}).get("content")
         if not content:
+            continue
+
+        if tool_processor is not None:
+            for event_type, value in tool_processor.ingest(content):
+                if event_type == "content" and value:
+                    chunk = {
+                        "id": response_id,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": model_name,
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {"content": value},
+                                "finish_reason": None,
+                            }
+                        ],
+                    }
+                    yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+                elif event_type == "tool":
+                    if isinstance(value, dict):
+                        tool_call = {
+                            "id": f"call_{uuid.uuid4().hex}",
+                            "name": value["name"],
+                            "arguments": value["arguments"],
+                        }
+                        yield _emit_tool_call_chunk(
+                            response_id, created, model_name, tool_call
+                        )
+                        tool_finish_reason = "tool_calls"
             continue
 
         chunk = {
@@ -146,11 +359,17 @@ async def _stream_state_openai_chunks(
 async def _stream_stateless_openai_chunks(
     engine,
     req,
+    body: dict,
     prompt_formatted: str,
     response_id: str,
     created: int,
     model_name: str,
 ):
+    tool_processor = None
+    tool_finish_reason = None
+    if _tool_stream_enabled(body):
+        tool_processor = _ToolCallStreamProcessor()
+
     start_chunk = {
         "id": response_id,
         "object": "chat.completion.chunk",
@@ -191,20 +410,27 @@ async def _stream_stateless_openai_chunks(
             if payload == "[DONE]":
                 saw_done = True
                 if not emitted_finish_reason:
-                    chunk = {
-                        "id": response_id,
-                        "object": "chat.completion.chunk",
-                        "created": created,
-                        "model": model_name,
-                        "choices": [
-                            {
-                                "index": 0,
-                                "delta": {},
-                                "finish_reason": "stop",
-                            }
-                        ],
-                    }
-                    yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+                    if tool_processor is not None:
+                        for event_type, value in tool_processor.flush():
+                            if event_type == "content" and value:
+                                chunk = {
+                                    "id": response_id,
+                                    "object": "chat.completion.chunk",
+                                    "created": created,
+                                    "model": model_name,
+                                    "choices": [
+                                        {
+                                            "index": 0,
+                                            "delta": {"content": value},
+                                            "finish_reason": None,
+                                        }
+                                    ],
+                                }
+                                yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+                    finish_reason = tool_finish_reason or "stop"
+                    yield _emit_finish_reason_chunk(
+                        response_id, created, model_name, finish_reason
+                    )
                 break
 
             try:
@@ -217,25 +443,62 @@ async def _stream_stateless_openai_chunks(
 
             finish_reason = choices[0].get("finish_reason")
             if finish_reason is not None:
-                emitted_finish_reason = True
-                chunk = {
-                    "id": response_id,
-                    "object": "chat.completion.chunk",
-                    "created": created,
-                    "model": model_name,
-                    "choices": [
-                        {
-                            "index": 0,
-                            "delta": {},
-                            "finish_reason": finish_reason,
-                        }
-                    ],
-                }
-                yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+                if tool_processor is not None:
+                    for event_type, value in tool_processor.flush():
+                        if event_type == "content" and value:
+                            chunk = {
+                                "id": response_id,
+                                "object": "chat.completion.chunk",
+                                "created": created,
+                                "model": model_name,
+                                "choices": [
+                                    {
+                                        "index": 0,
+                                        "delta": {"content": value},
+                                        "finish_reason": None,
+                                    }
+                                ],
+                            }
+                            yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+                if tool_finish_reason is None:
+                    emitted_finish_reason = True
+                    yield _emit_finish_reason_chunk(
+                        response_id, created, model_name, finish_reason
+                    )
                 continue
 
             content = choices[0].get("delta", {}).get("content")
             if not content:
+                continue
+
+            if tool_processor is not None:
+                for event_type, value in tool_processor.ingest(content):
+                    if event_type == "content" and value:
+                        chunk = {
+                            "id": response_id,
+                            "object": "chat.completion.chunk",
+                            "created": created,
+                            "model": model_name,
+                            "choices": [
+                                {
+                                    "index": 0,
+                                    "delta": {"content": value},
+                                    "finish_reason": None,
+                                }
+                            ],
+                        }
+                        yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+                    elif event_type == "tool":
+                        if isinstance(value, dict):
+                            tool_call = {
+                                "id": f"call_{uuid.uuid4().hex}",
+                                "name": value["name"],
+                                "arguments": value["arguments"],
+                            }
+                            yield _emit_tool_call_chunk(
+                                response_id, created, model_name, tool_call
+                            )
+                            tool_finish_reason = "tool_calls"
                 continue
 
             chunk = {
@@ -267,35 +530,76 @@ async def _stream_stateless_openai_chunks(
             chunk_size=req.chunk_size,
         ):
             if item["type"] == "delta" and item["text"]:
-                chunk = {
-                    "id": response_id,
-                    "object": "chat.completion.chunk",
-                    "created": created,
-                    "model": model_name,
-                    "choices": [
-                        {
-                            "index": 0,
-                            "delta": {"content": item["text"]},
-                            "finish_reason": None,
-                        }
-                    ],
-                }
-                yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+                if tool_processor is not None:
+                    for event_type, value in tool_processor.ingest(item["text"]):
+                        if event_type == "content" and value:
+                            chunk = {
+                                "id": response_id,
+                                "object": "chat.completion.chunk",
+                                "created": created,
+                                "model": model_name,
+                                "choices": [
+                                    {
+                                        "index": 0,
+                                        "delta": {"content": value},
+                                        "finish_reason": None,
+                                    }
+                                ],
+                            }
+                            yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+                        elif event_type == "tool":
+                            if isinstance(value, dict):
+                                tool_call = {
+                                    "id": f"call_{uuid.uuid4().hex}",
+                                    "name": value["name"],
+                                    "arguments": value["arguments"],
+                                }
+                                yield _emit_tool_call_chunk(
+                                    response_id, created, model_name, tool_call
+                                )
+                                tool_finish_reason = "tool_calls"
+                else:
+                    chunk = {
+                        "id": response_id,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": model_name,
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {"content": item["text"]},
+                                "finish_reason": None,
+                            }
+                        ],
+                    }
+                    yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
             elif item["type"] == "done":
-                chunk = {
-                    "id": response_id,
-                    "object": "chat.completion.chunk",
-                    "created": created,
-                    "model": model_name,
-                    "choices": [
-                        {
-                            "index": 0,
-                            "delta": {},
-                            "finish_reason": item["finish_reason"],
-                        }
-                    ],
-                }
-                yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+                if tool_processor is not None:
+                    for event_type, value in tool_processor.flush():
+                        if event_type == "content" and value:
+                            chunk = {
+                                "id": response_id,
+                                "object": "chat.completion.chunk",
+                                "created": created,
+                                "model": model_name,
+                                "choices": [
+                                    {
+                                        "index": 0,
+                                        "delta": {"content": value},
+                                        "finish_reason": None,
+                                    }
+                                ],
+                            }
+                            yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+                    finish_reason = tool_finish_reason or item["finish_reason"]
+                    yield _emit_finish_reason_chunk(
+                        response_id, created, model_name, finish_reason
+                    )
+                else:
+                    finish_reason = tool_finish_reason or item["finish_reason"]
+                    yield _emit_finish_reason_chunk(
+                        response_id, created, model_name, finish_reason
+                    )
                 break
 
     yield "data: [DONE]\n\n"
@@ -309,6 +613,11 @@ def register_openai_routes(app, engine, password, chat_request_model):
             auth_error = _check_openai_auth(request, body, password)
             if auth_error is not None:
                 return auth_error
+
+            try:
+                body = apply_tool_compatibility(body)
+            except ValueError as exc:
+                return _json_response(400, {"error": str(exc)})
 
             prompt = extract_openai_prompt(body)
             if not prompt and not (body.get("messages") or []):
@@ -339,6 +648,7 @@ def register_openai_routes(app, engine, password, chat_request_model):
                     _stream_state_openai_chunks(
                         engine,
                         req,
+                        body,
                         prompt_formatted,
                         req.session_id,
                         response_id,
@@ -349,6 +659,7 @@ def register_openai_routes(app, engine, password, chat_request_model):
                     else _stream_stateless_openai_chunks(
                         engine,
                         req,
+                        body,
                         prompt_formatted,
                         response_id,
                         created,
