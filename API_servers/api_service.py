@@ -1023,14 +1023,22 @@ def create_app(engine, password=None):
 
         prompts = req.contents
 
-        return StreamingResponse(
-            engine.big_batch_stream(
+        async def stream_big_batch():
+            stream = engine.big_batch_stream(
                 prompts=prompts,
                 max_length=req.max_tokens,
                 temperature=req.temperature,
                 stop_tokens=req.stop_tokens,
                 chunk_size=req.chunk_size,
-            ),
+            )
+            try:
+                async for chunk in stream:
+                    yield chunk
+            finally:
+                await stream.aclose()
+
+        return StreamingResponse(
+            stream_big_batch(),
             media_type="text/event-stream",
         )
 

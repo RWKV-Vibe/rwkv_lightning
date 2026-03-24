@@ -113,6 +113,17 @@ class InferenceEngine:
         gc.collect()
         torch.cuda.empty_cache()
 
+    @staticmethod
+    def _cleanup_cuda_memory():
+        gc.collect()
+        if not torch.cuda.is_available():
+            return
+        try:
+            torch.cuda.synchronize()
+        except Exception:
+            pass
+        torch.cuda.empty_cache()
+
     def _get_dynamic_scheduler(self, key):
         with self.dynamic_batch_lock:
             scheduler = self.dynamic_batch_schedulers.get(key)
@@ -1707,100 +1718,130 @@ class InferenceEngine:
         chunk_size=32,
     ):
         batch_size = len(prompts)
-        state = self.model.generate_zero_state(batch_size)
-        encoded_prompts = [self.tokenizer.encode(p) for p in prompts]
-        out = self.model.forward_batch(encoded_prompts, state)
-
-        finished = [False] * batch_size
-        generated_tokens = [[] for _ in range(batch_size)]
-        token_buffers = [[] for _ in range(batch_size)]
+        state = None
+        encoded_prompts = None
+        out = None
+        finished = None
+        generated_tokens = None
+        token_buffers = None
+        new_tokens_tensor = None
+        new_tokens = None
 
         try:
-            step_count = 0
-            cleanup_interval = 100
+            with torch.inference_mode():
+                state = self.model.generate_zero_state(batch_size)
+                encoded_prompts = [self.tokenizer.encode(p) for p in prompts]
+                out = self.model.forward_batch(encoded_prompts, state)
 
-            while not all(finished) and max_length > 0:
-                new_tokens = sampler_gumbel_batch(logits=out, temp=temperature).tolist()
-                out = self.model.forward_batch(new_tokens, state)
-                max_length -= 1
-                step_count += 1
+                finished = [False] * batch_size
+                generated_tokens = [[] for _ in range(batch_size)]
+                token_buffers = [[] for _ in range(batch_size)]
 
-                contents_to_send = [""] * batch_size
+                step_count = 0
+                cleanup_interval = 100
 
-                for i in range(batch_size):
-                    if finished[i]:
-                        continue
-
-                    tok = (
-                        new_tokens[i][0]
-                        if isinstance(new_tokens[i], list)
-                        else new_tokens[i]
+                while not all(finished) and max_length > 0:
+                    new_tokens_tensor = sampler_gumbel_batch(
+                        logits=out, temp=temperature
                     )
+                    new_tokens = new_tokens_tensor.tolist()
+                    del new_tokens_tensor
+                    new_tokens_tensor = None
 
-                    if tok in stop_tokens:
-                        finished[i] = True
-                        if token_buffers[i]:
+                    prev_out = out
+                    out = self.model.forward_batch(new_tokens, state)
+                    del prev_out
+
+                    max_length -= 1
+                    step_count += 1
+
+                    contents_to_send = [""] * batch_size
+
+                    for i in range(batch_size):
+                        if finished[i]:
+                            continue
+
+                        tok = (
+                            new_tokens[i][0]
+                            if isinstance(new_tokens[i], list)
+                            else new_tokens[i]
+                        )
+
+                        if tok in stop_tokens:
+                            finished[i] = True
+                            if token_buffers[i]:
+                                contents_to_send[i] = self.tokenizer.decode(
+                                    token_buffers[i], utf8_errors="ignore"
+                                )
+                                token_buffers[i].clear()
+                            continue
+
+                        token_buffers[i].append(tok)
+                        generated_tokens[i].append(tok)
+
+                        if len(token_buffers[i]) >= chunk_size:
                             contents_to_send[i] = self.tokenizer.decode(
                                 token_buffers[i], utf8_errors="ignore"
                             )
                             token_buffers[i].clear()
-                        continue
 
-                    token_buffers[i].append(tok)
-                    generated_tokens[i].append(tok)
+                    if any(contents_to_send):
+                        chunk = {
+                            "object": "chat.completion.chunk",
+                            "choices": [
+                                {"index": i, "delta": {"content": contents_to_send[i]}}
+                                for i in range(batch_size)
+                                if contents_to_send[i]
+                            ],
+                        }
+                        if chunk["choices"]:
+                            yield (
+                                f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+                            )
 
-                    if len(token_buffers[i]) >= chunk_size:
-                        contents_to_send[i] = self.tokenizer.decode(
+                    new_tokens = None
+                    await asyncio.sleep(0)
+
+                    if step_count % cleanup_interval == 0:
+                        self._cleanup_cuda_memory()
+
+                remaining_contents = [""] * batch_size
+                for i in range(batch_size):
+                    if token_buffers[i]:
+                        remaining_contents[i] = self.tokenizer.decode(
                             token_buffers[i], utf8_errors="ignore"
                         )
                         token_buffers[i].clear()
 
-                if any(contents_to_send):
+                if any(remaining_contents):
                     chunk = {
                         "object": "chat.completion.chunk",
                         "choices": [
-                            {"index": i, "delta": {"content": contents_to_send[i]}}
+                            {"index": i, "delta": {"content": remaining_contents[i]}}
                             for i in range(batch_size)
-                            if contents_to_send[i]
+                            if remaining_contents[i]
                         ],
                     }
                     if chunk["choices"]:
                         yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
 
-                await asyncio.sleep(0)
-
-                if step_count % cleanup_interval == 0:
-                    torch.cuda.empty_cache()
-                    gc.collect()
-
-            remaining_contents = [""] * batch_size
-            for i in range(batch_size):
-                if token_buffers[i]:
-                    remaining_contents[i] = self.tokenizer.decode(
-                        token_buffers[i], utf8_errors="ignore"
-                    )
-                    token_buffers[i].clear()
-
-            if any(remaining_contents):
-                chunk = {
-                    "object": "chat.completion.chunk",
-                    "choices": [
-                        {"index": i, "delta": {"content": remaining_contents[i]}}
-                        for i in range(batch_size)
-                        if remaining_contents[i]
-                    ],
-                }
-                if chunk["choices"]:
-                    yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
-
         finally:
-            del state
-            del encoded_prompts
-            del out
-            del finished
-            del generated_tokens
-            del token_buffers
-            torch.cuda.empty_cache()
-            gc.collect()
+            if new_tokens_tensor is not None:
+                del new_tokens_tensor
+            if out is not None:
+                del out
+            if state is not None:
+                del state
+            if encoded_prompts is not None:
+                del encoded_prompts
+            if finished is not None:
+                del finished
+            if generated_tokens is not None:
+                del generated_tokens
+            if token_buffers is not None:
+                del token_buffers
+            if new_tokens is not None:
+                del new_tokens
+            self._cleanup_cuda_memory()
 
         yield "data: [DONE]\n\n"
