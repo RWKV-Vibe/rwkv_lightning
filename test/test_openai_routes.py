@@ -150,7 +150,7 @@ def _assert_equal(actual, expected, message: str) -> None:
         raise AssertionError(f"{message}: expected {expected!r}, got {actual!r}")
 
 
-async def test_openai_route_stateless_non_stream_uses_dynamic_batch_generate() -> None:
+async def test_openai_route_stateless_non_stream_uses_graph_aggregation() -> None:
     app = DummyApp()
     engine = DummyEngine()
     openai_routes.register_openai_routes(
@@ -169,18 +169,54 @@ async def test_openai_route_stateless_non_stream_uses_dynamic_batch_generate() -
     payload = json.loads(response.description)
     _assert_equal(
         payload["choices"][0]["message"]["content"],
-        "stateless-ok",
+        "stream-graph",
         "stateless response content mismatch",
     )
     _assert_equal(
-        len(engine.dynamic_calls),
+        len(engine.graph_stream_calls),
         1,
-        "stateless route should use dynamic batch generate",
+        "stateless route should use graph stream aggregation",
+    )
+    _assert_equal(
+        len(engine.dynamic_calls),
+        0,
+        "stateless route should not use dynamic batch generate when graph is available",
     )
     _assert_equal(
         len(engine.state_calls), 0, "stateless route should not use state generate"
     )
-    print("[PASS] test_openai_route_stateless_non_stream_uses_dynamic_batch_generate")
+    print("[PASS] test_openai_route_stateless_non_stream_uses_graph_aggregation")
+
+
+async def test_openai_route_stateless_non_stream_falls_back_without_graph() -> None:
+    app = DummyApp()
+    engine = DummyEngine()
+    engine.rocm_flag = True
+    openai_routes.register_openai_routes(
+        app, engine, password=None, chat_request_model=ChatRequest
+    )
+    route = app.routes["/openai/v1/chat/completions"]
+
+    response = await route(
+        DummyRequest(
+            {
+                "messages": [{"role": "user", "content": "Hello there"}],
+                "stream": False,
+            }
+        )
+    )
+    payload = json.loads(response.description)
+    _assert_equal(
+        payload["choices"][0]["message"]["content"],
+        "stateless-ok",
+        "fallback stateless response content mismatch",
+    )
+    _assert_equal(
+        len(engine.dynamic_calls),
+        1,
+        "stateless route should fall back to dynamic batch generate when graph is unavailable",
+    )
+    print("[PASS] test_openai_route_stateless_non_stream_falls_back_without_graph")
 
 
 async def test_openai_route_stateful_non_stream_uses_state_cache() -> None:
@@ -488,12 +524,22 @@ async def test_openai_route_non_stream_tool_compat_injects_prompt_and_parses_too
     app = DummyApp()
 
     class ToolCallEngine(DummyEngine):
-        async def dynamic_batch_generate(self, **kwargs) -> tuple[str, str]:
-            self.dynamic_calls.append(kwargs)
-            return (
-                '<tool_call>{"name":"lookup_weather","arguments":{"city":"Beijing"}}</tool_call>',
-                "stop",
+        async def graph_infer_stream(self, **kwargs) -> AsyncIterator[str]:
+            self.graph_stream_calls.append(kwargs)
+            yield "data: " + json.dumps(
+                {
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {
+                                "content": '<tool_call>{"name":"lookup_weather","arguments":{"city":"Beijing"}}</tool_call>'
+                            },
+                        }
+                    ]
+                }
             )
+            yield 'data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}'
+            yield "data: [DONE]"
 
     engine = ToolCallEngine()
     openai_routes.register_openai_routes(
@@ -523,9 +569,9 @@ async def test_openai_route_non_stream_tool_compat_injects_prompt_and_parses_too
     payload = json.loads(response.description)
     _assert_equal(response.status_code, 200, "tool compat request should succeed")
     _assert_equal(
-        len(engine.dynamic_calls), 1, "tool compat should use non-stream route"
+        len(engine.graph_stream_calls), 1, "tool compat should use graph aggregation"
     )
-    prompt = engine.dynamic_calls[0]["prompt"]
+    prompt = engine.graph_stream_calls[0]["inputs"][0]
     if "Available tools:" not in prompt or "Tool: lookup_weather" not in prompt:
         raise AssertionError(
             "tool compat should inject tools into the formatted system prompt"
@@ -684,13 +730,13 @@ async def test_openai_route_stream_tool_compat_false_discards_tools() -> None:
     )
 
     payload = json.loads(response.description)
-    prompt = engine.dynamic_calls[0]["prompt"]
+    prompt = engine.graph_stream_calls[0]["inputs"][0]
     if "Available tools:" in prompt:
         raise AssertionError("false compat mode should discard tools without injection")
     _assert_equal(response.status_code, 200, "false compat request should succeed")
     _assert_equal(
         payload["choices"][0]["message"]["content"],
-        "stateless-ok",
+        "stream-graph",
         "false compat response content mismatch",
     )
     print("[PASS] test_openai_route_stream_tool_compat_false_discards_tools")
@@ -820,7 +866,8 @@ async def test_openai_route_stream_tool_compat_preserves_trailing_text_fallback(
 
 
 async def main() -> None:
-    await test_openai_route_stateless_non_stream_uses_dynamic_batch_generate()
+    await test_openai_route_stateless_non_stream_uses_graph_aggregation()
+    await test_openai_route_stateless_non_stream_falls_back_without_graph()
     await test_openai_route_stateful_non_stream_uses_state_cache()
     await test_openai_route_stateful_stream_uses_state_stream()
     await test_openai_route_stateless_stream_uses_graph_stream()

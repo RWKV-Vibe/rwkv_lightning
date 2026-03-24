@@ -25,6 +25,12 @@ def _tool_stream_enabled(body: dict) -> bool:
     )
 
 
+def _supports_graph_stream(engine) -> bool:
+    return hasattr(engine, "graph_infer_stream") and not getattr(
+        engine, "rocm_flag", False
+    )
+
+
 def _parse_tool_payload(payload: str) -> dict | None:
     try:
         parsed = json.loads(payload)
@@ -605,6 +611,54 @@ async def _stream_stateless_openai_chunks(
     yield "data: [DONE]\n\n"
 
 
+async def _collect_graph_stream_text(
+    engine,
+    req,
+    prompt_formatted: str,
+) -> tuple[str, str]:
+    content_parts: list[str] = []
+    finish_reason = "stop"
+    async for item in engine.graph_infer_stream(
+        inputs=[prompt_formatted],
+        stop_tokens=req.stop_tokens,
+        max_generate_tokens=req.max_tokens,
+        temperature=req.temperature,
+        top_k=req.top_k,
+        top_p=req.top_p,
+        alpha_presence=req.alpha_presence,
+        alpha_frequency=req.alpha_frequency,
+        alpha_decay=req.alpha_decay,
+        chunk_size=req.chunk_size,
+    ):
+        if not isinstance(item, str) or not item.startswith("data: "):
+            continue
+
+        payload = item[6:]
+        if payload == "[DONE]":
+            break
+
+        try:
+            chunk_payload = json.loads(payload)
+        except json.JSONDecodeError:
+            continue
+
+        choices = chunk_payload.get("choices") or []
+        if not choices:
+            continue
+
+        choice = choices[0]
+        finish = choice.get("finish_reason")
+        if finish is not None:
+            finish_reason = finish
+            continue
+
+        content = choice.get("delta", {}).get("content")
+        if content:
+            content_parts.append(content)
+
+    return "".join(content_parts), finish_reason
+
+
 def register_openai_routes(app, engine, password, chat_request_model):
     @app.post("/openai/v1/chat/completions")
     async def openai_chat_completions(request):
@@ -686,19 +740,24 @@ def register_openai_routes(app, engine, password, chat_request_model):
                 result_text = results[0] if results else ""
                 finish_reason = "stop"
             else:
-                result_text, finish_reason = await engine.dynamic_batch_generate(
-                    prompt=prompt_formatted,
-                    max_generate_tokens=req.max_tokens,
-                    stop_tokens=req.stop_tokens,
-                    pad_zero=req.pad_zero,
-                    temperature=req.temperature,
-                    top_k=req.top_k,
-                    top_p=req.top_p,
-                    alpha_presence=req.alpha_presence,
-                    alpha_frequency=req.alpha_frequency,
-                    alpha_decay=req.alpha_decay,
-                    chunk_size=req.chunk_size,
-                )
+                if _supports_graph_stream(engine):
+                    result_text, finish_reason = await _collect_graph_stream_text(
+                        engine, req, prompt_formatted
+                    )
+                else:
+                    result_text, finish_reason = await engine.dynamic_batch_generate(
+                        prompt=prompt_formatted,
+                        max_generate_tokens=req.max_tokens,
+                        stop_tokens=req.stop_tokens,
+                        pad_zero=req.pad_zero,
+                        temperature=req.temperature,
+                        top_k=req.top_k,
+                        top_p=req.top_p,
+                        alpha_presence=req.alpha_presence,
+                        alpha_frequency=req.alpha_frequency,
+                        alpha_decay=req.alpha_decay,
+                        chunk_size=req.chunk_size,
+                    )
 
             message, response_finish_reason = build_openai_message_response(
                 result_text, finish_reason, body
