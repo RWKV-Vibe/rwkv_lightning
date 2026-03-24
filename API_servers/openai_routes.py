@@ -190,6 +190,23 @@ def _emit_finish_reason_chunk(
     return f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
 
 
+def _extract_sse_payload(item: str) -> str | None:
+    if not isinstance(item, str) or not item.startswith("data: "):
+        return None
+    return item[6:].strip()
+
+
+def _flush_tool_processor_content(tool_processor) -> list[str]:
+    if tool_processor is None:
+        return []
+
+    flushed_content: list[str] = []
+    for event_type, value in tool_processor.flush():
+        if event_type == "content" and value:
+            flushed_content.append(value)
+    return flushed_content
+
+
 def _json_response(status_code: int, payload: dict):
     return Response(
         status_code=status_code,
@@ -274,28 +291,26 @@ async def _stream_state_openai_chunks(
         session_id=session_id,
         state_manager=state_manager,
     ):
-        if not item.startswith("data: "):
+        payload = _extract_sse_payload(item)
+        if payload is None:
             continue
 
-        payload = item[6:]
         if payload == "[DONE]":
-            if tool_processor is not None:
-                for event_type, value in tool_processor.flush():
-                    if event_type == "content" and value:
-                        chunk = {
-                            "id": response_id,
-                            "object": "chat.completion.chunk",
-                            "created": created,
-                            "model": model_name,
-                            "choices": [
-                                {
-                                    "index": 0,
-                                    "delta": {"content": value},
-                                    "finish_reason": None,
-                                }
-                            ],
+            for value in _flush_tool_processor_content(tool_processor):
+                chunk = {
+                    "id": response_id,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": model_name,
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {"content": value},
+                            "finish_reason": None,
                         }
-                        yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+                    ],
+                }
+                yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
             finish_reason = tool_finish_reason or "stop"
             yield _emit_finish_reason_chunk(
                 response_id, created, model_name, finish_reason
@@ -409,34 +424,33 @@ async def _stream_stateless_openai_chunks(
             alpha_decay=req.alpha_decay,
             chunk_size=req.chunk_size,
         ):
-            if not isinstance(item, str) or not item.startswith("data: "):
+            payload = _extract_sse_payload(item)
+            if payload is None:
                 continue
 
-            payload = item[6:]
             if payload == "[DONE]":
                 saw_done = True
                 if not emitted_finish_reason:
-                    if tool_processor is not None:
-                        for event_type, value in tool_processor.flush():
-                            if event_type == "content" and value:
-                                chunk = {
-                                    "id": response_id,
-                                    "object": "chat.completion.chunk",
-                                    "created": created,
-                                    "model": model_name,
-                                    "choices": [
-                                        {
-                                            "index": 0,
-                                            "delta": {"content": value},
-                                            "finish_reason": None,
-                                        }
-                                    ],
+                    for value in _flush_tool_processor_content(tool_processor):
+                        chunk = {
+                            "id": response_id,
+                            "object": "chat.completion.chunk",
+                            "created": created,
+                            "model": model_name,
+                            "choices": [
+                                {
+                                    "index": 0,
+                                    "delta": {"content": value},
+                                    "finish_reason": None,
                                 }
-                                yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+                            ],
+                        }
+                        yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
                     finish_reason = tool_finish_reason or "stop"
                     yield _emit_finish_reason_chunk(
                         response_id, created, model_name, finish_reason
                     )
+                    emitted_finish_reason = True
                 break
 
             try:
@@ -449,28 +463,28 @@ async def _stream_stateless_openai_chunks(
 
             finish_reason = choices[0].get("finish_reason")
             if finish_reason is not None:
-                if tool_processor is not None:
-                    for event_type, value in tool_processor.flush():
-                        if event_type == "content" and value:
-                            chunk = {
-                                "id": response_id,
-                                "object": "chat.completion.chunk",
-                                "created": created,
-                                "model": model_name,
-                                "choices": [
-                                    {
-                                        "index": 0,
-                                        "delta": {"content": value},
-                                        "finish_reason": None,
-                                    }
-                                ],
+                for value in _flush_tool_processor_content(tool_processor):
+                    chunk = {
+                        "id": response_id,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": model_name,
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {"content": value},
+                                "finish_reason": None,
                             }
-                            yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
-                if tool_finish_reason is None:
-                    emitted_finish_reason = True
-                    yield _emit_finish_reason_chunk(
-                        response_id, created, model_name, finish_reason
-                    )
+                        ],
+                    }
+                    yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+                emitted_finish_reason = True
+                yield _emit_finish_reason_chunk(
+                    response_id,
+                    created,
+                    model_name,
+                    tool_finish_reason or finish_reason,
+                )
                 continue
 
             content = choices[0].get("delta", {}).get("content")
@@ -630,10 +644,10 @@ async def _collect_graph_stream_text(
         alpha_decay=req.alpha_decay,
         chunk_size=req.chunk_size,
     ):
-        if not isinstance(item, str) or not item.startswith("data: "):
+        payload = _extract_sse_payload(item)
+        if payload is None:
             continue
 
-        payload = item[6:]
         if payload == "[DONE]":
             break
 
@@ -650,7 +664,7 @@ async def _collect_graph_stream_text(
         finish = choice.get("finish_reason")
         if finish is not None:
             finish_reason = finish
-            continue
+            break
 
         content = choice.get("delta", {}).get("content")
         if content:

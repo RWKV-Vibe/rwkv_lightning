@@ -444,6 +444,46 @@ async def test_openai_route_stateless_stream_propagates_graph_length_finish_reas
     )
 
 
+async def test_openai_route_stateless_stream_handles_done_with_whitespace() -> None:
+    app = DummyApp()
+
+    class GraphWhitespaceDoneEngine(DummyEngine):
+        async def graph_infer_stream(self, **kwargs) -> AsyncIterator[str]:
+            self.graph_stream_calls.append(kwargs)
+            yield 'data: {"choices":[{"index":0,"delta":{"content":"ws-done"}}]}'
+            yield 'data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}'
+            yield "data: [DONE]\n\n"
+
+    engine = GraphWhitespaceDoneEngine()
+    openai_routes.register_openai_routes(
+        app, engine, password=None, chat_request_model=ChatRequest
+    )
+    route = app.routes["/openai/v1/chat/completions"]
+
+    response = await route(
+        DummyRequest(
+            {
+                "messages": [{"role": "user", "content": "Hello whitespace"}],
+                "stream": True,
+            }
+        )
+    )
+    chunks = []
+    async for chunk in response.iterator:
+        chunks.append(chunk)
+
+    combined = "".join(chunks)
+    if "ws-done" not in combined:
+        raise AssertionError(
+            "graph stream should preserve content when DONE includes whitespace"
+        )
+    if '"finish_reason": "stop"' not in combined or "[DONE]" not in combined:
+        raise AssertionError(
+            "graph stream should emit stop finish_reason and DONE with whitespace"
+        )
+    print("[PASS] test_openai_route_stateless_stream_handles_done_with_whitespace")
+
+
 async def test_openai_route_stateless_stream_skips_malformed_graph_json_payload() -> (
     None
 ):
@@ -642,6 +682,68 @@ async def test_openai_route_stream_tool_compat_emits_tool_call_sse() -> None:
     if "<tool_call>" in combined:
         raise AssertionError("raw tool_call tags should not leak into SSE output")
     print("[PASS] test_openai_route_stream_tool_compat_emits_tool_call_sse")
+
+
+async def test_openai_route_stream_tool_compat_emits_finish_before_done_whitespace() -> (
+    None
+):
+    app = DummyApp()
+
+    class StreamingToolCallWhitespaceDoneEngine(DummyEngine):
+        async def graph_infer_stream(self, **kwargs) -> AsyncIterator[str]:
+            self.graph_stream_calls.append(kwargs)
+            for piece in [
+                "<tool_",
+                'call>{"name":"lookup_weather",',
+                '"arguments":{"city":"Beijing"}}',
+                "</tool_call>",
+            ]:
+                yield "data: " + json.dumps(
+                    {"choices": [{"index": 0, "delta": {"content": piece}}]}
+                )
+            yield 'data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}'
+            yield "data: [DONE]\n\n"
+
+    engine = StreamingToolCallWhitespaceDoneEngine()
+    openai_routes.register_openai_routes(
+        app, engine, password=None, chat_request_model=ChatRequest
+    )
+    route = app.routes["/openai/v1/chat/completions"]
+
+    response = await route(
+        DummyRequest(
+            {
+                "messages": [{"role": "user", "content": "Use a tool if needed"}],
+                "stream": True,
+                "tools": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "lookup_weather",
+                            "parameters": {"type": "object", "properties": {}},
+                        },
+                    }
+                ],
+            }
+        )
+    )
+
+    chunks = []
+    async for chunk in response.iterator:
+        chunks.append(chunk)
+
+    combined = "".join(chunks)
+    if '"tool_calls"' not in combined or "lookup_weather" not in combined:
+        raise AssertionError("tool compat should emit tool_calls chunks before DONE")
+    if '"finish_reason": "tool_calls"' not in combined:
+        raise AssertionError(
+            "tool compat should emit tool_calls finish_reason even before DONE with whitespace"
+        )
+    if combined.count('"finish_reason": "tool_calls"') != 1:
+        raise AssertionError("tool compat should emit tool_calls finish_reason exactly once")
+    print(
+        "[PASS] test_openai_route_stream_tool_compat_emits_finish_before_done_whitespace"
+    )
 
 
 async def test_openai_route_stream_tool_compat_preserves_trailing_text_graph() -> None:
@@ -873,12 +975,14 @@ async def main() -> None:
     await test_openai_route_stateless_stream_uses_graph_stream()
     await test_openai_route_stateless_stream_falls_back_when_graph_not_supported()
     await test_openai_route_stateless_stream_propagates_graph_length_finish_reason()
+    await test_openai_route_stateless_stream_handles_done_with_whitespace()
     await test_openai_route_stateless_stream_skips_malformed_graph_json_payload()
     await test_openai_route_stateless_stream_respects_chunk_size_override()
     await (
         test_openai_route_non_stream_tool_compat_injects_prompt_and_parses_tool_calls()
     )
     await test_openai_route_stream_tool_compat_emits_tool_call_sse()
+    await test_openai_route_stream_tool_compat_emits_finish_before_done_whitespace()
     await test_openai_route_stream_tool_compat_preserves_trailing_text_graph()
     await test_openai_route_stream_tool_compat_false_discards_tools()
     await test_openai_route_stream_tool_compat_emits_tool_call_sse_on_fallback()
