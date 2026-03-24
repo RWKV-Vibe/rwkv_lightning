@@ -474,7 +474,7 @@ class InferenceEngine:
                         if temperature != 1.0:
                             out /= temperature
 
-                        if self.rocm_flag:
+                        if self.rocm_flag or torch.cuda.is_current_stream_capturing():
                             new_tokens = self._torch_top_k_top_p(out, top_k, top_p)
                         else:
                             try:
@@ -1083,7 +1083,15 @@ class InferenceEngine:
                 return
 
             out = self.model.forward(encoded_prompt, state)
-            token = sampler_gumbel_batch(logits=out, temp=temperature).item()
+            token = self._sample_next_token(
+                out,
+                alpha_presence,
+                alpha_frequency,
+                alpha_decay,
+                temperature,
+                top_k,
+                top_p,
+            )
 
             if token in stop_tokens:
                 finish_reason = "stop"
