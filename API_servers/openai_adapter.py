@@ -196,14 +196,16 @@ def render_tool(tool: dict[str, Any]) -> str:
 def tools_to_system_prompt(tools: list[dict[str, Any]]) -> str:
     normalized = [normalize_tool(tool) for tool in tools]
     header = """You may use tools when needed.
-
-Follow these rules strictly:
-1. If a tool is needed, output EXACTLY one tool call.
-2. A tool call must be wrapped in <tool_call> and </tool_call>.
-3. Inside <tool_call>, output valid JSON only.
-4. Do not use markdown code fences.
-5. Do not add any explanation before or after a tool call.
-6. If no tool is needed, answer normally.
+If a tool is needed, output exactly one tool call in this format:
+<tool_call>{"name":"TOOL_NAME","arguments":{}}</tool_call>
+Rules:
+- Output valid JSON only inside <tool_call>.
+- Do not output any text before or after the tool call.
+- Do not use markdown code fences.
+- Do not use tags like <exec> or any other format.
+- If no tool is needed, answer normally.
+Example:
+<tool_call>{"name":"exec","arguments":{"command":"uname -r","working_dir":"/"}}</tool_call>
 """
     body = "\n\n".join(render_tool(tool) for tool in normalized)
     return header + "\n\nAvailable tools:\n\n" + body
