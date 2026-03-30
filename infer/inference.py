@@ -24,6 +24,9 @@ class InferenceEngine:
         self.executor = ThreadPoolExecutor(
             max_workers=128, thread_name_prefix="model_inference"
         )
+        
+    def shutdown(self):
+        self.executor.shutdown(wait=False)
 
     def _init_cuda_graph_state(self, token, state, out):
         x_emb = self.model.z["emb.weight"][token]
