@@ -312,69 +312,7 @@ curl -X POST http://localhost:8000/v2/chat/completions \
 </details>
 
 
-### 4. ```v3/chat/completions``` [Support all decode parameters]
-
-<details>
-<summary>curl examples</summary>
-
-- Streaming asynchronous batch processing With CUDA Graph For Bsz=1
-```bash
-curl -X POST http://localhost:8000/v3/chat/completions \
-  -H "Content-Type: application/json" \
-  -N \
-  -d '{
-    "messages": [
-      {
-        "role": "user",
-        "content": "What is the capital of France?"
-      }
-    ],
-    "max_tokens": 1024,
-    "stop_tokens": [0, 261, 24281],
-    "temperature": 1.0,
-    "top_k": 1,
-    "top_p": 0.3,
-    "pad_zero": true,
-    "alpha_presence": 0.8,
-    "alpha_frequency": 0.8,
-    "alpha_decay": 0.996,
-    "chunk_size": 128,
-    "stream": true,
-    "enable_think": true,
-    "password": "rwkv7_7.2b"
-  }'
-```
-- Non-streaming asynchronous batch processing With CUDA Graph For Bsz=1
-```bash
-curl -X POST http://localhost:8000/v3/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{
-    "messages": [
-      {
-        "role": "user",
-        "content": "What is the capital of France?"
-      }
-    ],
-    "max_tokens": 1024,
-    "stop_tokens": [0, 261, 24281],
-    "temperature": 1.0,
-    "top_k": 1,
-    "top_p": 0.3,
-    "pad_zero": true,
-    "alpha_presence": 0.8,
-    "alpha_frequency": 0.8,
-    "alpha_decay": 0.996,
-    "chunk_size": 128,
-    "stream": false,
-    "enable_think": true,
-    "password": "rwkv7_7.2b"
-  }'
-```
-
-</details>
-
-
-### 5. ```state/chat/completions``` [Support state cache manager] 😜
+### 4. ```state/chat/completions``` [Support state cache manager] 😜
 
 #### Have 3 Levels Cache design 🤓
 - **L1 cache(VRAM) 16**
@@ -397,7 +335,7 @@ curl -X POST http://localhost:8000/state/chat/completions \
   -N \
   -d '{
     "contents": [
-      "User: What should we eat for dinner? Any brief suggestions?\\n\\nAssistant: <think>\\n</think>\\n"
+      "User: What should we eat for dinner? Any brief suggestions?\n\nAssistant: <think>\n</think>\n"
     ],
     "max_tokens": 1024,
     "stop_tokens": [0, 261, 24281],
@@ -419,7 +357,7 @@ curl -X POST http://localhost:8000/state/chat/completions \
       -H "Content-Type: application/json" \
       -d '{
     "contents": [
-      "User: What should we eat for dinner? Any brief suggestions?\\n\\nAssistant: <think>\\n</think>\\n"
+      "User: What should we eat for dinner? Any brief suggestions?\n\nAssistant: <think>\n</think>\n"
     ],
     "max_tokens": 1024,
     "stop_tokens": [0, 261, 24281],
@@ -438,7 +376,7 @@ curl -X POST http://localhost:8000/state/chat/completions \
 </details>
 
 
-### 6. **State Management API** [Support state cache manager] 😜 
+### 5. **State Management API** [Support state cache manager] 😜 
 
 #### Use ```state/status```  Interface to check the state pool status of a session
 
@@ -472,7 +410,7 @@ curl -X POST http://localhost:8000/state/delete \
 
 </details>
 
-### 7. ```/openai/v1/chat/completions``` [Open AI format support]
+### 6. ```/openai/v1/chat/completions``` [Open AI format support]
 - "could be used for chat fronted which OpenAI API compatibility. Such as Cherry studio."
 - **Stateless by default.** If you do not send `"session_id"`, the server handles the request as a normal non-stateful OpenAI-compatible completion.
 - **Optional state mode via `"session_id"`.** When `"session_id"` is present, the route reuses cached RWKV state for that session and treats the request as an **incremental turn**.
@@ -541,7 +479,7 @@ python test/test_openai_routes.py
 ```
 </details>
 
-### 8. ```/big_batch/completions```  [Only Support noise & temperature decode parameters]
+### 7. ```/big_batch/completions```  [Only Support noise & temperature decode parameters]
 
 <details>
 <summary>curl examples</summary>

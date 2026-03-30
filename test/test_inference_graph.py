@@ -279,10 +279,43 @@ async def test_graph_infer_stream_falls_back_without_cuda() -> None:
     print("[PASS] test_graph_infer_stream_falls_back_without_cuda")
 
 
+async def test_batch_infer_stream_state_respects_chunk_size() -> None:
+    engine = _make_engine()
+    sampled_tokens = iter([11, 12, 0])
+
+    with _patch_sampler(
+        setup_rand_fn=lambda seed, batch_size: None,
+        batch_sampling_fn=lambda *args, **kwargs: FakeBatchTokens(next(sampled_tokens)),
+    ):
+        chunks = await _collect_stream(
+            engine.batch_infer_stream_state(
+                prompts=["hello"],
+                state=engine.model.generate_zero_state(0),
+                stop_tokens=[0],
+                max_length=3,
+                chunk_size=2,
+            )
+        )
+
+    combined = "".join(chunks)
+    if '"content": "A"' in combined:
+        raise AssertionError(
+            "batch_infer_stream_state should not flush the first token before chunk_size is reached"
+        )
+    if '"content": "AB"' not in combined:
+        raise AssertionError(
+            "batch_infer_stream_state should flush buffered tokens once chunk_size is reached"
+        )
+    if combined.count("[DONE]") != 1:
+        raise AssertionError("batch_infer_stream_state should emit exactly one DONE marker")
+    print("[PASS] test_batch_infer_stream_state_respects_chunk_size")
+
+
 async def main() -> None:
     await test_graph_generate_respects_max_generate_tokens()
     await test_graph_infer_stream_stops_on_initial_stop_token()
     await test_graph_infer_stream_falls_back_without_cuda()
+    await test_batch_infer_stream_state_respects_chunk_size()
     print("All inference graph tests passed.")
 
 

@@ -512,6 +512,7 @@ class InferenceEngine:
         state_manager=None,
     ):
         encoded_prompts = [self.tokenizer.encode(p) for p in prompts]
+        chunk_size = max(1, int(chunk_size))
 
         try:
             tokens = encoded_prompts[0]
@@ -553,31 +554,18 @@ class InferenceEngine:
                         yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
                     break
 
-                if not token_buffer:
-                    content = self.tokenizer.decode([tok], utf8_errors="ignore")
+                token_buffer.append(tok)
+                if len(token_buffer) >= chunk_size:
+                    content = self.tokenizer.decode(
+                        token_buffer, utf8_errors="ignore"
+                    )
+                    token_buffer.clear()
                     if content:
                         chunk = {
                             "object": "chat.completion.chunk",
                             "choices": [{"index": 0, "delta": {"content": content}}],
                         }
                         yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
-                    else:
-                        token_buffer.append(tok)
-                else:
-                    token_buffer.append(tok)
-                    if len(token_buffer) >= chunk_size:
-                        content = self.tokenizer.decode(
-                            token_buffer, utf8_errors="ignore"
-                        )
-                        token_buffer.clear()
-                        if content:
-                            chunk = {
-                                "object": "chat.completion.chunk",
-                                "choices": [
-                                    {"index": 0, "delta": {"content": content}}
-                                ],
-                            }
-                            yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
 
                 out = self.model.forward(tok, state).float()
 
