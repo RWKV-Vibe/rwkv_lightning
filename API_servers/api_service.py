@@ -116,7 +116,6 @@ def create_app(engine, password=None):
     @app.options("/v1/models")
     @app.options("/v1/chat/completions")
     @app.options("/v2/chat/completions")
-    @app.options("/v3/chat/completions")
     @app.options("/translate/v1/batch-translate")
     @app.options("/FIM/v1/batch-FIM")
     @app.options("/state/chat/completions")
@@ -307,110 +306,6 @@ def create_app(engine, password=None):
             import traceback
 
             print(f"[ERROR] /v2/chat/completions: {traceback.format_exc()}")
-            return Response(
-                status_code=500,
-                description=json.dumps({"error": str(exc)}),
-                headers={"Content-Type": "application/json"},
-            )
-
-    @app.post("/v3/chat/completions")
-    async def v3_chat_completions(request):
-        try:
-            body = json.loads(request.body)
-            if "contents" not in body and "messages" in body:
-                msgs = body.get("messages") or []
-                user_texts = [
-                    m.get("content", "") for m in msgs if m.get("role") == "user"
-                ]
-                if not user_texts and msgs:
-                    user_texts = [m.get("content", "") for m in msgs]
-                body = {**body, "contents": user_texts}
-
-            req = ChatRequest(**body)
-
-            if password and req.password != password:
-                return Response(
-                    status_code=401,
-                    description=json.dumps(
-                        {"error": "Unauthorized: invalid or missing password"}
-                    ),
-                    headers={"Content-Type": "application/json"},
-                )
-
-            prompts = req.contents
-            if req.enable_think:
-                prompts_formatted = [f"User: {q}\n\nAssistant: <think" for q in prompts]
-            else:
-                prompts_formatted = [
-                    f"User: {q}\n\nAssistant: <think>\n</think>" for q in prompts
-                ]
-
-            if not prompts:
-                return Response(
-                    status_code=400,
-                    description=json.dumps({"error": "Empty prompts list"}),
-                    headers={"Content-Type": "application/json"},
-                )
-
-            if req.stream:
-                return StreamingResponse(
-                    engine.graph_infer_stream(
-                        inputs=prompts_formatted,
-                        stop_tokens=req.stop_tokens,
-                        max_generate_tokens=req.max_tokens,
-                        temperature=req.temperature,
-                        top_k=req.top_k,
-                        top_p=req.top_p,
-                        alpha_presence=req.alpha_presence,
-                        alpha_frequency=req.alpha_frequency,
-                        alpha_decay=req.alpha_decay,
-                        chunk_size=req.chunk_size,
-                    ),
-                    media_type="text/event-stream",
-                )
-
-            results = await engine.graph_generate(
-                inputs=prompts_formatted,
-                stop_tokens=req.stop_tokens,
-                max_generate_tokens=req.max_tokens,
-                temperature=req.temperature,
-                top_k=req.top_k,
-                top_p=req.top_p,
-                alpha_presence=req.alpha_presence,
-                alpha_frequency=req.alpha_frequency,
-                alpha_decay=req.alpha_decay,
-            )
-            choices = []
-            for i, text in enumerate(results):
-                choices.append(
-                    {
-                        "index": i,
-                        "message": {"role": "assistant", "content": text},
-                        "finish_reason": "stop",
-                    }
-                )
-
-            response = {
-                "id": "rwkv7-batch-v3",
-                "object": "chat.completion",
-                "model": req.model,
-                "choices": choices,
-            }
-            return Response(
-                status_code=200,
-                description=json.dumps(response, ensure_ascii=False),
-                headers={"Content-Type": "application/json"},
-            )
-        except json.JSONDecodeError as exc:
-            return Response(
-                status_code=400,
-                description=json.dumps({"error": f"Invalid JSON: {str(exc)}"}),
-                headers={"Content-Type": "application/json"},
-            )
-        except Exception as exc:
-            import traceback
-
-            print(f"[ERROR] /v3/chat/completions: {traceback.format_exc()}")
             return Response(
                 status_code=500,
                 description=json.dumps({"error": str(exc)}),

@@ -13,21 +13,13 @@ from API_servers.openai_adapter import (
     build_openai_usage,
     extract_openai_prompt,
     format_openai_prompt,
-    format_openai_state_prompt,
 )
-from state_manager.state_pool import get_state_manager
 
 
 def _tool_stream_enabled(body: dict) -> bool:
     return bool(
         body.get("enable_tool_calls", False)
         or body.get("_rwkv_tool_compat_active", False)
-    )
-
-
-def _supports_graph_stream(engine) -> bool:
-    return hasattr(engine, "graph_infer_stream") and not getattr(
-        engine, "rocm_flag", False
     )
 
 
@@ -233,30 +225,18 @@ def _check_openai_auth(request, body: dict, password):
     return _json_response(401, {"error": "Unauthorized: invalid or missing password"})
 
 
-def _get_or_init_state(engine, session_id: str):
-    state_manager = get_state_manager()
-    state = state_manager.get_state(session_id)
-    if state is None:
-        state = engine.model.generate_zero_state(0)
-        state_manager.put_state(session_id, state)
-        print(f"[INIT] Created new state for session: {session_id}")
-    else:
-        print(f"[REUSE] Reusing existing state for session: {session_id}")
-    return state_manager, state
-
-
-async def _stream_state_openai_chunks(
+async def _stream_openai_chunks(
     engine,
     req,
     body: dict,
     prompt_formatted: str,
-    session_id: str,
     response_id: str,
     created: int,
     model_name: str,
 ):
     tool_processor = None
     tool_finish_reason = None
+    emitted_finish_reason = False
     if _tool_stream_enabled(body):
         tool_processor = _ToolCallStreamProcessor()
 
@@ -275,10 +255,8 @@ async def _stream_state_openai_chunks(
     }
     yield f"data: {json.dumps(start_chunk, ensure_ascii=False)}\n\n"
 
-    state_manager, state = _get_or_init_state(engine, session_id)
-    async for item in engine.batch_infer_stream_state(
-        prompts=[prompt_formatted],
-        state=state,
+    async for item in engine.singe_infer_stream(
+        prompt=prompt_formatted,
         max_length=req.max_tokens,
         temperature=req.temperature,
         top_k=req.top_k,
@@ -288,8 +266,6 @@ async def _stream_state_openai_chunks(
         alpha_decay=req.alpha_decay,
         stop_tokens=req.stop_tokens,
         chunk_size=req.chunk_size,
-        session_id=session_id,
-        state_manager=state_manager,
     ):
         payload = _extract_sse_payload(item)
         if payload is None:
@@ -311,10 +287,11 @@ async def _stream_state_openai_chunks(
                     ],
                 }
                 yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
-            finish_reason = tool_finish_reason or "stop"
-            yield _emit_finish_reason_chunk(
-                response_id, created, model_name, finish_reason
-            )
+            if not emitted_finish_reason:
+                finish_reason = tool_finish_reason or "stop"
+                yield _emit_finish_reason_chunk(
+                    response_id, created, model_name, finish_reason
+                )
             break
 
         try:
@@ -323,6 +300,32 @@ async def _stream_state_openai_chunks(
             continue
         choices = chunk_payload.get("choices") or []
         if not choices:
+            continue
+
+        finish_reason = choices[0].get("finish_reason")
+        if finish_reason is not None:
+            for value in _flush_tool_processor_content(tool_processor):
+                chunk = {
+                    "id": response_id,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": model_name,
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {"content": value},
+                            "finish_reason": None,
+                        }
+                    ],
+                }
+                yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+            yield _emit_finish_reason_chunk(
+                response_id,
+                created,
+                model_name,
+                tool_finish_reason or finish_reason,
+            )
+            emitted_finish_reason = True
             continue
 
         content = choices[0].get("delta", {}).get("content")
@@ -377,302 +380,6 @@ async def _stream_state_openai_chunks(
     yield "data: [DONE]\n\n"
 
 
-async def _stream_stateless_openai_chunks(
-    engine,
-    req,
-    body: dict,
-    prompt_formatted: str,
-    response_id: str,
-    created: int,
-    model_name: str,
-):
-    tool_processor = None
-    tool_finish_reason = None
-    if _tool_stream_enabled(body):
-        tool_processor = _ToolCallStreamProcessor()
-
-    start_chunk = {
-        "id": response_id,
-        "object": "chat.completion.chunk",
-        "created": created,
-        "model": model_name,
-        "choices": [
-            {
-                "index": 0,
-                "delta": {"role": "assistant"},
-                "finish_reason": None,
-            }
-        ],
-    }
-    yield f"data: {json.dumps(start_chunk, ensure_ascii=False)}\n\n"
-
-    saw_done = False
-    emitted_finish_reason = False
-    use_graph_stream = hasattr(engine, "graph_infer_stream") and not getattr(
-        engine, "rocm_flag", False
-    )
-    if use_graph_stream:
-        async for item in engine.graph_infer_stream(
-            inputs=[prompt_formatted],
-            stop_tokens=req.stop_tokens,
-            max_generate_tokens=req.max_tokens,
-            temperature=req.temperature,
-            top_k=req.top_k,
-            top_p=req.top_p,
-            alpha_presence=req.alpha_presence,
-            alpha_frequency=req.alpha_frequency,
-            alpha_decay=req.alpha_decay,
-            chunk_size=req.chunk_size,
-        ):
-            payload = _extract_sse_payload(item)
-            if payload is None:
-                continue
-
-            if payload == "[DONE]":
-                saw_done = True
-                if not emitted_finish_reason:
-                    for value in _flush_tool_processor_content(tool_processor):
-                        chunk = {
-                            "id": response_id,
-                            "object": "chat.completion.chunk",
-                            "created": created,
-                            "model": model_name,
-                            "choices": [
-                                {
-                                    "index": 0,
-                                    "delta": {"content": value},
-                                    "finish_reason": None,
-                                }
-                            ],
-                        }
-                        yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
-                    finish_reason = tool_finish_reason or "stop"
-                    yield _emit_finish_reason_chunk(
-                        response_id, created, model_name, finish_reason
-                    )
-                    emitted_finish_reason = True
-                break
-
-            try:
-                chunk_payload = json.loads(payload)
-            except json.JSONDecodeError:
-                continue
-            choices = chunk_payload.get("choices") or []
-            if not choices:
-                continue
-
-            finish_reason = choices[0].get("finish_reason")
-            if finish_reason is not None:
-                for value in _flush_tool_processor_content(tool_processor):
-                    chunk = {
-                        "id": response_id,
-                        "object": "chat.completion.chunk",
-                        "created": created,
-                        "model": model_name,
-                        "choices": [
-                            {
-                                "index": 0,
-                                "delta": {"content": value},
-                                "finish_reason": None,
-                            }
-                        ],
-                    }
-                    yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
-                emitted_finish_reason = True
-                yield _emit_finish_reason_chunk(
-                    response_id,
-                    created,
-                    model_name,
-                    tool_finish_reason or finish_reason,
-                )
-                continue
-
-            content = choices[0].get("delta", {}).get("content")
-            if not content:
-                continue
-
-            if tool_processor is not None:
-                for event_type, value in tool_processor.ingest(content):
-                    if event_type == "content" and value:
-                        chunk = {
-                            "id": response_id,
-                            "object": "chat.completion.chunk",
-                            "created": created,
-                            "model": model_name,
-                            "choices": [
-                                {
-                                    "index": 0,
-                                    "delta": {"content": value},
-                                    "finish_reason": None,
-                                }
-                            ],
-                        }
-                        yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
-                    elif event_type == "tool":
-                        if isinstance(value, dict):
-                            tool_call = {
-                                "id": f"call_{uuid.uuid4().hex}",
-                                "name": value["name"],
-                                "arguments": value["arguments"],
-                            }
-                            yield _emit_tool_call_chunk(
-                                response_id, created, model_name, tool_call
-                            )
-                            tool_finish_reason = "tool_calls"
-                continue
-
-            chunk = {
-                "id": response_id,
-                "object": "chat.completion.chunk",
-                "created": created,
-                "model": model_name,
-                "choices": [
-                    {
-                        "index": 0,
-                        "delta": {"content": content},
-                        "finish_reason": None,
-                    }
-                ],
-            }
-            yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
-    else:
-        async for item in engine.dynamic_batch_infer_stream(
-            prompt=prompt_formatted,
-            max_generate_tokens=req.max_tokens,
-            stop_tokens=req.stop_tokens,
-            pad_zero=req.pad_zero,
-            temperature=req.temperature,
-            top_k=req.top_k,
-            top_p=req.top_p,
-            alpha_presence=req.alpha_presence,
-            alpha_frequency=req.alpha_frequency,
-            alpha_decay=req.alpha_decay,
-            chunk_size=req.chunk_size,
-        ):
-            if item["type"] == "delta" and item["text"]:
-                if tool_processor is not None:
-                    for event_type, value in tool_processor.ingest(item["text"]):
-                        if event_type == "content" and value:
-                            chunk = {
-                                "id": response_id,
-                                "object": "chat.completion.chunk",
-                                "created": created,
-                                "model": model_name,
-                                "choices": [
-                                    {
-                                        "index": 0,
-                                        "delta": {"content": value},
-                                        "finish_reason": None,
-                                    }
-                                ],
-                            }
-                            yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
-                        elif event_type == "tool":
-                            if isinstance(value, dict):
-                                tool_call = {
-                                    "id": f"call_{uuid.uuid4().hex}",
-                                    "name": value["name"],
-                                    "arguments": value["arguments"],
-                                }
-                                yield _emit_tool_call_chunk(
-                                    response_id, created, model_name, tool_call
-                                )
-                                tool_finish_reason = "tool_calls"
-                else:
-                    chunk = {
-                        "id": response_id,
-                        "object": "chat.completion.chunk",
-                        "created": created,
-                        "model": model_name,
-                        "choices": [
-                            {
-                                "index": 0,
-                                "delta": {"content": item["text"]},
-                                "finish_reason": None,
-                            }
-                        ],
-                    }
-                    yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
-            elif item["type"] == "done":
-                if tool_processor is not None:
-                    for event_type, value in tool_processor.flush():
-                        if event_type == "content" and value:
-                            chunk = {
-                                "id": response_id,
-                                "object": "chat.completion.chunk",
-                                "created": created,
-                                "model": model_name,
-                                "choices": [
-                                    {
-                                        "index": 0,
-                                        "delta": {"content": value},
-                                        "finish_reason": None,
-                                    }
-                                ],
-                            }
-                            yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
-                    finish_reason = tool_finish_reason or item["finish_reason"]
-                    yield _emit_finish_reason_chunk(
-                        response_id, created, model_name, finish_reason
-                    )
-                else:
-                    finish_reason = tool_finish_reason or item["finish_reason"]
-                    yield _emit_finish_reason_chunk(
-                        response_id, created, model_name, finish_reason
-                    )
-                break
-
-    yield "data: [DONE]\n\n"
-
-
-async def _collect_graph_stream_text(
-    engine,
-    req,
-    prompt_formatted: str,
-) -> tuple[str, str]:
-    content_parts: list[str] = []
-    finish_reason = "stop"
-    async for item in engine.graph_infer_stream(
-        inputs=[prompt_formatted],
-        stop_tokens=req.stop_tokens,
-        max_generate_tokens=req.max_tokens,
-        temperature=req.temperature,
-        top_k=req.top_k,
-        top_p=req.top_p,
-        alpha_presence=req.alpha_presence,
-        alpha_frequency=req.alpha_frequency,
-        alpha_decay=req.alpha_decay,
-        chunk_size=req.chunk_size,
-    ):
-        payload = _extract_sse_payload(item)
-        if payload is None:
-            continue
-
-        if payload == "[DONE]":
-            break
-
-        try:
-            chunk_payload = json.loads(payload)
-        except json.JSONDecodeError:
-            continue
-
-        choices = chunk_payload.get("choices") or []
-        if not choices:
-            continue
-
-        choice = choices[0]
-        finish = choice.get("finish_reason")
-        if finish is not None:
-            finish_reason = finish
-            break
-
-        content = choice.get("delta", {}).get("content")
-        if content:
-            content_parts.append(content)
-
-    return "".join(content_parts), finish_reason
-
-
 def register_openai_routes(app, engine, password, chat_request_model):
     @app.post("/openai/v1/chat/completions")
     async def openai_chat_completions(request):
@@ -695,15 +402,7 @@ def register_openai_routes(app, engine, password, chat_request_model):
 
             print(f"[OpenAI] Request: {req}")
 
-            if req.session_id:
-                try:
-                    prompt_formatted = format_openai_state_prompt(
-                        body, req.enable_think
-                    )
-                except ValueError as exc:
-                    return _json_response(400, {"error": str(exc)})
-            else:
-                prompt_formatted = format_openai_prompt(body, req.enable_think)
+            prompt_formatted = format_openai_prompt(body, req.enable_think)
 
             print(f"[OpenAI] Prompt: {prompt_formatted}")
 
@@ -713,18 +412,7 @@ def register_openai_routes(app, engine, password, chat_request_model):
 
             if req.stream:
                 return StreamingResponse(
-                    _stream_state_openai_chunks(
-                        engine,
-                        req,
-                        body,
-                        prompt_formatted,
-                        req.session_id,
-                        response_id,
-                        created,
-                        model_name,
-                    )
-                    if req.session_id
-                    else _stream_stateless_openai_chunks(
+                    _stream_openai_chunks(
                         engine,
                         req,
                         body,
@@ -736,42 +424,17 @@ def register_openai_routes(app, engine, password, chat_request_model):
                     media_type="text/event-stream",
                 )
 
-            if req.session_id:
-                state_manager, state = _get_or_init_state(engine, req.session_id)
-                results = engine.batch_generate_state(
-                    prompts=[prompt_formatted],
-                    state=state,
-                    max_length=req.max_tokens,
-                    temperature=req.temperature,
-                    top_k=req.top_k,
-                    top_p=req.top_p,
-                    alpha_presence=req.alpha_presence,
-                    alpha_frequency=req.alpha_frequency,
-                    alpha_decay=req.alpha_decay,
-                    stop_tokens=req.stop_tokens,
-                )
-                state_manager.put_state(req.session_id, state)
-                result_text = results[0] if results else ""
-                finish_reason = "stop"
-            else:
-                if _supports_graph_stream(engine):
-                    result_text, finish_reason = await _collect_graph_stream_text(
-                        engine, req, prompt_formatted
-                    )
-                else:
-                    result_text, finish_reason = await engine.dynamic_batch_generate(
-                        prompt=prompt_formatted,
-                        max_generate_tokens=req.max_tokens,
-                        stop_tokens=req.stop_tokens,
-                        pad_zero=req.pad_zero,
-                        temperature=req.temperature,
-                        top_k=req.top_k,
-                        top_p=req.top_p,
-                        alpha_presence=req.alpha_presence,
-                        alpha_frequency=req.alpha_frequency,
-                        alpha_decay=req.alpha_decay,
-                        chunk_size=req.chunk_size,
-                    )
+            result_text, finish_reason = await engine.singe_infer(
+                prompt=prompt_formatted,
+                max_length=req.max_tokens,
+                temperature=req.temperature,
+                top_k=req.top_k,
+                top_p=req.top_p,
+                alpha_presence=req.alpha_presence,
+                alpha_frequency=req.alpha_frequency,
+                alpha_decay=req.alpha_decay,
+                stop_tokens=req.stop_tokens,
+            )
 
             message, response_finish_reason = build_openai_message_response(
                 result_text, finish_reason, body
