@@ -392,6 +392,7 @@ def build_internal_chat_request(body: dict, prompt: str) -> dict:
         "chunk_size": chunk_size,
         "password": body.get("password"),
         "session_id": body.get("session_id"),
+        "use_prefix_cache": body.get("use_prefix_cache", True),
     }
 
 

@@ -124,6 +124,57 @@ class InferenceEngine:
 
         return sampled_tokens
 
+    def _prefill_prompt_with_prefix_cache(self, prompt, prefix_cache_manager=None):
+        encoded_prompt = self.tokenizer.encode(prompt)
+        if not encoded_prompt:
+            raise ValueError("Empty prompt")
+
+        state = None
+        out = None
+        matched_tokens = 0
+        cache_source = None
+
+        if prefix_cache_manager is not None:
+            cache_match = prefix_cache_manager.match_prefix_state(encoded_prompt, device="cuda")
+            if cache_match is not None:
+                state = cache_match["state"]
+                out = cache_match["logits"]
+                matched_tokens = int(cache_match["matched_tokens"])
+                cache_source = cache_match["cache_source"]
+
+        if state is None:
+            state = self.model.generate_zero_state(0)
+
+        if prefix_cache_manager is not None:
+            bucket_checkpoints = [
+                bucket for bucket in getattr(prefix_cache_manager, "prefix_l2_cache", {}).keys()
+                if matched_tokens < bucket <= len(encoded_prompt)
+            ]
+            bucket_checkpoints.sort()
+        else:
+            bucket_checkpoints = []
+
+        cursor = matched_tokens
+        for checkpoint in bucket_checkpoints:
+            segment = encoded_prompt[cursor:checkpoint]
+            if segment:
+                out = self.model.forward(segment, state).float()
+                prefix_cache_manager.put_prefix_state(encoded_prompt[:checkpoint], state, out)
+                cursor = checkpoint
+
+        remaining_tokens = encoded_prompt[cursor:]
+        if remaining_tokens:
+            out = self.model.forward(remaining_tokens, state).float()
+        elif out is None:
+            # Older cache rows may exist without logits. Fall back to recomputing once.
+            del state
+            state = self.model.generate_zero_state(0)
+            out = self.model.forward(encoded_prompt, state).float()
+            matched_tokens = 0
+            cache_source = None
+
+        return encoded_prompt, state, out, matched_tokens, cache_source
+
     def batch_generate(
         self,
         prompts,
@@ -363,14 +414,15 @@ class InferenceEngine:
         alpha_frequency=0.1,
         alpha_decay=0.996,
         stop_tokens=(0, 261, 24281),
+        prefix_cache_manager=None,
     ):
-        state = self.model.generate_zero_state(0)
-        encoded_prompt = self.tokenizer.encode(prompt)
         generated_tokens = []
         finish_reason = "length"
 
         try:
-            out = self.model.forward(encoded_prompt, state).float()
+            _, state, out, _, _ = self._prefill_prompt_with_prefix_cache(
+                prompt, prefix_cache_manager=prefix_cache_manager
+            )
 
             while max_length > 0:
                 max_length -= 1
@@ -417,13 +469,14 @@ class InferenceEngine:
         alpha_decay=0.996,
         stop_tokens=(0, 261, 24281),
         chunk_size=32,
+        prefix_cache_manager=None,
     ):
-        state = self.model.generate_zero_state(0)
-        encoded_prompt = self.tokenizer.encode(prompt)
         finish_reason = "length"
 
         try:
-            out = self.model.forward(encoded_prompt, state).float()
+            _, state, out, _, _ = self._prefill_prompt_with_prefix_cache(
+                prompt, prefix_cache_manager=prefix_cache_manager
+            )
             token_buffer = []
 
             while max_length > 0:

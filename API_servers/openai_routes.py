@@ -14,6 +14,7 @@ from API_servers.openai_adapter import (
     extract_openai_prompt,
     format_openai_prompt,
 )
+from state_manager.state_pool import get_state_manager
 
 
 def _tool_stream_enabled(body: dict) -> bool:
@@ -233,6 +234,7 @@ async def _stream_openai_chunks(
     response_id: str,
     created: int,
     model_name: str,
+    prefix_cache_manager=None,
 ):
     tool_processor = None
     tool_finish_reason = None
@@ -266,6 +268,7 @@ async def _stream_openai_chunks(
         alpha_decay=req.alpha_decay,
         stop_tokens=req.stop_tokens,
         chunk_size=req.chunk_size,
+        prefix_cache_manager=prefix_cache_manager,
     ):
         payload = _extract_sse_payload(item)
         if payload is None:
@@ -400,15 +403,16 @@ def register_openai_routes(app, engine, password, chat_request_model):
 
             req = chat_request_model(**build_internal_chat_request(body, prompt))
 
-            print(f"[OpenAI] Request: {req}")
+            # print(f"[OpenAI] Request: {req}")
 
             prompt_formatted = format_openai_prompt(body, req.enable_think)
 
-            print(f"[OpenAI] Prompt: {prompt_formatted}")
+            # print(f"[OpenAI] Prompt: {prompt_formatted}")
 
             response_id = f"chatcmpl-{uuid.uuid4().hex}"
             created = int(time.time())
             model_name = req.model or os.path.basename(f"{engine.args.MODEL_NAME}")
+            prefix_cache_manager = get_state_manager() if req.use_prefix_cache else None
 
             if req.stream:
                 return StreamingResponse(
@@ -420,6 +424,7 @@ def register_openai_routes(app, engine, password, chat_request_model):
                         response_id,
                         created,
                         model_name,
+                        prefix_cache_manager,
                     ),
                     media_type="text/event-stream",
                 )
@@ -434,6 +439,7 @@ def register_openai_routes(app, engine, password, chat_request_model):
                 alpha_frequency=req.alpha_frequency,
                 alpha_decay=req.alpha_decay,
                 stop_tokens=req.stop_tokens,
+                prefix_cache_manager=prefix_cache_manager,
             )
 
             message, response_finish_reason = build_openai_message_response(

@@ -33,6 +33,7 @@ class ChatRequest(BaseModel):
     password: Optional[str] = None
     session_id: Optional[str] = None
     dialogue_idx: Optional[int] = 0
+    use_prefix_cache: bool = True
 
 
 class TranslateRequest(BaseModel):
