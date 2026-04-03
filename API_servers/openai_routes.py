@@ -3,162 +3,159 @@ import os
 import time
 import traceback
 import uuid
+import json
+from typing import Any
 
 from robyn import Response, StreamingResponse
 
-from API_servers.openai_adapter import (
-    apply_tool_compatibility,
-    build_internal_chat_request,
-    build_openai_message_response,
-    build_openai_usage,
-    extract_openai_prompt,
-    format_openai_prompt,
-)
 from state_manager.state_pool import get_state_manager
 
 
-def _tool_stream_enabled(body: dict) -> bool:
-    return bool(
-        body.get("enable_tool_calls", False)
-        or body.get("_rwkv_tool_compat_active", False)
-    )
+def normalize_message_content(content) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        text_parts = []
+        for item in content:
+            if isinstance(item, dict) and item.get("type") == "text":
+                text_parts.append(item.get("text", ""))
+            elif isinstance(item, str):
+                text_parts.append(item)
+        return "".join(text_parts)
+    if content is None:
+        return ""
+    return str(content)
 
 
-def _parse_tool_payload(payload: str) -> dict | None:
-    try:
-        parsed = json.loads(payload)
-    except json.JSONDecodeError:
-        return None
+def _sanitize_text_block(content) -> str:
+    normalized = normalize_message_content(content)
+    normalized = normalized.replace("\r\n", "\n").replace("\r", "\n")
+    lines = []
+    for line in normalized.split("\n"):
+        stripped = line.strip()
+        if stripped:
+            lines.append(stripped)
+    return "\n".join(lines)
 
-    if not isinstance(parsed, dict):
-        return None
-    name = parsed.get("name")
-    arguments = parsed.get("arguments", {})
-    if not isinstance(name, str) or not name.strip():
-        return None
-    if not isinstance(arguments, dict):
-        return None
+
+def _collect_openai_prompt_parts(body: dict) -> tuple[str, list[str]]:
+    messages = body.get("messages") or []
+    contents = body.get("contents") or []
+
+    system_parts = []
+    transcript_parts = []
+
+    system_field = _sanitize_text_block(body.get("system"))
+    if system_field:
+        system_parts.append(system_field)
+
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+
+        role = str(message.get("role", "user")).lower()
+        content = _sanitize_text_block(message.get("content", ""))
+
+        if role in {"system", "developer"}:
+            if content:
+                system_parts.append(content)
+            continue
+
+        if role == "user":
+            if content:
+                transcript_parts.append(f"User: {content}")
+            continue
+
+        if role == "assistant":
+            if content:
+                transcript_parts.append(f"Assistant: {content}")
+            continue
+
+    if contents:
+        content_prompt = _sanitize_text_block(contents[0])
+        if content_prompt:
+            transcript_parts.append(f"User: {content_prompt}")
+
+    system_text = "\n".join(part for part in system_parts if part).strip()
+    transcript_parts = [part for part in transcript_parts if part]
+    return system_text, transcript_parts
+
+
+def extract_openai_prompt(body: dict) -> str:
+    system_text, transcript_parts = _collect_openai_prompt_parts(body)
+    prompt_parts = []
+    if system_text:
+        prompt_parts.append(system_text)
+    prompt_parts.extend(transcript_parts)
+    return "\n".join(part for part in prompt_parts if part).strip()
+
+
+def format_openai_prompt(body: dict, enable_think: bool) -> str:
+    system_text, transcript_parts = _collect_openai_prompt_parts(body)
+    prompt_parts = []
+    if system_text:
+        prompt_parts.append(f"System: {system_text}")
+    prompt_parts.extend(transcript_parts)
+
+    prompt_text = "\n\n".join(part for part in prompt_parts if part).strip()
+    if not prompt_text:
+        raise ValueError("OpenAI chat completions require system or user text")
+
+    if enable_think:
+        return f"{prompt_text}\n\nAssistant: <think"
+    return f"{prompt_text}\n\nAssistant: <think>\n</think>\n"
+
+
+def format_openai_state_prompt(body: dict, enable_think: bool) -> str:
+    contents = body.get("contents") or []
+    if len(contents) > 1:
+        raise ValueError("State mode only supports a single contents item")
+    return format_openai_prompt(body, enable_think)
+
+
+def build_openai_usage(tokenizer, prompt_text: str, completion_text: str) -> dict:
+    prompt_tokens = len(tokenizer.encode(prompt_text))
+    completion_tokens = len(tokenizer.encode(completion_text)) if completion_text else 0
     return {
-        "name": name.strip(),
-        "arguments": json.dumps(arguments, ensure_ascii=False),
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": prompt_tokens + completion_tokens,
     }
 
 
-class _ToolCallStreamProcessor:
-    def __init__(self):
-        self.buffer = ""
-        self.in_tool = False
-        self.tool_buffer = ""
-        self.tool_emitted = False
+def build_internal_chat_request(body: dict, prompt: str) -> dict:
+    stream = body.get("stream", False)
+    chunk_size = body.get("chunk_size")
+    if chunk_size is None:
+        chunk_size = 1 if stream else 16
 
-    def ingest(self, text: str) -> list[tuple[str, str | dict]]:
-        if not text:
-            return []
-        if self.tool_emitted:
-            return [("content", text)]
-        self.buffer += text
-        return self._ingest_tag()
-
-    def flush(self) -> list[tuple[str, str | dict]]:
-        if self.in_tool:
-            raw = f"<tool_call>{self.tool_buffer}{self.buffer}"
-            self.tool_buffer = ""
-            self.buffer = ""
-            self.in_tool = False
-            return [("content", raw)]
-        if self.buffer:
-            leftover = self.buffer
-            self.buffer = ""
-            return [("content", leftover)]
-        return []
-
-    def _ingest_tag(self) -> list[tuple[str, str | dict]]:
-        events: list[tuple[str, str | dict]] = []
-        start_tag = "<tool_call>"
-        end_tag = "</tool_call>"
-        while True:
-            if not self.in_tool:
-                start_idx = self.buffer.find(start_tag)
-                if start_idx == -1:
-                    emit, keep = _split_incomplete_tag(self.buffer, start_tag)
-                    if emit:
-                        events.append(("content", emit))
-                    self.buffer = keep
-                    break
-                before = self.buffer[:start_idx]
-                if before:
-                    events.append(("content", before))
-                self.buffer = self.buffer[start_idx + len(start_tag) :]
-                self.in_tool = True
-                self.tool_buffer = ""
-
-            combined = self.tool_buffer + self.buffer
-            end_idx = combined.find(end_tag)
-            if end_idx == -1:
-                self.tool_buffer = combined
-                self.buffer = ""
-                break
-
-            payload = combined[:end_idx]
-            trailing = combined[end_idx + len(end_tag) :]
-            self.in_tool = False
-            self.tool_buffer = ""
-            self.buffer = ""
-
-            parsed = _parse_tool_payload(payload)
-            if parsed is not None:
-                events.append(("tool", parsed))
-                self.tool_emitted = True
-                if trailing:
-                    events.append(("content", trailing))
-                break
-            events.append(("content", f"{start_tag}{payload}{end_tag}"))
-            self.buffer = trailing
-        return events
-
-
-def _split_incomplete_tag(buffer: str, tag: str) -> tuple[str, str]:
-    max_keep = 0
-    for i in range(1, len(tag)):
-        if buffer.endswith(tag[:i]):
-            max_keep = i
-    if max_keep:
-        return buffer[:-max_keep], buffer[-max_keep:]
-    return buffer, ""
-
-
-def _emit_tool_call_chunk(
-    response_id: str,
-    created: int,
-    model_name: str,
-    tool_call: dict,
-) -> str:
-    chunk = {
-        "id": response_id,
-        "object": "chat.completion.chunk",
-        "created": created,
-        "model": model_name,
-        "choices": [
-            {
-                "index": 0,
-                "delta": {
-                    "tool_calls": [
-                        {
-                            "index": 0,
-                            "id": tool_call["id"],
-                            "type": "function",
-                            "function": {
-                                "name": tool_call["name"],
-                                "arguments": tool_call["arguments"],
-                            },
-                        }
-                    ]
-                },
-                "finish_reason": None,
-            }
-        ],
+    return {
+        "model": body.get("model", "rwkv7"),
+        "contents": [prompt],
+        "messages": body.get("messages", []),
+        "system": body.get("system"),
+        "max_tokens": body.get("max_tokens", 4096),
+        "stop_tokens": body.get("stop_tokens", [0, 261, 24281]),
+        "temperature": body.get("temperature", 1.0),
+        "top_k": body.get("top_k", 20),
+        "top_p": body.get("top_p", 0.6),
+        "stream": stream,
+        "pad_zero": body.get("pad_zero", False),
+        "alpha_presence": body.get("alpha_presence", 1),
+        "alpha_frequency": body.get("alpha_frequency", 0.1),
+        "alpha_decay": body.get("alpha_decay", 0.996),
+        "enable_think": body.get("enable_think", False),
+        "chunk_size": chunk_size,
+        "password": body.get("password"),
+        "session_id": body.get("session_id"),
+        "use_prefix_cache": body.get("use_prefix_cache", True),
     }
-    return f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+
+
+def build_openai_message_response(
+    result_text: str, finish_reason: str, body: dict
+) -> tuple[dict[str, Any], str]:
+    return {"role": "assistant", "content": result_text}, finish_reason
 
 
 def _emit_finish_reason_chunk(
@@ -187,17 +184,6 @@ def _extract_sse_payload(item: str) -> str | None:
     if not isinstance(item, str) or not item.startswith("data: "):
         return None
     return item[6:].strip()
-
-
-def _flush_tool_processor_content(tool_processor) -> list[str]:
-    if tool_processor is None:
-        return []
-
-    flushed_content: list[str] = []
-    for event_type, value in tool_processor.flush():
-        if event_type == "content" and value:
-            flushed_content.append(value)
-    return flushed_content
 
 
 def _json_response(status_code: int, payload: dict):
@@ -229,19 +215,13 @@ def _check_openai_auth(request, body: dict, password):
 async def _stream_openai_chunks(
     engine,
     req,
-    body: dict,
     prompt_formatted: str,
     response_id: str,
     created: int,
     model_name: str,
     prefix_cache_manager=None,
 ):
-    tool_processor = None
-    tool_finish_reason = None
     emitted_finish_reason = False
-    if _tool_stream_enabled(body):
-        tool_processor = _ToolCallStreamProcessor()
-
     start_chunk = {
         "id": response_id,
         "object": "chat.completion.chunk",
@@ -275,25 +255,9 @@ async def _stream_openai_chunks(
             continue
 
         if payload == "[DONE]":
-            for value in _flush_tool_processor_content(tool_processor):
-                chunk = {
-                    "id": response_id,
-                    "object": "chat.completion.chunk",
-                    "created": created,
-                    "model": model_name,
-                    "choices": [
-                        {
-                            "index": 0,
-                            "delta": {"content": value},
-                            "finish_reason": None,
-                        }
-                    ],
-                }
-                yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
             if not emitted_finish_reason:
-                finish_reason = tool_finish_reason or "stop"
                 yield _emit_finish_reason_chunk(
-                    response_id, created, model_name, finish_reason
+                    response_id, created, model_name, "stop"
                 )
             break
 
@@ -307,62 +271,17 @@ async def _stream_openai_chunks(
 
         finish_reason = choices[0].get("finish_reason")
         if finish_reason is not None:
-            for value in _flush_tool_processor_content(tool_processor):
-                chunk = {
-                    "id": response_id,
-                    "object": "chat.completion.chunk",
-                    "created": created,
-                    "model": model_name,
-                    "choices": [
-                        {
-                            "index": 0,
-                            "delta": {"content": value},
-                            "finish_reason": None,
-                        }
-                    ],
-                }
-                yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
             yield _emit_finish_reason_chunk(
                 response_id,
                 created,
                 model_name,
-                tool_finish_reason or finish_reason,
+                finish_reason,
             )
             emitted_finish_reason = True
             continue
 
         content = choices[0].get("delta", {}).get("content")
         if not content:
-            continue
-
-        if tool_processor is not None:
-            for event_type, value in tool_processor.ingest(content):
-                if event_type == "content" and value:
-                    chunk = {
-                        "id": response_id,
-                        "object": "chat.completion.chunk",
-                        "created": created,
-                        "model": model_name,
-                        "choices": [
-                            {
-                                "index": 0,
-                                "delta": {"content": value},
-                                "finish_reason": None,
-                            }
-                        ],
-                    }
-                    yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
-                elif event_type == "tool":
-                    if isinstance(value, dict):
-                        tool_call = {
-                            "id": f"call_{uuid.uuid4().hex}",
-                            "name": value["name"],
-                            "arguments": value["arguments"],
-                        }
-                        yield _emit_tool_call_chunk(
-                            response_id, created, model_name, tool_call
-                        )
-                        tool_finish_reason = "tool_calls"
             continue
 
         chunk = {
@@ -392,11 +311,6 @@ def register_openai_routes(app, engine, password, chat_request_model):
             if auth_error is not None:
                 return auth_error
 
-            try:
-                body = apply_tool_compatibility(body)
-            except ValueError as exc:
-                return _json_response(400, {"error": str(exc)})
-
             prompt = extract_openai_prompt(body)
             if not prompt and not (body.get("messages") or []):
                 return _json_response(400, {"error": "Empty prompt"})
@@ -407,11 +321,11 @@ def register_openai_routes(app, engine, password, chat_request_model):
 
             prompt_formatted = format_openai_prompt(body, req.enable_think)
 
-            # print(f"[OpenAI] Prompt: {prompt_formatted}")
+            print(f"[OpenAI] Prompt: {prompt_formatted}")
 
             response_id = f"chatcmpl-{uuid.uuid4().hex}"
             created = int(time.time())
-            model_name = req.model or os.path.basename(f"{engine.args.MODEL_NAME}")
+            model_name = os.path.basename(f"{engine.args.MODEL_NAME}")
             prefix_cache_manager = get_state_manager() if req.use_prefix_cache else None
 
             if req.stream:
@@ -419,7 +333,6 @@ def register_openai_routes(app, engine, password, chat_request_model):
                     _stream_openai_chunks(
                         engine,
                         req,
-                        body,
                         prompt_formatted,
                         response_id,
                         created,

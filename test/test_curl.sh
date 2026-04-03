@@ -8,7 +8,6 @@
 # 1. /translate/v1/batch-translate - 批量翻译（非流式）
 # 2. /v1/chat/completions          - V1：基础批处理（支持流式和非流式）
 # 3. /v2/chat/completions          - V2：连续批处理（支持流式和非流式）
-# 4. /v3/chat/completions          - V3：异步高并发（VLLM风格，支持流式和非流式）
 # 
 # 使用方法：
 #   bash test_curl.sh        # 执行所有测试
@@ -133,67 +132,6 @@ curl -X POST http://localhost:8000/v2/chat/completions \
     "alpha_decay": 0.996,
     "chunk_size": 128,
     "stream": true,
-    "password": "rwkv7_7.2b"
-  }'
-
-echo -e "\n\n========================================\n\n"
-
-# ============================================================================
-# 测试 6: V3 - 非流式异步高并发
-# ============================================================================
-echo -e "\n[测试 6/7] V3 非流式异步高并发 With CUDA Graph For Bsz=1\n"
-curl -X POST http://localhost:8000/v3/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{
-    "messages": [
-      {
-        "role": "user",
-        "content": "What is the capital of France?"
-      }
-    ],
-    "max_tokens": 1024,
-    "stop_tokens": [0, 261, 24281],
-    "temperature": 1.0,
-    "top_k": 1,
-    "top_p": 0.3,
-    "pad_zero": true,
-    "alpha_presence": 0.8,
-    "alpha_frequency": 0.8,
-    "alpha_decay": 0.996,
-    "chunk_size": 128,
-    "stream": false,
-    "enable_think": true,
-    "password": "rwkv7_7.2b"
-  }'
-
-echo -e "\n\n========================================\n\n"
-
-# ============================================================================
-# 测试 7: V3 - 流式异步高并发 (VLLM风格)
-# ============================================================================
-echo -e "\n[测试 7/7] V3 流式异步高并发 With CUDA Graph For Bsz=1\n"
-curl -X POST http://localhost:8000/v3/chat/completions \
-  -H "Content-Type: application/json" \
-  -N \
-  -d '{
-    "messages": [
-      {
-        "role": "user",
-        "content": "What is the capital of France?"
-      }
-    ],
-    "max_tokens": 1024,
-    "stop_tokens": [0, 261, 24281],
-    "temperature": 1.0,
-    "top_k": 1,
-    "top_p": 0.3,
-    "pad_zero": true,
-    "alpha_presence": 0.8,
-    "alpha_frequency": 0.8,
-    "alpha_decay": 0.996,
-    "chunk_size": 128,
-    "stream": true,
-    "enable_think": true,
     "password": "rwkv7_7.2b"
   }'
 
