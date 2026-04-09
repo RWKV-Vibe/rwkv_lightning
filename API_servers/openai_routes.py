@@ -321,7 +321,7 @@ def register_openai_routes(app, engine, password, chat_request_model):
 
             prompt_formatted = format_openai_prompt(body, req.enable_think)
 
-            print(f"[OpenAI] Prompt: {prompt_formatted}")
+            # print(f"[OpenAI] Prompt: {prompt_formatted}")
 
             response_id = f"chatcmpl-{uuid.uuid4().hex}"
             created = int(time.time())

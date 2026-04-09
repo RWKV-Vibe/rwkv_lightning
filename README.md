@@ -19,11 +19,16 @@ pip install robyn pydantic ninja numpy
 ```
 
 ## Usage
+### Single GPU
 ```bash
 python app.py --model-path <your model path> --port <your port number> --password rwkv7_7.2b
 ```
 - if no password, you can do not add ```--password``` flag
 
+### Pipeline Parallelism
+```bash
+python app.py --model-path <your model path> --port <your port number> --password rwkv7_7.2b --pp-devices [0,1,2,3] 
+```
 
 ## Test API quickly
 ```bash

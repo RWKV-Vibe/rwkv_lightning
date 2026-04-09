@@ -8,13 +8,14 @@ import time
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
+import os
 
 import torch
 
 L1_CAPACITY = 16  # VRAM (Hot)
 L2_CAPACITY = 64  # RAM (Warm)
-DB_PATH = "rwkv_sessions.db"  # infinite cold state pool HaHa!
+DB_PATH = os.environ.get("DB_PATH", "rwkv_sessions.db") # infinite cold state pool HaHa!
 
 PREFIX_CACHE_BUCKETS = (1024, 2048, 3072, 4096, 5120, 6144, 7168, 8192)
 PREFIX_CACHE_BUCKET_CAPACITY = 16
@@ -226,20 +227,98 @@ class StateCacheManager:
         buffer = io.BytesIO(blob)
         return torch.load(buffer, map_location="cpu", weights_only=True)
 
-    def _clone_state(self, state: List[torch.Tensor]) -> List[torch.Tensor]:
+    def _map_state_structure(self, value: Any, fn, device_spec: Any = None):
+        if torch.is_tensor(value):
+            return fn(value, device_spec)
+        if isinstance(value, list):
+            if isinstance(device_spec, (list, tuple)) and len(device_spec) == len(value):
+                return [
+                    self._map_state_structure(item, fn, child_spec)
+                    for item, child_spec in zip(value, device_spec)
+                ]
+            return [self._map_state_structure(item, fn, device_spec) for item in value]
+        if isinstance(value, tuple):
+            if isinstance(device_spec, (list, tuple)) and len(device_spec) == len(value):
+                return tuple(
+                    self._map_state_structure(item, fn, child_spec)
+                    for item, child_spec in zip(value, device_spec)
+                )
+            return tuple(self._map_state_structure(item, fn, device_spec) for item in value)
+        return value
+
+    def _infer_state_device_spec(self, state: Any, device: Any = None):
+        if device is not None:
+            if isinstance(device, (list, tuple)):
+                replicated = [list(device), list(device), list(device)]
+                if isinstance(state, list) and len(state) > 3:
+                    replicated.append(None)
+                return replicated
+            return device
+
+        if (
+            isinstance(state, list)
+            and len(state) >= 4
+            and isinstance(state[3], (list, tuple))
+        ):
+            device_list = list(state[3])
+            return [device_list, device_list, device_list, None]
+
+        return "cuda"
+
+    def _extract_token_pos(self, value: Any):
+        if torch.is_tensor(value):
+            if value.numel() == 1:
+                return int(value.item())
+            return "batched"
+        if isinstance(value, (list, tuple)):
+            for item in value:
+                token_pos = self._extract_token_pos(item)
+                if token_pos != "unknown":
+                    return token_pos
+        return "unknown"
+
+    def _clone_state(self, state):
         """深拷贝状态，避免多线程共享导致污染"""
-        return [t.clone() for t in state]
+        return self._map_state_structure(
+            state, lambda tensor, _device: tensor.detach().clone()
+        )
 
-    def _clone_to_cpu_state(self, state: List[torch.Tensor]) -> List[torch.Tensor]:
-        return [t.detach().to("cpu").clone() for t in state]
+    def _clone_to_cpu_state(self, state):
+        return self._map_state_structure(
+            state, lambda tensor, _device: tensor.detach().to("cpu").clone()
+        )
 
-    def _clone_to_device_state(self, state: List[torch.Tensor], device: str) -> List[torch.Tensor]:
-        return [t.detach().to(device, non_blocking=device == "cuda").clone() for t in state]
+    def _clone_to_device_state(self, state, device=None):
+        device_spec = self._infer_state_device_spec(state, device)
+
+        def move_tensor(tensor: torch.Tensor, target_device):
+            if target_device is None:
+                return tensor.detach().clone()
+            target_device = str(target_device)
+            return tensor.detach().to(
+                target_device,
+                non_blocking=target_device.startswith("cuda"),
+            ).clone()
+
+        return self._map_state_structure(state, move_tensor, device_spec)
+
+    def _resolve_tensor_device(self, device, fallback="cuda"):
+        if isinstance(device, (list, tuple)):
+            if not device:
+                return fallback
+            return str(device[-1])
+        if device is None:
+            return fallback
+        return str(device)
 
     def _clone_optional_tensor(self, tensor: Optional[torch.Tensor], device: str) -> Optional[torch.Tensor]:
         if tensor is None:
             return None
-        return tensor.detach().to(device, non_blocking=device == "cuda").clone()
+        device_str = self._resolve_tensor_device(device)
+        return tensor.detach().to(
+            device_str,
+            non_blocking=device_str.startswith("cuda"),
+        ).clone()
 
     def _persist_task(self, session_id: str, state_cpu: List[torch.Tensor]):
         """异步任务：序列化并写入数据库"""
@@ -309,7 +388,7 @@ class StateCacheManager:
         if evicted_entry is not None:
             self.io_executor.submit(self._persist_prefix_task, evicted_entry)
 
-    def put_state(self, session_id: str, state: List[torch.Tensor]):
+    def put_state(self, session_id: str, state):
         """
         存入状态。
         流程：
@@ -332,7 +411,7 @@ class StateCacheManager:
                 # popitem(last=False) 弹出最早插入的元素 (FIFO/LRU Oldest)
                 evicted_id, evicted_state_gpu = self.l1_cache.popitem(last=False)
                 
-                evicted_state_cpu = [t.to('cpu', non_blocking=True) for t in evicted_state_gpu]
+                evicted_state_cpu = self._clone_to_cpu_state(evicted_state_gpu)
                 
                 self.l2_cache[evicted_id] = evicted_state_cpu
                 
@@ -341,7 +420,7 @@ class StateCacheManager:
 
                     self.io_executor.submit(self._persist_task, l2_evicted_id, l2_evicted_state_cpu)
 
-    def get_state(self, session_id: str) -> Optional[List[torch.Tensor]]:
+    def get_state(self, session_id: str):
 
         if session_id is None:
             return None
@@ -351,7 +430,7 @@ class StateCacheManager:
             if session_id in self.l1_cache:
                 self.l1_cache.move_to_end(session_id) # 标记为最近使用
                 state = self.l1_cache[session_id]
-                token_pos = state[2].item() if len(state) > 2 and hasattr(state[2], "item") else "unknown"
+                token_pos = self._extract_token_pos(state[2]) if len(state) > 2 else "unknown"
                 print(
                     f"[StatePool][SESSION HIT][L1] session_id={session_id} "
                     f"token_pos={token_pos}"
@@ -361,12 +440,12 @@ class StateCacheManager:
             # Case 2: L2 Hit (RAM)
             if session_id in self.l2_cache:
                 state_cpu = self.l2_cache.pop(session_id)
-                token_pos = state_cpu[2].item() if len(state_cpu) > 2 and hasattr(state_cpu[2], "item") else "unknown"
+                token_pos = self._extract_token_pos(state_cpu[2]) if len(state_cpu) > 2 else "unknown"
                 print(
                     f"[StatePool][SESSION HIT][L2] session_id={session_id} "
                     f"token_pos={token_pos} -> promote_to_l1"
                 )
-                state_gpu = [t.to('cuda', non_blocking=True) for t in state_cpu]
+                state_gpu = self._clone_to_device_state(state_cpu)
                 
                 self.put_state(session_id, state_gpu)
                 return self._clone_state(state_gpu)
@@ -381,12 +460,12 @@ class StateCacheManager:
         if blob:
             try:
                 state_cpu = self._deserialize(blob)
-                token_pos = state_cpu[2].item() if len(state_cpu) > 2 and hasattr(state_cpu[2], "item") else "unknown"
+                token_pos = self._extract_token_pos(state_cpu[2]) if len(state_cpu) > 2 else "unknown"
                 print(
                     f"[StatePool][SESSION HIT][DISK] session_id={session_id} "
                     f"token_pos={token_pos} -> load_to_l1"
                 )
-                state_gpu = [t.to('cuda') for t in state_cpu]
+                state_gpu = self._clone_to_device_state(state_cpu)
                 self.put_state(session_id, state_gpu)
                 return self._clone_state(state_gpu)
             except Exception as e:
@@ -467,7 +546,7 @@ class StateCacheManager:
     def match_prefix_state(
         self,
         prompt_tokens: List[int] | Tuple[int, ...],
-        device: str = "cuda",
+        device=None,
     ) -> Optional[dict]:
         token_tuple = tuple(prompt_tokens)
         if not token_tuple:
@@ -532,7 +611,7 @@ class StateCacheManager:
         
         with self.cache_lock:
             if session_id in self.l1_cache:
-                state_to_save = [t.to('cpu') for t in self.l1_cache.pop(session_id)]
+                state_to_save = self._clone_to_cpu_state(self.l1_cache.pop(session_id))
             elif session_id in self.l2_cache:
                 state_to_save = self.l2_cache.pop(session_id)
         
@@ -552,7 +631,7 @@ class StateCacheManager:
         with self.cache_lock:
             while self.l1_cache:
                 sid, state = self.l1_cache.popitem()
-                items_to_save.append((sid, [t.to('cpu') for t in state]))
+                items_to_save.append((sid, self._clone_to_cpu_state(state)))
             
             while self.l2_cache:
                 sid, state = self.l2_cache.popitem()
