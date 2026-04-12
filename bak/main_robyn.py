@@ -9,7 +9,7 @@ from robyn import Robyn, Response, StreamingResponse, ALLOW_CORS
 from pydantic import BaseModel
 from infer.rwkv_batch.rwkv7 import RWKV_x070
 from infer.rwkv_batch.utils import TRIE_TOKENIZER, sampler_simple_batch, sampler_simple
-from infer.rwkv_batch.sampler import sample
+from infer.rwkv_batch.rwkv7.ops.sampler import sample
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from threading import Lock

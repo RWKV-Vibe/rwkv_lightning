@@ -5,8 +5,8 @@ import time
 
 current_path = os.path.dirname(__file__)
 sources = [
-    os.path.join(current_path, "hip/rwkv_mm_sparsity_op.hip"),
-    os.path.join(current_path, "hip/rwkv_mm_sparsity.hip"),
+    os.path.join(current_path, "infer/rwkv_batch/rwkv7/ops/hip/rwkv_mm_sparsity_op.hip"),
+    os.path.join(current_path, "infer/rwkv_batch/rwkv7/ops/hip/rwkv_mm_sparsity.hip"),
 ]
 
 HEAD_SIZE = 64  

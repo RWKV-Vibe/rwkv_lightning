@@ -8,17 +8,13 @@ DTYPE = torch.half
 ROCm_flag = torch.version.hip is not None
 MyStatic = torch.jit.script 
 
-
 if ROCm_flag == True:
-    load(name="rwkv_mm8", sources=[f"{current_path}/hip/wrapper.hip", 
-                                   f"{current_path}/hip/operators.hip", 
-                                   f"{current_path}/hip/gemm_fp16_cublas.hip"], is_python_module=False,
+    load(name="rwkv_mm8", sources=[f"{current_path}/cuda/mm8_op.cpp", f"{current_path}/cuda/mm8.cu"], is_python_module=False,
                     verbose=True, extra_cuda_cflags=['-fopenmp', '-ffast-math', '-O3', '-munsafe-fp-atomics'])
 else:
-    load(name="rwkv_mm8", sources=[f"{current_path}/cuda/wrapper.cpp", 
-                                   f"{current_path}/cuda/operators.cu", 
-                                   f"{current_path}/cuda/gemm_fp16_cublas.cpp"], is_python_module=False,
-                    verbose=True, extra_cuda_cflags=["-res-usage", "--use_fast_math", "-O3", "--extra-device-vectorization",])
+    load(name="rwkv_mm8", sources=[f"{current_path}/cuda/mm8_op.cpp", f"{current_path}/cuda/mm8.cu"], is_python_module=False,
+                    verbose=True, extra_cuda_cflags=["-res-usage", "--use_fast_math", "-O3", "--extra-device-vectorization",],
+                    extra_ldflags=["-lcublas", "-lcublasLt"])
 
 @MyStatic
 def torch_mm8_seq(x, w, mx, rx, my, ry):

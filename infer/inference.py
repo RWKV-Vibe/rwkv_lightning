@@ -10,7 +10,7 @@ from threading import Event, Lock, Thread
 
 import torch
 
-from infer.rwkv_batch.sampler import sample
+from infer.rwkv_batch.rwkv7.ops.sampler import sample
 from infer.rwkv_batch.utils import sampler_gumbel_batch
 
 

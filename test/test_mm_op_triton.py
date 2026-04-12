@@ -2,11 +2,14 @@ import torch
 import time
 import sys
 import os
+from pathlib import Path
 
 current_path = os.path.dirname(__file__)
 sys.path.insert(0, current_path)
-
-from rwkv_mm_op_triton import rwkv_mm_sparsity
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+from infer.rwkv_batch.rwkv7.ops.ops_loader import rwkv_mm_sparsity
 
 
 def test_performance():
