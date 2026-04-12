@@ -30,8 +30,9 @@ MyDisable = torch.compiler.disable
 HEAD_SIZE = 64
 DTYPE = torch.half
 
-from .Tmix import RWKV_x070_TMix_one, RWKV_x070_TMix_seq, RWKV_x070_TMix_seq_batch
-from .Cmix import RWKV_x070_CMix_one, RWKV_x070_CMix_seq, RWKV_x070_CMix_seq_batch
+from .Tmix import RWKV_x070_TMix_one_i8, RWKV_x070_TMix_seq_i8, RWKV_x070_TMix_seq_batch_i8
+from .Cmix import RWKV_x070_CMix_one_i8, RWKV_x070_CMix_seq_i8, RWKV_x070_CMix_seq_batch_i8
+from .ops.mm_int8_kernel import linear_w8a8
 
 class RWKV_x070(MyModule):
     def __init__(self, args):
@@ -42,33 +43,33 @@ class RWKV_x070(MyModule):
         
         self.z = torch.load(args.MODEL_NAME + '.pth', map_location='cpu')
         z = self.z
-        self.n_head, self.head_size = z['blocks.0.att.r_k'].shape
+        if '__int8_preprocessed' not in z:
+            raise RuntimeError(
+                "modeling_rwkv7_int8 requires a pre-quantized checkpoint. "
+                "Run ./convert_int8_weight.py first."
+            )
+        z.pop('__int8_preprocessed')
+
+        r_k0 = z['blocks.0.att.r_k']
+        if r_k0.dim() == 1:
+            self.head_size = HEAD_SIZE
+            self.n_head = r_k0.numel() // self.head_size
+        else:
+            self.n_head, self.head_size = r_k0.shape
         args.n_embd = self.n_head * self.head_size
 
         assert HEAD_SIZE == self.head_size
         assert self.head_size == args.head_size
 
-        keys = list(z.keys())
         max_layer = -1
-        for k in keys:
+        for k in list(z.keys()):
             kk = k.split('.')
-            # if kk[0] == 'blocks' and int(kk[1]) >= 10:
-            #     continue
-            if 'att.g1' in k or 'att.g2' in k or 'att.a1' in k or 'att.a2' in k or 'att.w1' in k or 'att.w2' in k or 'att.v1' in k or 'att.v2' in k or 'ffn.value.weight' in k:
-                z[k] = z[k].t()
-            z[k] = z[k].squeeze().to(dtype=DTYPE, device="cuda")
-            if k.endswith('att.r_k'): z[k] = z[k].flatten()
-            z[k] = z[k].contiguous()
+            z[k] = z[k].to(device="cuda").contiguous()
             if kk[0] == 'blocks':
                 max_layer = max(max_layer, int(kk[1]))
         args.n_layer = max_layer + 1
         print(args)
         self.n_layer, self.n_embd = args.n_layer, args.n_embd
-
-        z['emb.weight'] = F.layer_norm(z['emb.weight'], (args.n_embd,), weight=z['blocks.0.ln0.weight'], bias=z['blocks.0.ln0.bias'])
-        z['blocks.0.att.v0'] = z['blocks.0.att.a0'] # actually ignored
-        z['blocks.0.att.v1'] = z['blocks.0.att.a1'] # actually ignored
-        z['blocks.0.att.v2'] = z['blocks.0.att.a2'] # actually ignored
 
     def generate_zero_state(self, bsz):
         args = self.args
@@ -146,21 +147,26 @@ class RWKV_x070(MyModule):
 
                 xx = F.layer_norm(x, (self.n_embd,), weight=z[bbb+'ln1.weight'], bias=z[bbb+'ln1.bias'])
 
-                xx, v_first = RWKV_x070_TMix_one(i, self.n_head, self.head_size, xx, state[0][i], v_first, state[1][i],
+                xx, v_first = RWKV_x070_TMix_one_i8(i, self.n_head, self.head_size, xx, state[0][i], v_first, state[1][i],
                     z[att+'x_r'], z[att+'x_w'], z[att+'x_k'], z[att+'x_v'], z[att+'x_a'], z[att+'x_g'],
                     z[att+'w0'], z[att+'w1'], z[att+'w2'], z[att+'a0'], z[att+'a1'], z[att+'a2'], z[att+'v0'], z[att+'v1'], z[att+'v2'],
                     z[att+'g1'], z[att+'g2'], z[att+'k_k'], z[att+'k_a'], z[att+'r_k'],
-                    z[att+'receptance.weight'], z[att+'key.weight'], z[att+'value.weight'], z[att+'output.weight'],
+                    z[att+'receptance.weight.i8_w'], z[att+'receptance.weight.i8_scale'],
+                    z[att+'key.weight.i8_w'], z[att+'key.weight.i8_scale'],
+                    z[att+'value.weight.i8_w'], z[att+'value.weight.i8_scale'],
+                    z[att+'output.weight.i8_w'], z[att+'output.weight.i8_scale'],
                     z[att+'ln_x.weight'], z[att+'ln_x.bias'], state[2])
                 x = x + xx
 
                 xx = F.layer_norm(x, (self.n_embd,), weight=z[bbb+'ln2.weight'], bias=z[bbb+'ln2.bias'])
 
-                xx = RWKV_x070_CMix_one(xx, state[0][i], z[ffn+'x_k'], z[ffn+'key.weight'], z[ffn+'value.weight'])
+                xx = RWKV_x070_CMix_one_i8(xx, state[0][i], z[ffn+'x_k'],
+                    z[ffn+'key.weight.i8_w'], z[ffn+'key.weight.i8_scale'],
+                    z[ffn+'value.weight.i8_w'], z[ffn+'value.weight.i8_scale'])
                 x = x + xx
             
             x = F.layer_norm(x, (self.n_embd,), weight=z['ln_out.weight'], bias=z['ln_out.bias'])
-            x = F.linear(x, z['head.weight'])
+            x = linear_w8a8(x, z['head.weight.i8_w'], z['head.weight.i8_scale'])
             state[2] += 1
             return x
         
@@ -178,22 +184,27 @@ class RWKV_x070(MyModule):
 
                 xx = F.layer_norm(x, (self.n_embd,), weight=z[bbb+'ln1.weight'], bias=z[bbb+'ln1.bias'])
 
-                xx, v_first = RWKV_x070_TMix_seq(i, self.n_head, self.head_size, xx, state[0][i], v_first, state[1][i],
+                xx, v_first = RWKV_x070_TMix_seq_i8(i, self.n_head, self.head_size, xx, state[0][i], v_first, state[1][i],
                     z[att+'x_r'], z[att+'x_w'], z[att+'x_k'], z[att+'x_v'], z[att+'x_a'], z[att+'x_g'],
                     z[att+'w0'], z[att+'w1'], z[att+'w2'], z[att+'a0'], z[att+'a1'], z[att+'a2'], z[att+'v0'], z[att+'v1'], z[att+'v2'],
                     z[att+'g1'], z[att+'g2'], z[att+'k_k'], z[att+'k_a'], z[att+'r_k'],
-                    z[att+'receptance.weight'], z[att+'key.weight'], z[att+'value.weight'], z[att+'output.weight'],
+                    z[att+'receptance.weight.i8_w'], z[att+'receptance.weight.i8_scale'],
+                    z[att+'key.weight.i8_w'], z[att+'key.weight.i8_scale'],
+                    z[att+'value.weight.i8_w'], z[att+'value.weight.i8_scale'],
+                    z[att+'output.weight.i8_w'], z[att+'output.weight.i8_scale'],
                     z[att+'ln_x.weight'], z[att+'ln_x.bias'], state[2])
                 x = x + xx
 
                 xx = F.layer_norm(x, (self.n_embd,), weight=z[bbb+'ln2.weight'], bias=z[bbb+'ln2.bias'])
 
-                xx = RWKV_x070_CMix_seq(xx, state[0][i], z[ffn+'x_k'], z[ffn+'key.weight'], z[ffn+'value.weight'])
+                xx = RWKV_x070_CMix_seq_i8(xx, state[0][i], z[ffn+'x_k'],
+                    z[ffn+'key.weight.i8_w'], z[ffn+'key.weight.i8_scale'],
+                    z[ffn+'value.weight.i8_w'], z[ffn+'value.weight.i8_scale'])
                 x = x + xx
             
             if not full_output: x = x[-1,:]
             x = F.layer_norm(x, (self.n_embd,), weight=z['ln_out.weight'], bias=z['ln_out.bias'])
-            x = F.linear(x, z['head.weight'])
+            x = linear_w8a8(x, z['head.weight.i8_w'], z['head.weight.i8_scale'])
             state[2] += len(idx)
             return x
         
@@ -211,43 +222,43 @@ class RWKV_x070(MyModule):
 
                 xx = F.layer_norm(x, (self.n_embd,), weight=z[bbb+'ln1.weight'], bias=z[bbb+'ln1.bias'])
 
-                xx, v_first = RWKV_x070_TMix_seq_batch(i, self.n_head, self.head_size, xx, state[0][i], v_first, state[1][i],
+                xx, v_first = RWKV_x070_TMix_seq_batch_i8(i, self.n_head, self.head_size, xx, state[0][i], v_first, state[1][i],
                     z[att+'x_r'], z[att+'x_w'], z[att+'x_k'], z[att+'x_v'], z[att+'x_a'], z[att+'x_g'],
                     z[att+'w0'], z[att+'w1'], z[att+'w2'], z[att+'a0'], z[att+'a1'], z[att+'a2'], z[att+'v0'], z[att+'v1'], z[att+'v2'],
                     z[att+'g1'], z[att+'g2'], z[att+'k_k'], z[att+'k_a'], z[att+'r_k'],
-                    z[att+'receptance.weight'], z[att+'key.weight'], z[att+'value.weight'], z[att+'output.weight'],
+                    z[att+'receptance.weight.i8_w'], z[att+'receptance.weight.i8_scale'],
+                    z[att+'key.weight.i8_w'], z[att+'key.weight.i8_scale'],
+                    z[att+'value.weight.i8_w'], z[att+'value.weight.i8_scale'],
+                    z[att+'output.weight.i8_w'], z[att+'output.weight.i8_scale'],
                     z[att+'ln_x.weight'], z[att+'ln_x.bias'], state[2])
                 x = x + xx
 
                 xx = F.layer_norm(x, (self.n_embd,), weight=z[bbb+'ln2.weight'], bias=z[bbb+'ln2.bias'])
 
-                xx = RWKV_x070_CMix_seq_batch(xx, state[0][i], z[ffn+'x_k'], z[ffn+'key.weight'], z[ffn+'value.weight'])
+                xx = RWKV_x070_CMix_seq_batch_i8(xx, state[0][i], z[ffn+'x_k'],
+                    z[ffn+'key.weight.i8_w'], z[ffn+'key.weight.i8_scale'],
+                    z[ffn+'value.weight.i8_w'], z[ffn+'value.weight.i8_scale'])
                 x = x + xx
             
             if not full_output: x = x[:,-1,:]
             x = F.layer_norm(x, (self.n_embd,), weight=z['ln_out.weight'], bias=z['ln_out.bias'])
-            x = F.linear(x, z['head.weight'])
+            x = linear_w8a8(x, z['head.weight.i8_w'], z['head.weight.i8_scale'])
             state[2] += len(idxs[0])
             return x
+
     @MyFunction
     def forward_seq_batch_chunk(self, idxs: List[List[int]], state: List[torch.Tensor], chunk_len: int = 64, full_output: bool = False):
         with torch.no_grad():
             z = self.z
             device = z['emb.weight'].device
-            
-            # 转换为 Tensor，形状为 [Batch, Total_Seq_Len]
             full_idxs = torch.tensor(idxs, device=device)
             batch_size, total_len = full_idxs.size()
-            
-            all_outputs = []
 
-            # 按 chunk_len 进行循环处理
+            all_outputs = []
             for start in range(0, total_len, chunk_len):
                 end = min(start + chunk_len, total_len)
-                # 截取当前的 chunk
                 chunk_idxs = full_idxs[:, start:end]
-                
-                x = z['emb.weight'][chunk_idxs] 
+                x = z['emb.weight'][chunk_idxs]
                 v_first = torch.empty_like(x)
 
                 for i in range(self.n_layer):
@@ -255,26 +266,25 @@ class RWKV_x070(MyModule):
                     att = f'blocks.{i}.att.'
                     ffn = f'blocks.{i}.ffn.'
 
-                    # TimeMix
                     xx = F.layer_norm(x, (self.n_embd,), weight=z[bbb+'ln1.weight'], bias=z[bbb+'ln1.bias'])
-                    
-                    xx, v_first = RWKV_x070_TMix_seq_batch(
-                        i, self.n_head, self.head_size, xx, state[0][i], v_first, state[1][i],
+                    xx, v_first = RWKV_x070_TMix_seq_batch_i8(i, self.n_head, self.head_size, xx, state[0][i], v_first, state[1][i],
                         z[att+'x_r'], z[att+'x_w'], z[att+'x_k'], z[att+'x_v'], z[att+'x_a'], z[att+'x_g'],
                         z[att+'w0'], z[att+'w1'], z[att+'w2'], z[att+'a0'], z[att+'a1'], z[att+'a2'], z[att+'v0'], z[att+'v1'], z[att+'v2'],
                         z[att+'g1'], z[att+'g2'], z[att+'k_k'], z[att+'k_a'], z[att+'r_k'],
-                        z[att+'receptance.weight'], z[att+'key.weight'], z[att+'value.weight'], z[att+'output.weight'],
-                        z[att+'ln_x.weight'], z[att+'ln_x.bias'], state[2]
-                    )
+                        z[att+'receptance.weight.i8_w'], z[att+'receptance.weight.i8_scale'],
+                        z[att+'key.weight.i8_w'], z[att+'key.weight.i8_scale'],
+                        z[att+'value.weight.i8_w'], z[att+'value.weight.i8_scale'],
+                        z[att+'output.weight.i8_w'], z[att+'output.weight.i8_scale'],
+                        z[att+'ln_x.weight'], z[att+'ln_x.bias'], state[2])
                     x = x + xx
 
-                    # ChannelMix
                     xx = F.layer_norm(x, (self.n_embd,), weight=z[bbb+'ln2.weight'], bias=z[bbb+'ln2.bias'])
-                    xx = RWKV_x070_CMix_seq_batch(xx, state[0][i], z[ffn+'x_k'], z[ffn+'key.weight'], z[ffn+'value.weight'])
+                    xx = RWKV_x070_CMix_seq_batch_i8(xx, state[0][i], z[ffn+'x_k'],
+                        z[ffn+'key.weight.i8_w'], z[ffn+'key.weight.i8_scale'],
+                        z[ffn+'value.weight.i8_w'], z[ffn+'value.weight.i8_scale'])
                     x = x + xx
 
                 state[2] += (end - start)
-                
                 if full_output:
                     all_outputs.append(x)
                 else:
@@ -282,10 +292,7 @@ class RWKV_x070(MyModule):
                         all_outputs.append(x[:, -1, :])
 
             x = torch.cat(all_outputs, dim=1) if full_output else all_outputs[0]
-            
             x = F.layer_norm(x, (self.n_embd,), weight=z['ln_out.weight'], bias=z['ln_out.bias'])
-            x = F.linear(x, z['head.weight'])
-            
+            x = linear_w8a8(x, z['head.weight.i8_w'], z['head.weight.i8_scale'])
             return x
-
 

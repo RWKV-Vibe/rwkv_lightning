@@ -29,11 +29,11 @@ args.head_size = 64
 # args.MODEL_NAME = "/mnt/e/RWKV-Runner/models/rwkv7-g1a-0.4b-20250905-ctx4096"
 # args.MODEL_NAME = "/mnt/e/RWKV-Runner/models/rwkv7-g1-1.5b-20250429-ctx4096"
 # args.MODEL_NAME = "/mnt/e/RWKV-Runner/models/rwkv7-g1-2.9b-20250519-ctx4096"
-args.MODEL_NAME = "/mnt/pc411_data/rwkv_translate/rwkv7-g1e-2.9b-20260312-ctx8192"
+args.MODEL_NAME = "/mnt/pc411_data/rwkv_translate/rwkv7-g1e-2.9b-20260312-ctx8192_w8a8"
 
 print(f'\nUsing CUDA fp16. Loading {args.MODEL_NAME} ...\n')
 
-from infer.rwkv_batch.rwkv7.modeling_rwkv7 import RWKV_x070
+from infer.rwkv_batch.rwkv7.modeling_rwkv7_int8 import RWKV_x070
 model = RWKV_x070(args)
 
 PARAM_BYTES = 2
@@ -212,7 +212,7 @@ print(f'\n\nToken/s = {round(1/times,2)} (forward), {round(1/all_times,2)} (full
 xprint("Decode (batch)")
 
 # for BSZ in [2**n for n in range(1,8)] + [128 + n for n in range(8, 512+8, 8)]:
-for BSZ in [8, 16, 16, 16, 32, 32, 32, 64, 64, 64, 128, 128, 128]:
+for BSZ in [8, 16, 16, 16, 32, 32, 32, 64, 64, 64, 128, 128, 128, 256, 256, 256]:
     torch.cuda.empty_cache()
     gc.collect()
     torch.cuda.empty_cache()
@@ -273,7 +273,7 @@ for BSZ in [8, 16, 16, 16, 32, 32, 32, 64, 64, 64, 128, 128, 128]:
             print('#'*80)
 
     print(f'Bsz {BSZ} || Token/s = {round(nnn/times,2)} (forward), {round(nnn/all_times,2)} (full) || {round(time.perf_counter()-t000,3)}s')
-
+# exit(0)
 ########################################################################################################
 
 xprint('MMLU')

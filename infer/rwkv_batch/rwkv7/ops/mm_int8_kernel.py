@@ -68,6 +68,40 @@ def mm8_torch(x, w, mx, rx, my, ry):
     y = torch_mm8_seq(x.view(B * T, C), w, mx, rx, my, ry)
     return y.view(B, T, -1)
 
+
+@MyStatic
+def cuda_mm8_prequant_seq(B: int, N: int, M: int, x, w, scale):
+    y = torch.empty((B, M), device=w.device, dtype=x.dtype)
+    torch.ops.rwkv.mm8_prequant_seq(B, N, M, x, w, scale, y)
+    return y
+
+@MyStatic
+def cuda_mm8_prequant_one(N: int, M: int, x, w, scale):
+    y = torch.zeros((M,), device=w.device, dtype=torch.float32)
+    torch.ops.rwkv.mm8_prequant_one(N, M, x, w, scale, y)
+    return y.to(dtype=x.dtype)
+
+@MyStatic
+def mm8_prequant_cuda(x, w, scale):
+    if len(x.shape) == 1:
+        N, M = w.shape[0], w.shape[1]
+        return cuda_mm8_prequant_one(N, M, x, w, scale)
+    if len(x.shape) == 2:
+        B, N, M = x.shape[0], w.shape[0], w.shape[1]
+        return cuda_mm8_prequant_seq(B, N, M, x, w, scale)
+    B, T, C = x.shape
+    N, M = w.shape[0], w.shape[1]
+    y = cuda_mm8_prequant_seq(B * T, N, M, x.view(B * T, C), w, scale)
+    return y.view(B, T, -1)
+
+@MyStatic
+def linear_w8a8(x, w, scale):
+    if w.dtype != torch.int8:
+        raise TypeError(f"linear_w8a8 only supports int8 weight, got {w.dtype}")
+    if scale.dtype != torch.float32:
+        raise TypeError(f"linear_w8a8 only supports float32 scale, got {scale.dtype}")
+    return mm8_prequant_cuda(x, w, scale)
+
 @MyStatic
 def linear_i8(x, w, mx, rx, my, ry):
     if w.dtype != torch.uint8:

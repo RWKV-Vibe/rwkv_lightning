@@ -290,9 +290,13 @@ void mm8_w8a8_int8(
     }
 
     auto quantized_weight = get_cached_w8a8_weight(w, mx, rx, my, ry);
-    auto x_q = torch::empty({B, N}, x.options().dtype(torch::kInt8));
-    auto x_scale = torch::empty({B}, x.options().dtype(torch::kFloat));
-    auto acc = torch::empty({B, M}, x.options().dtype(torch::kInt32));
+    const int64_t B_padded = (B == 1) ? 1 : ((B + 31) / 32) * 32;
+    auto x_q = torch::empty({B_padded, N}, x.options().dtype(torch::kInt8));
+    if (B_padded != B) {
+        x_q.zero_();
+    }
+    auto x_scale = torch::empty({B_padded}, x.options().dtype(torch::kFloat));
+    auto acc = torch::empty({B_padded, M}, x.options().dtype(torch::kInt32));
 
     quantize_rows_fp16_kernel<<<B, 256>>>(
         reinterpret_cast<const __half*>(x.data_ptr<at::Half>()),
@@ -321,6 +325,73 @@ void mm8_w8a8_int8(
             acc.data_ptr<int32_t>(),
             x_scale.data_ptr<float>(),
             quantized_weight.scale.data_ptr<float>(),
+            y.data_ptr<float>(),
+            y.stride(0),
+            B,
+            M);
+    } else {
+        throw std::runtime_error("mm8 W8A8 output must be FP16 or FP32");
+    }
+    CUDA_CHECK(cudaGetLastError());
+}
+
+
+void mm8_w8a8_prequant_int8(
+    int64_t B,
+    int64_t N,
+    int64_t M,
+    const torch::Tensor& x,
+    const torch::Tensor& w_q,
+    const torch::Tensor& w_scale,
+    const torch::Tensor& y) {
+    if (x.scalar_type() != torch::kHalf) {
+        throw std::runtime_error("mm8 W8A8 only supports FP16 activations before dynamic quantization");
+    }
+    if (w_q.scalar_type() != torch::kChar) {
+        throw std::runtime_error("mm8 W8A8 prequant weight must be int8");
+    }
+    if (w_scale.scalar_type() != torch::kFloat) {
+        throw std::runtime_error("mm8 W8A8 prequant weight scale must be FP32");
+    }
+    if ((N % 4) != 0 || (M % 4) != 0) {
+        throw std::runtime_error("mm8 W8A8 requires N and M to be multiples of 4 for INT8 Tensor Core GEMM");
+    }
+
+    const int64_t B_padded = (B == 1) ? 1 : ((B + 31) / 32) * 32;
+    auto x_q = torch::empty({B_padded, N}, x.options().dtype(torch::kInt8));
+    if (B_padded != B) {
+        x_q.zero_();
+    }
+    auto x_scale = torch::empty({B_padded}, x.options().dtype(torch::kFloat));
+    auto acc = torch::empty({B_padded, M}, x.options().dtype(torch::kInt32));
+
+    quantize_rows_fp16_kernel<<<B, 256>>>(
+        reinterpret_cast<const __half*>(x.data_ptr<at::Half>()),
+        x.stride(0),
+        x_q.data_ptr<int8_t>(),
+        x_scale.data_ptr<float>(),
+        B,
+        N);
+    CUDA_CHECK(cudaGetLastError());
+
+    gemm_w8a8_cublaslt(x_q, w_q, acc);
+
+    const int threads = 256;
+    const int blocks = (B * M + threads - 1) / threads;
+    if (y.scalar_type() == torch::kHalf) {
+        dequant_i32_to_fp16_kernel<<<blocks, threads>>>(
+            acc.data_ptr<int32_t>(),
+            x_scale.data_ptr<float>(),
+            w_scale.data_ptr<float>(),
+            reinterpret_cast<__half*>(y.data_ptr<at::Half>()),
+            y.stride(0),
+            B,
+            M);
+    } else if (y.scalar_type() == torch::kFloat) {
+        dequant_i32_to_fp32_kernel<<<blocks, threads>>>(
+            acc.data_ptr<int32_t>(),
+            x_scale.data_ptr<float>(),
+            w_scale.data_ptr<float>(),
             y.data_ptr<float>(),
             y.stride(0),
             B,
@@ -363,3 +434,29 @@ void mm8_one_cuda(
     auto y_2d = y.view({1, y.size(0)});
     mm8_w8a8_int8(1, N, M, x_2d, w, mx, rx, my, ry, y_2d);
 }
+
+void mm8_prequant_seq_cuda(
+    int64_t B,
+    int64_t N,
+    int64_t M,
+    const torch::Tensor& x,
+    const torch::Tensor& w_q,
+    const torch::Tensor& w_scale,
+    torch::Tensor& y) {
+    const at::cuda::OptionalCUDAGuard device_guard(device_of(w_q));
+    mm8_w8a8_prequant_int8(B, N, M, x, w_q, w_scale, y);
+}
+
+void mm8_prequant_one_cuda(
+    int64_t N,
+    int64_t M,
+    const torch::Tensor& x,
+    const torch::Tensor& w_q,
+    const torch::Tensor& w_scale,
+    torch::Tensor& y) {
+    const at::cuda::OptionalCUDAGuard device_guard(device_of(w_q));
+    auto x_2d = x.view({1, x.size(0)});
+    auto y_2d = y.view({1, y.size(0)});
+    mm8_w8a8_prequant_int8(1, N, M, x_2d, w_q, w_scale, y_2d);
+}
+
