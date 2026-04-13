@@ -9,6 +9,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from infer.rwkv_batch.rwkv7.ops.mm_int8_kernel import *
+from convert_int8_weight import quantize_w8a8_weight_cpu
 
 DTYPE = torch.half
 ROCm_flag = torch.version.hip is not None
@@ -96,6 +97,32 @@ def _run_mm8_linear_test_with_bias(device: torch.device):
     _assert_w8a8_total_error(stats)
     print(f"[mm8 linear bias W8A8 vs FP16] {_format_error_stats(stats)}")
 
+
+def _run_prequant_linear_w8a8_test(device: torch.device):
+    x = torch.randn(37, 64, device=device, dtype=DTYPE)
+    w_ref = torch.randn(32, 64, device=device, dtype=DTYPE)
+
+    w_q, scale = quantize_w8a8_weight_cpu(w_ref)
+    y_ref = F.linear(x, w_ref)
+    y_out = linear_w8a8(x, w_q.to(device), scale.to(device))
+
+    stats = _error_stats(y_ref, y_out)
+    _assert_w8a8_total_error(stats)
+    print(f"[prequant linear_w8a8 vs FP16] {_format_error_stats(stats)}")
+
+
+def _run_prequant_linear_w8a8_3d_test(device: torch.device):
+    x = torch.randn(5, 7, 64, device=device, dtype=DTYPE)
+    w_ref = torch.randn(32, 64, device=device, dtype=DTYPE)
+
+    w_q, scale = quantize_w8a8_weight_cpu(w_ref)
+    y_ref = F.linear(x, w_ref)
+    y_out = linear_w8a8(x, w_q.to(device), scale.to(device))
+
+    stats = _error_stats(y_ref, y_out)
+    _assert_w8a8_total_error(stats)
+    print(f"[prequant linear_w8a8 3D vs FP16] {_format_error_stats(stats)}")
+
 def _benchmark_mm8_linear_large_batch(device: torch.device):
     print("======mm8 linear large-batch benchmark======")
     # 固定 weight shape: [out_features=4096, in_features=4096]
@@ -157,6 +184,10 @@ def main():
     _run_mm8_linear_test(device)
     print("======mm8 linear with bias======")
     _run_mm8_linear_test_with_bias(device)
+    print("======prequant linear_w8a8======")
+    _run_prequant_linear_w8a8_test(device)
+    print("======prequant linear_w8a8 3D======")
+    _run_prequant_linear_w8a8_3d_test(device)
 
     _benchmark_mm8_linear_large_batch(device)
 

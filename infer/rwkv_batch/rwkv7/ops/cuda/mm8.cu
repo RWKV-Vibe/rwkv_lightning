@@ -2,7 +2,7 @@
 
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
-#include <cublasLt.h>
+#include <cublas_v2.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
@@ -202,12 +202,12 @@ __global__ void dequant_i32_to_fp32_kernel(
     y[row * y_stride + col] = static_cast<float>(acc[idx]) * x_scale[row] * w_scale[col];
 }
 
-void gemm_w8a8_cublaslt(torch::Tensor x_q, torch::Tensor w_q, torch::Tensor acc) {
+void gemm_w8a8_cublas(torch::Tensor x_q, torch::Tensor w_q, torch::Tensor acc) {
     const at::cuda::OptionalCUDAGuard device_guard(device_of(x_q));
     const int32_t alpha = 1;
     const int32_t beta = 0;
 
-    // Row-major X[B, N] @ W[N, M] has the same bytes as column-major
+    // Row-major X[B, N] @ W[N, M] is represented as column-major
     // W^T[M, N] @ X^T[N, B] -> Y^T[M, B].
     const int m = w_q.size(1);
     const int n = x_q.size(0);
@@ -216,59 +216,27 @@ void gemm_w8a8_cublaslt(torch::Tensor x_q, torch::Tensor w_q, torch::Tensor acc)
     const int ldb = k;
     const int ldc = m;
 
-    cublasLtHandle_t handle = at::cuda::getCurrentCUDABlasLtHandle();
-    cublasLtMatmulDesc_t op_desc = nullptr;
-    cublasLtMatrixLayout_t a_desc = nullptr;
-    cublasLtMatrixLayout_t b_desc = nullptr;
-    cublasLtMatrixLayout_t c_desc = nullptr;
-    cublasLtMatmulPreference_t pref = nullptr;
-
-    CUBLAS_CHECK(cublasLtMatmulDescCreate(&op_desc, CUBLAS_COMPUTE_32I, CUDA_R_32I));
-    const cublasOperation_t trans = CUBLAS_OP_N;
-    CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(op_desc, CUBLASLT_MATMUL_DESC_TRANSA, &trans, sizeof(trans)));
-    CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(op_desc, CUBLASLT_MATMUL_DESC_TRANSB, &trans, sizeof(trans)));
-
-    CUBLAS_CHECK(cublasLtMatrixLayoutCreate(&a_desc, CUDA_R_8I, m, k, lda));
-    CUBLAS_CHECK(cublasLtMatrixLayoutCreate(&b_desc, CUDA_R_8I, k, n, ldb));
-    CUBLAS_CHECK(cublasLtMatrixLayoutCreate(&c_desc, CUDA_R_32I, m, n, ldc));
-
-    CUBLAS_CHECK(cublasLtMatmulPreferenceCreate(&pref));
-    size_t workspace_size = at::cuda::getCUDABlasLtWorkspaceSize();
-    void* workspace = at::cuda::getCUDABlasLtWorkspace();
-    CUBLAS_CHECK(cublasLtMatmulPreferenceSetAttribute(
-        pref, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &workspace_size, sizeof(workspace_size)));
-
-    cublasLtMatmulHeuristicResult_t heuristic = {};
-    int returned = 0;
-    CUBLAS_CHECK(cublasLtMatmulAlgoGetHeuristic(
-        handle, op_desc, a_desc, b_desc, c_desc, c_desc, pref, 1, &heuristic, &returned));
-    if (returned == 0) {
-        throw std::runtime_error("cuBLASLt found no W8A8 INT8 matmul algorithm");
-    }
-
-    CUBLAS_CHECK(cublasLtMatmul(
+    cublasHandle_t handle = at::cuda::getCurrentCUDABlasHandle();
+    CUBLAS_CHECK(cublasGemmEx(
         handle,
-        op_desc,
+        CUBLAS_OP_N,
+        CUBLAS_OP_N,
+        m,
+        n,
+        k,
         &alpha,
         w_q.data_ptr(),
-        a_desc,
+        CUDA_R_8I,
+        lda,
         x_q.data_ptr(),
-        b_desc,
+        CUDA_R_8I,
+        ldb,
         &beta,
         acc.data_ptr(),
-        c_desc,
-        acc.data_ptr(),
-        c_desc,
-        &heuristic.algo,
-        workspace,
-        workspace_size,
-        at::cuda::getCurrentCUDAStream()));
-
-    CUBLAS_CHECK(cublasLtMatmulPreferenceDestroy(pref));
-    CUBLAS_CHECK(cublasLtMatrixLayoutDestroy(c_desc));
-    CUBLAS_CHECK(cublasLtMatrixLayoutDestroy(b_desc));
-    CUBLAS_CHECK(cublasLtMatrixLayoutDestroy(a_desc));
-    CUBLAS_CHECK(cublasLtMatmulDescDestroy(op_desc));
+        CUDA_R_32I,
+        ldc,
+        CUDA_R_32I,
+        CUBLAS_GEMM_DEFAULT_TENSOR_OP));
 }
 
 void mm8_w8a8_int8(
@@ -307,7 +275,7 @@ void mm8_w8a8_int8(
         N);
     CUDA_CHECK(cudaGetLastError());
 
-    gemm_w8a8_cublaslt(x_q, quantized_weight.q, acc);
+    gemm_w8a8_cublas(x_q, quantized_weight.q, acc);
 
     const int threads = 256;
     const int blocks = (B * M + threads - 1) / threads;
@@ -374,7 +342,7 @@ void mm8_w8a8_prequant_int8(
         N);
     CUDA_CHECK(cudaGetLastError());
 
-    gemm_w8a8_cublaslt(x_q, w_q, acc);
+    gemm_w8a8_cublas(x_q, w_q, acc);
 
     const int threads = 256;
     const int blocks = (B * M + threads - 1) / threads;
