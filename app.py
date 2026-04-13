@@ -14,12 +14,13 @@ def parse_args():
     parser.add_argument("--model-path", type=str, required=True, help="RWKV model path")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--password", type=str, default=None, help="API password for authentication")
+    parser.add_argument("--w8a8", action="store_true", help="Load a preprocessed W8A8 int8 RWKV-7 checkpoint")
     return parser.parse_args()
 
 
 def main():
     args_cli = parse_args()
-    model, tokenizer, args, rocm_flag = load_model_and_tokenizer(args_cli.model_path)
+    model, tokenizer, args, rocm_flag = load_model_and_tokenizer(args_cli.model_path, w8a8=args_cli.w8a8)
     engine = InferenceEngine(model=model, tokenizer=tokenizer, args=args, rocm_flag=rocm_flag)
     app = create_app(engine, password=args_cli.password)
 

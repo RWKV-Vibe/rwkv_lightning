@@ -98,6 +98,7 @@ setattr(
     ),
 )
 sys.modules.setdefault("infer.rwkv_batch.sampler", sampler_stub)
+sys.modules.setdefault("infer.rwkv_batch.rwkv7.ops.sampler", sampler_stub)
 
 utils_stub = ModuleType("infer.rwkv_batch.utils")
 setattr(utils_stub, "sampler_gumbel_batch", lambda logits, temp: FakeScalar(0))
@@ -311,7 +312,20 @@ async def test_batch_infer_stream_state_respects_chunk_size() -> None:
     print("[PASS] test_batch_infer_stream_state_respects_chunk_size")
 
 
+def test_model_device_supports_int8_head_only() -> None:
+    engine = _make_engine()
+    engine.model.z = {"emb.weight": FakeTensor(), "head.weight.i8_w": FakeTensor()}
+
+    _assert_equal(
+        engine._model_device().type,
+        "cuda",
+        "InferenceEngine should infer device from int8 head weights when FP16 head is absent",
+    )
+    print("[PASS] test_model_device_supports_int8_head_only")
+
+
 async def main() -> None:
+    test_model_device_supports_int8_head_only()
     await test_graph_generate_respects_max_generate_tokens()
     await test_graph_infer_stream_stops_on_initial_stop_token()
     await test_graph_infer_stream_falls_back_without_cuda()

@@ -212,7 +212,7 @@ print(f'\n\nToken/s = {round(1/times,2)} (forward), {round(1/all_times,2)} (full
 xprint("Decode (batch)")
 
 # for BSZ in [2**n for n in range(1,8)] + [128 + n for n in range(8, 512+8, 8)]:
-for BSZ in [8, 16, 16, 16, 32, 32, 32, 64, 64, 64, 128, 128, 128, 256, 256, 256]:
+for BSZ in [8, 8 ,8]:
     torch.cuda.empty_cache()
     gc.collect()
     torch.cuda.empty_cache()

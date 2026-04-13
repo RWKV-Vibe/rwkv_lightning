@@ -8,7 +8,7 @@ MyStatic = torch.jit.script
 current_path = os.path.dirname(os.path.abspath(__file__))
 
 if ROCm_flag == True:
-    load(name="rwkv_mm8", sources=[f"{current_path}/cuda/mm8_op.cpp", f"{current_path}/cuda/mm8.cu"], is_python_module=False,
+    load(name="rwkv_mm8", sources=[f"{current_path}/hip/mm8_op.cpp", f"{current_path}/hip/mm8.hip"], is_python_module=False,
                     verbose=True, extra_cuda_cflags=['-fopenmp', '-ffast-math', '-O3', '-munsafe-fp-atomics'])
 else:
     load(name="rwkv_mm8", sources=[f"{current_path}/cuda/mm8_op.cpp", f"{current_path}/cuda/mm8.cu"], is_python_module=False,

@@ -1,102 +1,429 @@
 #include <torch/extension.h>
-#include "ATen/ATen.h"
-#include <iostream>
-#include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
 
-typedef at::Half fp16;
+#include <ATen/hip/HIPContext.h>
+#include <c10/hip/HIPGuard.h>
+#include <hipblas/hipblas.h>
+#include <hip/hip_fp16.h>
+#include <hip/hip_runtime.h>
 
-template <typename F>
-void cuda_mm8_seq(int B, int N, int M,
-                  F *x, int x_stride,
-                  uint8_t *w, int w_stride,
-                  F *mx, F *rx,
-                  F *my, F *ry,
-                  F *y, int y_stride);
-template <typename F>
-void cuda_mm8_one(int N, int M,
-                  F *x,
-                  uint8_t *w, int w_stride,
-                  F *mx, F *rx,
-                  F *my, F *ry,
-                  float *y);
+#include <cmath>
+#include <mutex>
+#include <stdexcept>
+#include <string>
+#include <unordered_map>
 
-void mm8_seq(int64_t B, int64_t N, int64_t M,
-             torch::Tensor &x, torch::Tensor &w,
-             torch::Tensor &mx, torch::Tensor &rx,
-             torch::Tensor &my, torch::Tensor &ry,
-             torch::Tensor &y) {
-    assert(x.stride(1) == 1);
-    assert(w.stride(1) == 1);
-    assert(mx.stride(0) == 1 && rx.stride(0) == 1);
-    assert(my.stride(0) == 1 && ry.stride(0) == 1);
-    assert(y.stride(1) == 1);
-    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(w));
-    switch (x.scalar_type()) {
-    case c10::ScalarType::Half:
-        cuda_mm8_seq(
-            B, N, M,
-            x.data_ptr<fp16>(), x.stride(0),
-            w.data_ptr<uint8_t>(), w.stride(0),
-            mx.data_ptr<fp16>(), rx.data_ptr<fp16>(),
-            my.data_ptr<fp16>(), ry.data_ptr<fp16>(),
-            y.data_ptr<fp16>(), y.stride(0));
-        break;
-    case c10::ScalarType::Float:
-        cuda_mm8_seq(
-            B, N, M,
-            x.data_ptr<float>(), x.stride(0),
-            w.data_ptr<uint8_t>(), w.stride(0),
-            mx.data_ptr<float>(), rx.data_ptr<float>(),
-            my.data_ptr<float>(), ry.data_ptr<float>(),
-            y.data_ptr<float>(), y.stride(0));
-        break;
-    default:
-        assert(false && "Only FP16 and FP32 are currently supported");
+#define CUBLAS_CHECK(condition)                                                \
+  for (hipblasStatus_t _cublas_check_status = (condition);                      \
+       _cublas_check_status != HIPBLAS_STATUS_SUCCESS;)                         \
+    throw std::runtime_error("cuBLAS error " +                                 \
+                             std::to_string(_cublas_check_status) + " at " +   \
+                             std::to_string(__LINE__));
+
+#define CUDA_CHECK(condition)                                                  \
+  for (hipError_t _cuda_check_status = (condition);                           \
+       _cuda_check_status != hipSuccess;)                                     \
+    throw std::runtime_error(                                                  \
+        "CUDA error " + std::string(hipGetErrorString(_cuda_check_status)) +  \
+        " at " + std::to_string(__LINE__));
+
+namespace {
+
+struct CacheKey {
+    const void* w_impl;
+    const void* mx_impl;
+    const void* rx_impl;
+    const void* my_impl;
+    const void* ry_impl;
+
+    bool operator==(const CacheKey& other) const {
+        return w_impl == other.w_impl &&
+               mx_impl == other.mx_impl &&
+               rx_impl == other.rx_impl &&
+               my_impl == other.my_impl &&
+               ry_impl == other.ry_impl;
+    }
+};
+
+struct CacheKeyHash {
+    size_t operator()(const CacheKey& key) const {
+        size_t seed = 0;
+        auto hash_combine = [&seed](size_t value) {
+            seed ^= value + 0x9e3779b9 + (seed << 6) + (seed >> 2);
+        };
+
+        hash_combine(std::hash<const void*>()(key.w_impl));
+        hash_combine(std::hash<const void*>()(key.mx_impl));
+        hash_combine(std::hash<const void*>()(key.rx_impl));
+        hash_combine(std::hash<const void*>()(key.my_impl));
+        hash_combine(std::hash<const void*>()(key.ry_impl));
+        return seed;
+    }
+};
+
+struct W8A8Weight {
+    torch::Tensor q;
+    torch::Tensor scale;
+};
+
+std::mutex& w8a8_cache_mutex() {
+    static std::mutex mutex;
+    return mutex;
+}
+
+std::unordered_map<CacheKey, W8A8Weight, CacheKeyHash>& w8a8_weight_cache() {
+    static std::unordered_map<CacheKey, W8A8Weight, CacheKeyHash> cache;
+    return cache;
+}
+
+CacheKey make_cache_key(
+    const torch::Tensor& w,
+    const torch::Tensor& mx,
+    const torch::Tensor& rx,
+    const torch::Tensor& my,
+    const torch::Tensor& ry) {
+    return CacheKey{
+        w.unsafeGetTensorImpl(),
+        mx.unsafeGetTensorImpl(),
+        rx.unsafeGetTensorImpl(),
+        my.unsafeGetTensorImpl(),
+        ry.unsafeGetTensorImpl(),
+    };
+}
+
+W8A8Weight get_cached_w8a8_weight(
+    const torch::Tensor& w,
+    const torch::Tensor& mx,
+    const torch::Tensor& rx,
+    const torch::Tensor& my,
+    const torch::Tensor& ry) {
+    const auto key = make_cache_key(w, mx, rx, my, ry);
+
+    {
+        std::lock_guard<std::mutex> lock(w8a8_cache_mutex());
+        auto& cache = w8a8_weight_cache();
+        auto it = cache.find(key);
+        if (it != cache.end()) {
+            return it->second;
+        }
+    }
+
+    auto weight = w.to(torch::kFloat).add(0.5);
+    weight = weight.mul(ry.to(torch::kFloat));
+    weight = weight.mul(rx.to(torch::kFloat));
+    weight = weight.add(my.to(torch::kFloat));
+    weight = weight.add(mx.to(torch::kFloat));
+
+    auto scale = std::get<0>(weight.abs().max(0)).div(127.0).clamp_min(1.0e-8).contiguous();
+    auto q = weight.div(scale).round().clamp(-127, 127).to(torch::kInt8).contiguous();
+    W8A8Weight quantized{q, scale};
+
+    {
+        std::lock_guard<std::mutex> lock(w8a8_cache_mutex());
+        auto& cache = w8a8_weight_cache();
+        auto [it, inserted] = cache.emplace(key, quantized);
+        if (!inserted) {
+            return it->second;
+        }
+    }
+
+    return quantized;
+}
+
+__global__ void quantize_rows_fp16_kernel(
+    const __half* __restrict__ x,
+    int x_stride,
+    int8_t* __restrict__ q,
+    float* __restrict__ scale,
+    int B,
+    int N) {
+    const int row = blockIdx.x;
+    __shared__ float shared[256];
+
+    float local_max = 0.0f;
+    for (int col = threadIdx.x; col < N; col += blockDim.x) {
+        local_max = fmaxf(local_max, fabsf(__half2float(x[row * x_stride + col])));
+    }
+    shared[threadIdx.x] = local_max;
+    __syncthreads();
+
+    for (int offset = blockDim.x / 2; offset > 0; offset >>= 1) {
+        if (threadIdx.x < offset) {
+            shared[threadIdx.x] = fmaxf(shared[threadIdx.x], shared[threadIdx.x + offset]);
+        }
+        __syncthreads();
+    }
+
+    const float row_scale = fmaxf(shared[0] / 127.0f, 1.0e-8f);
+    if (threadIdx.x == 0) {
+        scale[row] = row_scale;
+    }
+
+    for (int col = threadIdx.x; col < N; col += blockDim.x) {
+        float v = nearbyintf(__half2float(x[row * x_stride + col]) / row_scale);
+        v = fminf(127.0f, fmaxf(-127.0f, v));
+        q[row * N + col] = static_cast<int8_t>(v);
     }
 }
-void mm8_one(int64_t N, int64_t M,
-             torch::Tensor &x, torch::Tensor &w,
-             torch::Tensor &mx, torch::Tensor &rx,
-             torch::Tensor &my, torch::Tensor &ry,
-             torch::Tensor &y) {
-    assert(x.stride(0) == 1);
-    assert(w.stride(1) == 1);
-    assert(mx.stride(0) == 1 && rx.stride(0) == 1);
-    assert(my.stride(0) == 1 && ry.stride(0) == 1);
-    assert(y.stride(0) == 1);
-    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(w));
-    switch (x.scalar_type()) {
-    case c10::ScalarType::Half:
-        cuda_mm8_one(
-            N, M,
-            x.data_ptr<fp16>(),
-            w.data_ptr<uint8_t>(), w.stride(0),
-            mx.data_ptr<fp16>(), rx.data_ptr<fp16>(),
-            my.data_ptr<fp16>(), ry.data_ptr<fp16>(),
-            y.data_ptr<float>());
-        break;
-    case c10::ScalarType::Float:
-        cuda_mm8_one(
-            N, M,
-            x.data_ptr<float>(),
-            w.data_ptr<uint8_t>(), w.stride(0),
-            mx.data_ptr<float>(), rx.data_ptr<float>(),
-            my.data_ptr<float>(), ry.data_ptr<float>(),
-            y.data_ptr<float>());
-        break;
-    default:
-        assert(false && "Only FP16 and FP32 are currently supported");
+
+__global__ void dequant_i32_to_fp16_kernel(
+    const int32_t* __restrict__ acc,
+    const float* __restrict__ x_scale,
+    const float* __restrict__ w_scale,
+    __half* __restrict__ y,
+    int y_stride,
+    int B,
+    int M) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int total = B * M;
+    if (idx >= total) {
+        return;
     }
+    const int row = idx / M;
+    const int col = idx - row * M;
+    const float value = static_cast<float>(acc[idx]) * x_scale[row] * w_scale[col];
+    y[row * y_stride + col] = __float2half(value);
 }
 
-using torch::Tensor;
-
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("mm8_seq", &mm8_seq, "mm8 seq");
-    m.def("mm8_one", &mm8_one, "mm8 one");
+__global__ void dequant_i32_to_fp32_kernel(
+    const int32_t* __restrict__ acc,
+    const float* __restrict__ x_scale,
+    const float* __restrict__ w_scale,
+    float* __restrict__ y,
+    int y_stride,
+    int B,
+    int M) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int total = B * M;
+    if (idx >= total) {
+        return;
+    }
+    const int row = idx / M;
+    const int col = idx - row * M;
+    y[row * y_stride + col] = static_cast<float>(acc[idx]) * x_scale[row] * w_scale[col];
 }
 
-TORCH_LIBRARY(rwkv, m) {
-    m.def("mm8_seq", mm8_seq);
-    m.def("mm8_one", mm8_one);
+void gemm_w8a8_cublas(torch::Tensor x_q, torch::Tensor w_q, torch::Tensor acc) {
+    const at::cuda::OptionalCUDAGuard device_guard(device_of(x_q));
+    const int32_t alpha = 1;
+    const int32_t beta = 0;
+
+    // Row-major X[B, N] @ W[N, M] is represented as column-major
+    // W^T[M, N] @ X^T[N, B] -> Y^T[M, B].
+    const int m = w_q.size(1);
+    const int n = x_q.size(0);
+    const int k = x_q.size(1);
+    const int lda = m;
+    const int ldb = k;
+    const int ldc = m;
+
+    hipblasHandle_t handle = at::cuda::getCurrentCUDABlasHandle();
+    CUBLAS_CHECK(hipblasGemmEx(
+        handle,
+        HIPBLAS_OP_N,
+        HIPBLAS_OP_N,
+        m,
+        n,
+        k,
+        &alpha,
+        w_q.data_ptr(),
+        HIP_R_8I,
+        lda,
+        x_q.data_ptr(),
+        HIP_R_8I,
+        ldb,
+        &beta,
+        acc.data_ptr(),
+        HIP_R_32I,
+        ldc,
+        HIPBLAS_COMPUTE_32I,
+        HIPBLAS_GEMM_DEFAULT));
+}
+
+void mm8_w8a8_int8(
+    int64_t B,
+    int64_t N,
+    int64_t M,
+    const torch::Tensor& x,
+    const torch::Tensor& w,
+    const torch::Tensor& mx,
+    const torch::Tensor& rx,
+    const torch::Tensor& my,
+    const torch::Tensor& ry,
+    const torch::Tensor& y) {
+    if (x.scalar_type() != torch::kHalf) {
+        throw std::runtime_error("mm8 W8A8 only supports FP16 activations before dynamic quantization");
+    }
+    if ((N % 4) != 0 || (M % 4) != 0) {
+        throw std::runtime_error("mm8 W8A8 requires N and M to be multiples of 4 for INT8 Tensor Core GEMM");
+    }
+
+    auto quantized_weight = get_cached_w8a8_weight(w, mx, rx, my, ry);
+    const int64_t B_padded = (B == 1) ? 1 : ((B + 31) / 32) * 32;
+    auto x_q = torch::empty({B_padded, N}, x.options().dtype(torch::kInt8));
+    if (B_padded != B) {
+        x_q.zero_();
+    }
+    auto x_scale = torch::empty({B_padded}, x.options().dtype(torch::kFloat));
+    auto acc = torch::empty({B_padded, M}, x.options().dtype(torch::kInt32));
+
+   hipLaunchKernelGGL(( quantize_rows_fp16_kernel), dim3(B), dim3(256), 0, 0, 
+        reinterpret_cast<const __half*>(x.data_ptr<at::Half>()),
+        x.stride(0),
+        x_q.data_ptr<int8_t>(),
+        x_scale.data_ptr<float>(),
+        B,
+        N);
+    CUDA_CHECK(hipGetLastError());
+
+    gemm_w8a8_cublas(x_q, quantized_weight.q, acc);
+
+    const int threads = 256;
+    const int blocks = (B * M + threads - 1) / threads;
+    if (y.scalar_type() == torch::kHalf) {
+       hipLaunchKernelGGL(( dequant_i32_to_fp16_kernel), dim3(blocks), dim3(threads), 0, 0, 
+            acc.data_ptr<int32_t>(),
+            x_scale.data_ptr<float>(),
+            quantized_weight.scale.data_ptr<float>(),
+            reinterpret_cast<__half*>(y.data_ptr<at::Half>()),
+            y.stride(0),
+            B,
+            M);
+    } else if (y.scalar_type() == torch::kFloat) {
+       hipLaunchKernelGGL(( dequant_i32_to_fp32_kernel), dim3(blocks), dim3(threads), 0, 0, 
+            acc.data_ptr<int32_t>(),
+            x_scale.data_ptr<float>(),
+            quantized_weight.scale.data_ptr<float>(),
+            y.data_ptr<float>(),
+            y.stride(0),
+            B,
+            M);
+    } else {
+        throw std::runtime_error("mm8 W8A8 output must be FP16 or FP32");
+    }
+    CUDA_CHECK(hipGetLastError());
+}
+
+
+void mm8_w8a8_prequant_int8(
+    int64_t B,
+    int64_t N,
+    int64_t M,
+    const torch::Tensor& x,
+    const torch::Tensor& w_q,
+    const torch::Tensor& w_scale,
+    const torch::Tensor& y) {
+    if (x.scalar_type() != torch::kHalf) {
+        throw std::runtime_error("mm8 W8A8 only supports FP16 activations before dynamic quantization");
+    }
+    if (w_q.scalar_type() != torch::kChar) {
+        throw std::runtime_error("mm8 W8A8 prequant weight must be int8");
+    }
+    if (w_scale.scalar_type() != torch::kFloat) {
+        throw std::runtime_error("mm8 W8A8 prequant weight scale must be FP32");
+    }
+    if ((N % 4) != 0 || (M % 4) != 0) {
+        throw std::runtime_error("mm8 W8A8 requires N and M to be multiples of 4 for INT8 Tensor Core GEMM");
+    }
+
+    const int64_t B_padded = (B == 1) ? 1 : ((B + 31) / 32) * 32;
+    auto x_q = torch::empty({B_padded, N}, x.options().dtype(torch::kInt8));
+    if (B_padded != B) {
+        x_q.zero_();
+    }
+    auto x_scale = torch::empty({B_padded}, x.options().dtype(torch::kFloat));
+    auto acc = torch::empty({B_padded, M}, x.options().dtype(torch::kInt32));
+
+   hipLaunchKernelGGL(( quantize_rows_fp16_kernel), dim3(B), dim3(256), 0, 0, 
+        reinterpret_cast<const __half*>(x.data_ptr<at::Half>()),
+        x.stride(0),
+        x_q.data_ptr<int8_t>(),
+        x_scale.data_ptr<float>(),
+        B,
+        N);
+    CUDA_CHECK(hipGetLastError());
+
+    gemm_w8a8_cublas(x_q, w_q, acc);
+
+    const int threads = 256;
+    const int blocks = (B * M + threads - 1) / threads;
+    if (y.scalar_type() == torch::kHalf) {
+       hipLaunchKernelGGL(( dequant_i32_to_fp16_kernel), dim3(blocks), dim3(threads), 0, 0, 
+            acc.data_ptr<int32_t>(),
+            x_scale.data_ptr<float>(),
+            w_scale.data_ptr<float>(),
+            reinterpret_cast<__half*>(y.data_ptr<at::Half>()),
+            y.stride(0),
+            B,
+            M);
+    } else if (y.scalar_type() == torch::kFloat) {
+       hipLaunchKernelGGL(( dequant_i32_to_fp32_kernel), dim3(blocks), dim3(threads), 0, 0, 
+            acc.data_ptr<int32_t>(),
+            x_scale.data_ptr<float>(),
+            w_scale.data_ptr<float>(),
+            y.data_ptr<float>(),
+            y.stride(0),
+            B,
+            M);
+    } else {
+        throw std::runtime_error("mm8 W8A8 output must be FP16 or FP32");
+    }
+    CUDA_CHECK(hipGetLastError());
+}
+
+}  // namespace
+
+void mm8_seq_cuda(
+    int64_t B,
+    int64_t N,
+    int64_t M,
+    const torch::Tensor& x,
+    const torch::Tensor& w,
+    const torch::Tensor& mx,
+    const torch::Tensor& rx,
+    const torch::Tensor& my,
+    const torch::Tensor& ry,
+    torch::Tensor& y) {
+    const at::cuda::OptionalCUDAGuard device_guard(device_of(w));
+    mm8_w8a8_int8(B, N, M, x, w, mx, rx, my, ry, y);
+}
+
+void mm8_one_cuda(
+    int64_t N,
+    int64_t M,
+    const torch::Tensor& x,
+    const torch::Tensor& w,
+    const torch::Tensor& mx,
+    const torch::Tensor& rx,
+    const torch::Tensor& my,
+    const torch::Tensor& ry,
+    torch::Tensor& y) {
+    const at::cuda::OptionalCUDAGuard device_guard(device_of(w));
+    auto x_2d = x.view({1, x.size(0)});
+    auto y_2d = y.view({1, y.size(0)});
+    mm8_w8a8_int8(1, N, M, x_2d, w, mx, rx, my, ry, y_2d);
+}
+
+void mm8_prequant_seq_cuda(
+    int64_t B,
+    int64_t N,
+    int64_t M,
+    const torch::Tensor& x,
+    const torch::Tensor& w_q,
+    const torch::Tensor& w_scale,
+    torch::Tensor& y) {
+    const at::cuda::OptionalCUDAGuard device_guard(device_of(w_q));
+    mm8_w8a8_prequant_int8(B, N, M, x, w_q, w_scale, y);
+}
+
+void mm8_prequant_one_cuda(
+    int64_t N,
+    int64_t M,
+    const torch::Tensor& x,
+    const torch::Tensor& w_q,
+    const torch::Tensor& w_scale,
+    torch::Tensor& y) {
+    const at::cuda::OptionalCUDAGuard device_guard(device_of(w_q));
+    auto x_2d = x.view({1, x.size(0)});
+    auto y_2d = y.view({1, y.size(0)});
+    mm8_w8a8_prequant_int8(1, N, M, x_2d, w_q, w_scale, y_2d);
 }

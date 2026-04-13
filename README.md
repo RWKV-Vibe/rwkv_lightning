@@ -19,11 +19,21 @@ pip install robyn pydantic ninja numpy
 ```
 
 ## Usage
+### FP16
 ```bash
 python app.py --model-path <your model path> --port <your port number> --password rwkv7_7.2b
 ```
 - if no password, you can do not add ```--password``` flag
 
+### Int8 W8A8
+```bash
+python app.py --model-path <your model path> --port <your port number> --password rwkv7_7.2b --w8a8
+```
+- Use ```convert_int8_weight.py```to convert the model to int8 weight
+
+```bash
+python convert_int8_weight.py --input <your model path> --output <your output path>
+```
 
 ## Test API quickly
 ```bash

@@ -85,6 +85,17 @@ class InferenceEngine:
         gc.collect()
         torch.cuda.empty_cache()
 
+    def _model_device(self):
+        z = getattr(self.model, "z", {})
+        for key in ("head.weight", "head.weight.i8_w", "emb.weight"):
+            tensor = z.get(key)
+            if tensor is not None and hasattr(tensor, "device"):
+                return tensor.device
+        for tensor in z.values():
+            if hasattr(tensor, "device"):
+                return tensor.device
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
     @staticmethod
     def _cleanup_cuda_memory():
         gc.collect()
@@ -871,7 +882,7 @@ class InferenceEngine:
         pad_zero = pad_zero
         chunk_size = chunk_size
 
-        device = self.model.z["head.weight"].device
+        device = self._model_device()
         alpha_presence_val = torch.tensor(
             alpha_presence, dtype=torch.float32, device=device
         )
@@ -1103,7 +1114,7 @@ class InferenceEngine:
         batch_size = batch_size
         pad_zero = pad_zero
 
-        device = self.model.z["head.weight"].device
+        device = self._model_device()
         alpha_presence_val = torch.tensor(
             alpha_presence, dtype=torch.float32, device=device
         )

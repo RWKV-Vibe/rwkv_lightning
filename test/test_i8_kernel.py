@@ -131,7 +131,7 @@ def _benchmark_mm8_linear_large_batch(device: torch.device):
     w_q, mx, rx, my, ry = quantize_mm8_for_linear(w_ref)
 
     # 测试多个 batch sizes
-    batch_sizes = [1, 8, 32, 128, 512, 1024]
+    batch_sizes = [1, 4, 8, 16, 32, 64, 128, 512, 1024]
     warmup = 5
     repeats = 10
 
