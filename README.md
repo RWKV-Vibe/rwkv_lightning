@@ -42,459 +42,170 @@ MyStatic = torch.compile(mode='max-autotune-no-cudagraphs')
 
 ## API Docs 
 
-### FIM ( For RWKV7_G1c series model )
 
-<details>
-<summary>curl examples</summary>
-
-**Batch stream inference using [FIM/v1/batch-FIM interface]**
-
-```bash
-curl -X POST http://localhost:8000/FIM/v1/batch-FIM \
-  -H "Content-Type: application/json" \
-  -d '{
-    "prefix": [
-      "The rain had stopped, but the street still glistened like a river of broken glass.",
-      "She wasn’t sure why she’d come back.",
-      "A cat darted from the alley,"
-    ],
-    "suffix": [
-      "though everyone knew Mr. Ellis hadn’t opened that door in three years.",
-      "sounding almost like her name.",
-      "And then, from inside, a single lamp clicked on."
-    ],
-    "max_tokens": 1024,
-    "stop_tokens": [0, 261, 24281],
-    "temperature": 0.8,
-    "top_k": 50,
-    "top_p": 0.6,
-    "alpha_presence": 1.0,
-    "alpha_frequency": 0.1,
-    "alpha_decay": 0.99,
-    "stream": true,
-    "password": "rwkv7_7.2b"
-  }'
-```
-
-**Batch inference using [FIM/v1/batch-FIM interface]**
-
-```bash
-curl -X POST http://localhost:8000/FIM/v1/batch-FIM \
-  -H "Content-Type: application/json" \
-  -d '{
-    "prefix": [
-      "The rain had stopped, but the street still glistened like a river of broken glass.",
-      "She wasn’t sure why she’d come back.",
-      "A cat darted from the alley,"
-    ],
-    "suffix": [
-      "though everyone knew Mr. Ellis hadn’t opened that door in three years.",
-      "sounding almost like her name.",
-      "And then, from inside, a single lamp clicked on."
-    ],
-    "max_tokens": 1024,
-    "stop_tokens": [0, 261, 24281],
-    "temperature": 0.8,
-    "top_k": 50,
-    "top_p": 0.6,
-    "alpha_presence": 1.0,
-    "alpha_frequency": 0.1,
-    "alpha_decay": 0.99,
-    "stream": false,
-    "password": "rwkv7_7.2b"
-  }'
-```
-
-**BachSize == 1 Super Fast stream Infer with CUDA graph**
-
-make sure 
-    "temperature": 0.8,
-    "top_k": 1,
-    "top_p": 0,
-    "alpha_presence": 0,
-    "alpha_frequency": 0,
-    "alpha_decay": 0.96,
-For Text Generation
-
-make sure 
-    "temperature": 0.5,
-    "top_k": 100,
-    "top_p": 0.5,
-    "alpha_presence": 1.0,
-    "alpha_frequency": 0.1,
-    "alpha_decay": 0.99,
-For Coding
-
-```bash
-curl -X POST http://localhost:8000/FIM/v1/batch-FIM \
-  -H "Content-Type: application/json" \
-  -d '{
-    "prefix": [
-      "A cat darted from the alley,"
-    ],
-    "suffix": [
-      "And then, from inside, a single lamp clicked on."
-    ],
-    "stop_tokens": [0, 261, 24281],
-    "max_tokens": 4096,
-    "chunk_size": 64,
-    "temperature": 0.8,
-    "top_k": 1,
-    "top_p": 0,
-    "alpha_presence": 0,
-    "alpha_frequency": 0,
-    "alpha_decay": 0.996,
-    "stream": true,
-    "password": "rwkv7_7.2b"
-  }'
-```
-**BachSize == 1 Super Fast Infer with CUDA graph**
-```bash
-curl -X POST http://localhost:8000/FIM/v1/batch-FIM \
-  -H "Content-Type: application/json" \
-  -d '{
-    "prefix": [
-      "A cat darted from the alley,"
-    ],
-    "suffix": [
-      "And then, from inside, a single lamp clicked on."
-    ],
-    "max_tokens": 4096,
-    "stop_tokens": [0, 261, 24281],
-    "temperature": 0.8,
-    "top_k": 1,
-    "top_p": 0,
-    "alpha_presence": 0,
-    "alpha_frequency": 0,
-    "alpha_decay": 0.996,
-    "stream": false,
-    "password": "rwkv7_7.2b"
-  }'
-```
-
+<div style="overflow-x: auto; margin: 20px 0;">
+<table style="width: 100%; min-width: 850px; border-collapse: collapse; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; border-radius: 12px; overflow: hidden; box-shadow: 0 8px 24px rgba(45, 106, 79, 0.06); background-color: #ffffff; text-align: left; line-height: 1.6; font-size: 14px;">
+<thead style="background: linear-gradient(90deg, #f0fdf4 0%, #f4fbfa 100%); color: #2d6a4f; border-bottom: 2px solid #d1fae5;">
+<tr>
+<th style="padding: 18px 24px; font-weight: 600; width: 25%;">🚀 API Endpoint</th>
+<th style="padding: 18px 24px; font-weight: 600; width: 18%;">💡 Core Function</th>
+<th style="padding: 18px 24px; font-weight: 600; width: 23%;">✨ Features & Description</th>
+<th style="padding: 18px 24px; font-weight: 600; width: 40%;">📡 Request Method</th>
+</tr>
+</thead>
+<tbody style="color: #4b5563;">
+<tr style="border-bottom: 1px solid #f3f4f6; transition: background-color 0.2s;">
+<td style="padding: 16px 24px; vertical-align: top;"><code style="background-color: #f8fafc; color: #0f172a; padding: 4px 8px; border-radius: 6px; font-size: 13px; border: 1px solid #e2e8f0;">/translate/v1/batch-translate</code></td>
+<td style="padding: 16px 24px; font-weight: 500; vertical-align: top;">Batch Sync Translation</td>
+<td style="padding: 16px 24px; font-size: 13.5px; vertical-align: top;">Perfectly compatible with Immersive Translate custom API, extremely stable.</td>
+<td style="padding: 16px 24px; vertical-align: top;">
+<details style="cursor: pointer; outline: none;">
+<summary style="display: inline-block; outline: none;">
+<span style="background-color: #eff6ff; color: #1d4ed8; padding: 4px 10px; border-radius: 20px; font-size: 12px; font-weight: 500; border: 1px solid #bfdbfe;">Non-stream ▾</span>
+</summary>
+<div style="margin-top: 10px; padding: 12px; background-color: #1e293b; color: #e2e8f0; border-radius: 8px; font-size: 12px; font-family: monospace; white-space: pre; overflow-x: auto;">curl -X POST http://localhost:8000/translate/v1/batch-translate
+-H "Content-Type: application/json"
+-d '{
+"source_lang": "en",
+"target_lang": "zh-CN",
+"text_list": ["Hello world!", "Good morning"]
+}'</div>
 </details>
-
-
-### 1. Batch synchronous Translate 
-
-<details>
-<summary>curl examples</summary>
-
-**Compatible with immersive translation custom API**
-**--- Very stable 🚀 ---** 
-```bash
-curl -X POST http://localhost:8000/translate/v1/batch-translate \
-         -H "Content-Type: application/json" \
-         -d '{
-           "source_lang": "en",
-           "target_lang": "zh-CN",
-           "text_list": ["Hello world!", "Good morning"]
-         }'
-```
-```bash
-curl -X POST http://localhost:8000/translate/v1/batch-translate \
-         -H "Content-Type: application/json" \
-         -d '{
-           "source_lang": "zh-CN",
-           "target_lang": "en",
-           "text_list": ["你好世界", "早上好"]
-         }'
-```
+</td>
+</tr>
+<tr style="border-bottom: 1px solid #f3f4f6; background-color: #fafdfc;">
+<td style="padding: 16px 24px; vertical-align: top;"><code style="background-color: #f8fafc; color: #0f172a; padding: 4px 8px; border-radius: 6px; font-size: 13px; border: 1px solid #e2e8f0;">/v1/chat/completions</code></td>
+<td style="padding: 16px 24px; font-weight: 500; vertical-align: top;">Standard Chat Completion</td>
+<td style="padding: 16px 24px; font-size: 13.5px; vertical-align: top;">Batch synchronous processing, supports <strong>all decode parameters</strong>, extremely stable.</td>
+<td style="padding: 16px 24px; vertical-align: top;">
+<details style="cursor: pointer; outline: none; margin-bottom: 8px;">
+<summary style="display: inline-block; outline: none;">
+<span style="background-color: #ecfdf5; color: #047857; padding: 4px 10px; border-radius: 20px; font-size: 12px; font-weight: 500; border: 1px solid #a7f3d0;">Stream ▾</span>
+</summary>
+<div style="margin-top: 10px; padding: 12px; background-color: #1e293b; color: #e2e8f0; border-radius: 8px; font-size: 12px; font-family: monospace; white-space: pre; overflow-x: auto;">curl -X POST http://localhost:8000/v1/chat/completions
+-H "Content-Type: application/json"
+-d '{
+"contents": ["Hello", "World"],
+"max_tokens": 1024,
+"stream": true,
+"password": "rwkv7_7.2b"
+}'</div>
 </details>
-
-
-### 2. ```v1/chat/completions```  [Support all decode parameters]
-
-<details>
-<summary>curl examples</summary>
-
-**--- Very stable 🚀 ---** 
-- Streaming synchronous batch processing 
-```bash
-curl -X POST http://localhost:8000/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{
-    "contents": [
-      "English: After a blissful two weeks, Jane encounters Rochester in the gardens. He invites her to walk with him, and Jane, caught off guard, accepts. Rochester confides that he has finally decided to marry Blanche Ingram and tells Jane that he knows of an available governess position in Ireland that she could take.\n\nChinese:",
-      "English: That night, a bolt of lightning splits the same chestnut tree under which Rochester and Jane had been sitting that evening.\n\nChinese:"
-    ],
-    "max_tokens": 1024,
-    "stop_tokens": [0, 261, 24281],
-    "temperature": 0.8,
-    "top_k": 50,
-    "top_p": 0.6,
-    "alpha_presence": 1.0,
-    "alpha_frequency": 0.1,
-    "alpha_decay": 0.99,
-    "stream": true,
-    "password": "rwkv7_7.2b"
-  }'
-```
-- Non-streaming synchronous batch processing
-```bash
-curl -X POST http://localhost:8000/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{
-    "contents": [
-      "English: After a blissful two weeks, Jane encounters Rochester in the gardens. He invites her to walk with him, and Jane, caught off guard, accepts. Rochester confides that he has finally decided to marry Blanche Ingram and tells Jane that he knows of an available governess position in Ireland that she could take.\n\nChinese:",
-      "English: That night, a bolt of lightning splits the same chestnut tree under which Rochester and Jane had been sitting that evening.\n\nChinese:"
-    ],
-    "max_tokens": 1024,
-    "stop_tokens": [0, 261, 24281],
-    "temperature": 0.8,
-    "top_k": 50,
-    "top_p": 0.6,
-    "alpha_presence": 1.0,
-    "alpha_frequency": 0.1,
-    "alpha_decay": 0.99,
-    "stream": false,
-    "password": "rwkv7_7.2b"
-  }'
-```
-
+</td>
+</tr>
+<tr style="border-bottom: 1px solid #f3f4f6;">
+<td style="padding: 16px 24px; vertical-align: top;"><code style="background-color: #f8fafc; color: #0f172a; padding: 4px 8px; border-radius: 6px; font-size: 13px; border: 1px solid #e2e8f0;">/v2/chat/completions</code></td>
+<td style="padding: 16px 24px; font-weight: 500; vertical-align: top;">Continuous Batching Chat</td>
+<td style="padding: 16px 24px; font-size: 13.5px; vertical-align: top;">Synchronous <strong>Continuous Batching</strong> processing, supports all decode parameters, extremely stable.</td>
+<td style="padding: 16px 24px; vertical-align: top;">
+<details style="cursor: pointer; outline: none;">
+<summary style="display: inline-block; outline: none;">
+<span style="background-color: #ecfdf5; color: #047857; padding: 4px 10px; border-radius: 20px; font-size: 12px; font-weight: 500; border: 1px solid #a7f3d0;">Stream ▾</span>
+</summary>
+<div style="margin-top: 10px; padding: 12px; background-color: #1e293b; color: #e2e8f0; border-radius: 8px; font-size: 12px; font-family: monospace; white-space: pre; overflow-x: auto;">curl -X POST http://localhost:8000/v2/chat/completions
+-H "Content-Type: application/json"
+-N
+-d '{
+"contents": ["Hi there!", "Tell me a joke."],
+"max_tokens": 1024,
+"chunk_size": 128,
+"stream": true,
+"password": "rwkv7_7.2b"
+}'</div>
 </details>
-
-
-### 3. ```v2/chat/completions``` [Support all decode parameters]
-
-<details>
-<summary>curl examples</summary>
-
-**--- Very stable 🚀 ---** 
-- Streaming synchronous continuous batching processing 
-```bash
-curl -X POST http://localhost:8000/v2/chat/completions \
-  -H "Content-Type: application/json" \
-  -N \
-  -d '{
-    "contents": [
-      "English: After a blissful two weeks, Jane encounters Rochester in the gardens. He invites her to walk with him, and Jane, caught off guard, accepts. Rochester confides that he has finally decided to marry Blanche Ingram and tells Jane that he knows of an available governess position in Ireland that she could take.\n\nChinese:",
-      "English: That night, a bolt of lightning splits the same chestnut tree under which Rochester and Jane had been sitting that evening.\n\nChinese:"
-    ],
-    "max_tokens": 1024,
-    "stop_tokens": [0, 261, 24281],
-    "temperature": 1.0,
-    "top_k": 1,
-    "top_p": 0.3,
-    "pad_zero": true,
-    "alpha_presence": 0.8,
-    "alpha_frequency": 0.8,
-    "alpha_decay": 0.996,
-    "chunk_size": 128,
-    "stream": true,
-    "password": "rwkv7_7.2b"
-  }'
-```
-- Non-streaming synchronous continuous batching processing
-```bash
-curl -X POST http://localhost:8000/v2/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{
-    "contents": [
-      "English: After a blissful two weeks, Jane encounters Rochester in the gardens. He invites her to walk with him, and Jane, caught off guard, accepts. Rochester confides that he has finally decided to marry Blanche Ingram and tells Jane that he knows of an available governess position in Ireland that she could take.\n\nChinese:",
-      "English: That night, a bolt of lightning splits the same chestnut tree under which Rochester and Jane had been sitting that evening.\n\nChinese:"
-    ],
-    "max_tokens": 1024,
-    "stop_tokens": [0, 261, 24281],
-    "temperature": 1.0,
-    "top_k": 1,
-    "top_p": 0.3,
-    "pad_zero": true,
-    "alpha_presence": 0.8,
-    "alpha_frequency": 0.8,
-    "alpha_decay": 0.996,
-    "chunk_size": 32,
-    "stream": false,
-    "password": "rwkv7_7.2b"
-  }'
-```
-
+</td>
+</tr>
+<tr style="border-bottom: 1px solid #f3f4f6; background-color: #fafdfc;">
+<td style="padding: 16px 24px; vertical-align: top;"><code style="background-color: #f8fafc; color: #0f172a; padding: 4px 8px; border-radius: 6px; font-size: 13px; border: 1px solid #e2e8f0;">/state/chat/completions</code></td>
+<td style="padding: 16px 24px; font-weight: 500; vertical-align: top;">Stateful Chat Completion 💾</td>
+<td style="padding: 16px 24px; font-size: 13.5px; vertical-align: top;">Supports state cache manager. Features <strong>L1(VRAM), L2(RAM), L3(Sqlite3)</strong> cache design. Only supports single session (Bsz=1), requires <code>session_id</code>.</td>
+<td style="padding: 16px 24px; vertical-align: top;">
+<details style="cursor: pointer; outline: none;">
+<summary style="display: inline-block; outline: none;">
+<span style="background-color: #ecfdf5; color: #047857; padding: 4px 10px; border-radius: 20px; font-size: 12px; font-weight: 500; border: 1px solid #a7f3d0;">Stream ▾</span>
+</summary>
+<div style="margin-top: 10px; padding: 12px; background-color: #1e293b; color: #e2e8f0; border-radius: 8px; font-size: 12px; font-family: monospace; white-space: pre; overflow-x: auto;">curl -X POST http://localhost:8000/state/chat/completions
+-H "Content-Type: application/json"
+-N
+-d '{
+"contents": ["User: What should we eat for dinner?\n\nAssistant:"],
+"stream": true,
+"password": "rwkv7_7.2b",
+"session_id": "session_one"
+}'</div>
 </details>
+</td>
+</tr>
+<tr style="border-bottom: 1px solid #f3f4f6;">
+<td style="padding: 16px 24px; vertical-align: top;">
+<code style="background-color: #f8fafc; color: #0f172a; padding: 4px 8px; border-radius: 6px; font-size: 13px; border: 1px solid #e2e8f0; display: inline-block; margin-bottom: 6px;">/state/status</code>
 
 
-### 4. ```state/chat/completions``` [Support state cache manager] 😜
-
-#### Have 3 Levels Cache design 🤓
-- **L1 cache(VRAM) 16**
-- **L2 cache(RAM) 32**
-- **L3 cache(Sqlite3 database)**
-#### The all cached state will be stored in the database when shout down the server 😋
-- could modify the cache size in ```./state_pool.py``` in line 14-16
-
-***Need to add a unique "session_id": "XXX" in the request body as a unique identifier for each session***👆
-
-**ONLY support for bsz = 1 one session** 🤫
-
-<details>
-<summary>curl examples</summary>
-
-- Streaming asynchronous batch processing With CUDA Graph For Bsz=1
-```bash
-curl -X POST http://localhost:8000/state/chat/completions \
-  -H "Content-Type: application/json" \
-  -N \
-  -d '{
-    "contents": [
-      "User: What should we eat for dinner? Any brief suggestions?\n\nAssistant: <think>\n</think>\n"
-    ],
-    "max_tokens": 1024,
-    "stop_tokens": [0, 261, 24281],
-    "temperature": 0.8,
-    "top_k": 50,
-    "top_p": 0.6,
-    "alpha_presence": 1.0,
-    "alpha_frequency": 0.1,
-    "alpha_decay": 0.99,
-    "stream": true,
-    "chunk_size": 128,
-    "password": "rwkv7_7.2b",
-    "session_id": "session_one"
-  }'
-```
-- Non-streaming asynchronous batch processing With CUDA Graph For Bsz=1
-```bash
-curl -X POST http://localhost:8000/state/chat/completions \
-      -H "Content-Type: application/json" \
-      -d '{
-    "contents": [
-      "User: What should we eat for dinner? Any brief suggestions?\n\nAssistant: <think>\n</think>\n"
-    ],
-    "max_tokens": 1024,
-    "stop_tokens": [0, 261, 24281],
-    "temperature": 0.8,
-    "top_k": 50,
-    "top_p": 0.6,
-    "alpha_presence": 1.0,
-    "alpha_frequency": 0.1,
-    "alpha_decay": 0.99,
-    "stream": false,
-    "password": "rwkv7_7.2b",
-    "session_id": "session_one"
-  }'
-```
-
+<code style="background-color: #f8fafc; color: #0f172a; padding: 4px 8px; border-radius: 6px; font-size: 13px; border: 1px solid #e2e8f0; display: inline-block;">/state/delete</code>
+</td>
+<td style="padding: 16px 24px; font-weight: 500; vertical-align: top;">Cache State Management</td>
+<td style="padding: 16px 24px; font-size: 13.5px; vertical-align: top;">Used to check the status of the state pool for a specific session (<code>session_id</code>), or delete its cached state.</td>
+<td style="padding: 16px 24px; vertical-align: top;">
+<details style="cursor: pointer; outline: none; margin-bottom: 8px;">
+<summary style="display: inline-block; outline: none;">
+<span style="background-color: #eff6ff; color: #1d4ed8; padding: 4px 10px; border-radius: 20px; font-size: 12px; font-weight: 500; border: 1px solid #bfdbfe;">Check Status ▾</span>
+</summary>
+<div style="margin-top: 10px; padding: 12px; background-color: #1e293b; color: #e2e8f0; border-radius: 8px; font-size: 12px; font-family: monospace; white-space: pre; overflow-x: auto;">curl -X POST http://localhost:8000/state/status
+-H "Content-Type: application/json"
+-d '{"password": "rwkv7_7.2b"}'</div>
 </details>
-
-
-### 5. **State Management API** [Support state cache manager] 😜 
-
-#### Use ```state/status```  Interface to check the state pool status of a session
-
-<details>
-<summary>curl examples</summary>
-
-```bash
-curl -X POST http://localhost:8000/state/status \
-  -H "Content-Type: application/json" \
-  -d '{
-    "password": "rwkv7_7.2b"
-  }'
-```
-
+<details style="cursor: pointer; outline: none;">
+<summary style="display: inline-block; outline: none;">
+<span style="background-color: #fef2f2; color: #b91c1c; padding: 4px 10px; border-radius: 20px; font-size: 12px; font-weight: 500; border: 1px solid #fecaca;">Delete State ▾</span>
+</summary>
+<div style="margin-top: 10px; padding: 12px; background-color: #1e293b; color: #e2e8f0; border-radius: 8px; font-size: 12px; font-family: monospace; white-space: pre; overflow-x: auto;">curl -X POST http://localhost:8000/state/delete
+-H "Content-Type: application/json"
+-d '{
+"session_id": "your_session_id_to_delete",
+"password": "rwkv7_7.2b"
+}'</div>
 </details>
-
-#### Use ```state/delete```  Interface to delete the state of a session
-
-<details>
-<summary>curl examples</summary>
-
-
-```bash
-curl -X POST http://localhost:8000/state/delete \
-  -H "Content-Type: application/json" \
-  -d '{
-    "session_id": "your_session_id_to_delete",
-    "password": "rwkv7_7.2b"
-  }'
-```
-
+</td>
+</tr>
+<tr style="border-bottom: 1px solid #f3f4f6; background-color: #fafdfc;">
+<td style="padding: 16px 24px; vertical-align: top;"><code style="background-color: #f8fafc; color: #0f172a; padding: 4px 8px; border-radius: 6px; font-size: 13px; border: 1px solid #e2e8f0;">/openai/v1/chat/completions</code></td>
+<td style="padding: 16px 24px; font-weight: 500; vertical-align: top;">OpenAI Format Support</td>
+<td style="padding: 16px 24px; font-size: 13.5px; vertical-align: top;">Standard OpenAI format interface adaptation. Supports appending <code>session_id</code> for stateful incremental processing.</td>
+<td style="padding: 16px 24px; vertical-align: top;">
+<details style="cursor: pointer; outline: none;">
+<summary style="display: inline-block; outline: none;">
+<span style="background-color: #ecfdf5; color: #047857; padding: 4px 10px; border-radius: 20px; font-size: 12px; font-weight: 500; border: 1px solid #a7f3d0;">Stream ▾</span>
+</summary>
+<div style="margin-top: 10px; padding: 12px; background-color: #1e293b; color: #e2e8f0; border-radius: 8px; font-size: 12px; font-family: monospace; white-space: pre; overflow-x: auto;">curl -X POST http://localhost:8000/openai/v1/chat/completions
+-H "Content-Type: application/json"
+-d '{
+"model": "rwkv7",
+"messages": [
+{"role": "user", "content": "Tell me about AI."}
+],
+"stream": true
+}'</div>
 </details>
-
-### 6. ```/openai/v1/chat/completions``` [Open AI format support]
-
-<details>
-<summary>curl examples</summary>
-
-- Streaming asynchronous Open AI API
-```bash
-curl -X POST 'http://localhost:8000/openai/v1/chat/completions' \
-  --header 'Content-Type: application/json' \
-  --header 'Authorization: Bearer your-password-if-set' \
-  --data '{
-    "model": "rwkv7",
-    "messages": [
-      {"role": "user", "content": "please tell me about the history of artificial intelligence"}
-    ],
-    "top_p": 0.6,
-    "max_tokens": 2048,
-    "temperature": 0.8,
-    "stream": true
-  }'
-```
-- Non-streaming asynchronous Open AI API
-```bash
-curl -X POST 'http://localhost:8000/openai/v1/chat/completions' \
-  --header 'Content-Type: application/json' \
-  --header 'Authorization: Bearer your-password-if-set' \
-  --data '{
-    "model": "rwkv7",
-    "messages": [
-      {"role": "system", "content": "You are a helpful assistant."},
-      {"role": "user", "content": "please tell me about the history of artificial intelligence"}
-    ],
-    "top_p": 0.6,
-    "max_tokens": 2048,
-    "temperature": 1,
-    "stream": false
-  }'
-```
-
-- Stateful incremental Open AI API with `session_id`
-```bash
-curl -X POST 'http://localhost:8000/openai/v1/chat/completions' \
-  --header 'Content-Type: application/json' \
-  --header 'Authorization: Bearer your-password-if-set' \
-  --data '{
-    "model": "rwkv7",
-    "messages": [
-      {"role": "system", "content": "You are a helpful assistant."},
-      {"role": "user", "content": "Please continue from our last turn and give me 3 short ideas."}
-    ],
-    "top_p": 0.6,
-    "max_tokens": 2048,
-    "temperature": 1,
-    "stream": false
-  }'
-```
-
-- Related focused test scripts
-```bash
-python test/test_openai_adapter.py
-python test/test_openai_routes.py
-```
+</td>
+</tr>
+<tr style="border-bottom: 1px solid #f3f4f6;">
+<td style="padding: 16px 24px; vertical-align: top;"><code style="background-color: #f8fafc; color: #0f172a; padding: 4px 8px; border-radius: 6px; font-size: 13px; border: 1px solid #e2e8f0;">/big_batch/completions</code></td>
+<td style="padding: 16px 24px; font-weight: 500; vertical-align: top;">Extreme Batching ⚡</td>
+<td style="padding: 16px 24px; font-size: 13.5px; vertical-align: top;"><strong>The fastest batch processing API.</strong> As a performance trade-off, only supports <code>noise</code> and <code>temperature</code> decode parameters.</td>
+<td style="padding: 16px 24px; vertical-align: top;">
+<details style="cursor: pointer; outline: none;">
+<summary style="display: inline-block; outline: none;">
+<span style="background-color: #ecfdf5; color: #047857; padding: 4px 10px; border-radius: 20px; font-size: 12px; font-weight: 500; border: 1px solid #a7f3d0;">Stream ▾</span>
+</summary>
+<div style="margin-top: 10px; padding: 12px; background-color: #1e293b; color: #e2e8f0; border-radius: 8px; font-size: 12px; font-family: monospace; white-space: pre; overflow-x: auto;">curl -X POST http://localhost:8000/big_batch/completions
+-H "Content-Type: application/json"
+-d '{
+"contents": ["Text 1...", "Text 2..."],
+"temperature": 1.0,
+"stream": true,
+"password": "rwkv7_7.2b"
+}'</div>
 </details>
-
-### 7. ```/big_batch/completions```  [Only Support noise & temperature decode parameters]
-
-<details>
-<summary>curl examples</summary>
-
-**The Fastest Batch Processing API 🚀** 
-- Streaming synchronous batch processing 
-```bash
-curl -X POST 'http://localhost:8000/big_batch/completions' \
-  --header 'Content-Type: application/json' \
-  --data '{
-    "contents": [
-      "English: That night, a bolt of lightning splits the same chestnut tree under which Rochester and Jane had been sitting that evening.\n\nChinese:",
-      "English: That night, a bolt of lightning splits the same chestnut tree under which Rochester and Jane had been sitting that evening.\n\nChinese:"
-    ],
-    "max_tokens": 1024,
-    "stop_tokens": [0, 261, 24281],
-    "temperature": 1.0,
-    "chunk_size": 8,
-    "stream": true,
-    "password": "rwkv7_7.2b"
-  }'
-```
-</details>
+</tbody>
+</table>
+</div>
