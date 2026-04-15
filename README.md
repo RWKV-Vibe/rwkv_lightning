@@ -43,10 +43,10 @@ MyStatic = torch.compile(mode='max-autotune-no-cudagraphs')
 ## API Docs 
 
 
-### 1. Batch synchronous Translate 
+### **1. Batch synchronous Translate**
 
 <details>
-<summary>curl examples</summary>
+<summary><strong><em>curl examples</em></strong></summary>
 
 **Compatible with immersive translation custom API**
 **--- Very stable 🚀 ---** 
@@ -70,11 +70,11 @@ curl -X POST http://localhost:8000/translate/v1/batch-translate \
 ```
 </details>
 
-
-### 2. ```v1/chat/completions```  [Support all decode parameters]
+___
+### **2. ```v1/chat/completions```  [Support all decode parameters]**
 
 <details>
-<summary>curl examples</summary>
+<summary><strong><em>curl examples</em></strong></summary>
 
 **--- Very stable 🚀 ---** 
 - Streaming synchronous batch processing 
@@ -122,11 +122,11 @@ curl -X POST http://localhost:8000/v1/chat/completions \
 
 </details>
 
-
-### 3. ```v2/chat/completions``` [Support all decode parameters]
+___
+### **3. ```v2/chat/completions``` [Support all decode parameters]**
 
 <details>
-<summary>curl examples</summary>
+<summary><strong><em>curl examples</em></strong></summary>
 
 **--- Very stable 🚀 ---** 
 - Streaming synchronous continuous batching processing 
@@ -179,8 +179,8 @@ curl -X POST http://localhost:8000/v2/chat/completions \
 
 </details>
 
-
-### 4. ```state/chat/completions``` [Support state cache manager] 😜
+___
+### **4. ```state/chat/completions``` [Support state cache manager] 😜**
 
 #### Have 3 Levels Cache design 🤓
 - **L1 cache(VRAM) 16**
@@ -194,7 +194,7 @@ curl -X POST http://localhost:8000/v2/chat/completions \
 **ONLY support for bsz = 1 one session** 🤫
 
 <details>
-<summary>curl examples</summary>
+<summary><strong><em>curl examples</em></strong></summary>
 
 - Streaming asynchronous batch processing With CUDA Graph For Bsz=1
 ```bash
@@ -243,13 +243,13 @@ curl -X POST http://localhost:8000/state/chat/completions \
 
 </details>
 
-
-### 5. **State Management API** [Support state cache manager] 😜 
+___
+### **5. State Management API [Support state cache manager] 😜**
 
 #### Use ```state/status```  Interface to check the state pool status of a session
 
 <details>
-<summary>curl examples</summary>
+<summary><strong><em>curl examples</em></strong></summary>
 
 ```bash
 curl -X POST http://localhost:8000/state/status \
@@ -264,7 +264,7 @@ curl -X POST http://localhost:8000/state/status \
 #### Use ```state/delete```  Interface to delete the state of a session
 
 <details>
-<summary>curl examples</summary>
+<summary><strong><em>curl examples</em></strong></summary>
 
 
 ```bash
@@ -278,10 +278,11 @@ curl -X POST http://localhost:8000/state/delete \
 
 </details>
 
-### 6. ```/openai/v1/chat/completions``` [Open AI format support]
+___
+### **6. ```/openai/v1/chat/completions``` [Open AI format support]**
 
 <details>
-<summary>curl examples</summary>
+<summary><strong><em>curl examples</em></strong></summary>
 
 - Streaming asynchronous Open AI API
 ```bash
@@ -342,10 +343,11 @@ python test/test_openai_routes.py
 ```
 </details>
 
-### 7. ```/big_batch/completions```  [Only Support noise & temperature decode parameters]
+___
+### **7. ```/big_batch/completions```  [Only Support noise & temperature decode parameters]**
 
 <details>
-<summary>curl examples</summary>
+<summary><strong><em>curl examples</em></strong></summary>
 
 **The Fastest Batch Processing API 🚀** 
 - Streaming synchronous batch processing 
@@ -367,10 +369,11 @@ curl -X POST 'http://localhost:8000/big_batch/completions' \
 ```
 </details>
 
-### FIM ( For RWKV7_G1c series model )
+___
+### **8. FIM ( For RWKV7_G1c series model )**
 
 <details>
-<summary>curl examples</summary>
+<summary><strong><em>curl examples</em></strong></summary>
 
 **Batch stream inference using [FIM/v1/batch-FIM interface]**
 
