@@ -1,5 +1,6 @@
 import argparse
 import atexit
+import gc
 import json
 import os
 import signal
@@ -30,9 +31,18 @@ class BigBatchEngine:
         self.tokenizer = tokenizer
 
     def cleanup(self):
+        gc.collect()
         if torch.cuda.is_available():
             try:
+                torch.cuda.synchronize()
+            except Exception:
+                pass
+            try:
                 torch.cuda.empty_cache()
+            except Exception:
+                pass
+            try:
+                torch.cuda.ipc_collect()
             except Exception:
                 pass
 
@@ -63,7 +73,7 @@ class BigBatchEngine:
 
                 while not all(finished) and max_length > 0:
                     new_tokens_tensor = sampler_gumbel_batch(
-                        logits=out, temp=temperature
+                        logits=out.clone(), temp=temperature
                     )
                     new_tokens = new_tokens_tensor.tolist()
                     del new_tokens_tensor
@@ -167,9 +177,9 @@ class BigBatchEngine:
                 del token_buffers
             if new_tokens is not None:
                 del new_tokens
-            self.cleanup()
 
         yield "data: [DONE]\n\n"
+        self.cleanup()
 
     def batch_generate(
         self,
@@ -197,7 +207,7 @@ class BigBatchEngine:
 
                 while not all(finished) and max_length > 0:
                     new_tokens_tensor = sampler_gumbel_batch(
-                        logits=out, temp=temperature
+                        logits=out.clone(), temp=temperature
                     )
                     new_tokens = new_tokens_tensor.tolist()
                     del new_tokens_tensor
