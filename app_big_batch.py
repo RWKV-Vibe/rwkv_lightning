@@ -1,6 +1,5 @@
 import argparse
 import atexit
-import gc
 import json
 import os
 import signal
@@ -26,13 +25,11 @@ class BigBatchRequest(BaseModel):
 
 
 class BigBatchEngine:
-    def __init__(self, model, tokenizer, cleanup_interval: int):
+    def __init__(self, model, tokenizer):
         self.model = model
         self.tokenizer = tokenizer
-        self.cleanup_interval = cleanup_interval
 
     def cleanup(self):
-        gc.collect()
         if torch.cuda.is_available():
             try:
                 torch.cuda.empty_cache()
@@ -63,7 +60,6 @@ class BigBatchEngine:
                 out = self.model.forward_batch(encoded_prompts, state)
                 finished = [False] * batch_size
                 token_buffers = [[] for _ in range(batch_size)]
-                step_count = 0
 
                 while not all(finished) and max_length > 0:
                     new_tokens_tensor = sampler_gumbel_batch(
@@ -78,7 +74,6 @@ class BigBatchEngine:
                     del prev_out
 
                     max_length -= 1
-                    step_count += 1
                     contents_to_send = [""] * batch_size
 
                     for i in range(batch_size):
@@ -129,9 +124,6 @@ class BigBatchEngine:
                         )
 
                     new_tokens = None
-
-                    if step_count % self.cleanup_interval == 0:
-                        self.cleanup()
 
                 remaining_contents = [""] * batch_size
                 for i in range(batch_size):
@@ -260,7 +252,6 @@ def parse_args():
     parser.add_argument("--model-path", type=str, required=True, help="RWKV model path")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--password", type=str, default=None)
-    parser.add_argument("--cleanup-interval", type=int, default=100)
     return parser.parse_args()
 
 
@@ -352,11 +343,7 @@ def create_app(engine: BigBatchEngine, model_name: str, password: str | None):
 def main():
     cli_args = parse_args()
     model, tokenizer, args, _ = load_model_and_tokenizer(cli_args.model_path)
-    engine = BigBatchEngine(
-        model=model,
-        tokenizer=tokenizer,
-        cleanup_interval=max(1, cli_args.cleanup_interval),
-    )
+    engine = BigBatchEngine(model=model, tokenizer=tokenizer)
     model_name = os.path.basename(f"{args.MODEL_NAME}")
     app = create_app(engine, model_name, cli_args.password)
 
