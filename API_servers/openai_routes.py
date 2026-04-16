@@ -135,7 +135,7 @@ def build_internal_chat_request(body: dict, prompt: str) -> dict:
         "messages": body.get("messages", []),
         "system": body.get("system"),
         "max_tokens": body.get("max_tokens", 4096),
-        "stop_tokens": body.get("stop_tokens", [0, 261, 24281]),
+        "stop_tokens": body.get("stop_tokens", ["\nUser:"]),
         "temperature": body.get("temperature", 1.0),
         "top_k": body.get("top_k", 20),
         "top_p": body.get("top_p", 0.6),

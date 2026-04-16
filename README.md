@@ -87,7 +87,7 @@ curl -X POST http://localhost:8000/v1/chat/completions \
       "English: That night, a bolt of lightning splits the same chestnut tree under which Rochester and Jane had been sitting that evening.\n\nChinese:"
     ],
     "max_tokens": 1024,
-    "stop_tokens": [0, 261, 24281],
+    "stop_tokens": ["\nUser:"],
     "temperature": 0.8,
     "top_k": 50,
     "top_p": 0.6,
@@ -108,7 +108,7 @@ curl -X POST http://localhost:8000/v1/chat/completions \
       "English: That night, a bolt of lightning splits the same chestnut tree under which Rochester and Jane had been sitting that evening.\n\nChinese:"
     ],
     "max_tokens": 1024,
-    "stop_tokens": [0, 261, 24281],
+    "stop_tokens": ["\nUser:"],
     "temperature": 0.8,
     "top_k": 50,
     "top_p": 0.6,
@@ -140,7 +140,7 @@ curl -X POST http://localhost:8000/v2/chat/completions \
       "English: That night, a bolt of lightning splits the same chestnut tree under which Rochester and Jane had been sitting that evening.\n\nChinese:"
     ],
     "max_tokens": 1024,
-    "stop_tokens": [0, 261, 24281],
+    "stop_tokens": ["\nUser:"],
     "temperature": 1.0,
     "top_k": 1,
     "top_p": 0.3,
@@ -163,7 +163,7 @@ curl -X POST http://localhost:8000/v2/chat/completions \
       "English: That night, a bolt of lightning splits the same chestnut tree under which Rochester and Jane had been sitting that evening.\n\nChinese:"
     ],
     "max_tokens": 1024,
-    "stop_tokens": [0, 261, 24281],
+    "stop_tokens": ["\nUser:"],
     "temperature": 1.0,
     "top_k": 1,
     "top_p": 0.3,
@@ -206,7 +206,7 @@ curl -X POST http://localhost:8000/state/chat/completions \
       "User: What should we eat for dinner? Any brief suggestions?\n\nAssistant: <think>\n</think>\n"
     ],
     "max_tokens": 1024,
-    "stop_tokens": [0, 261, 24281],
+    "stop_tokens": ["\nUser:"],
     "temperature": 0.8,
     "top_k": 50,
     "top_p": 0.6,
@@ -228,7 +228,7 @@ curl -X POST http://localhost:8000/state/chat/completions \
       "User: What should we eat for dinner? Any brief suggestions?\n\nAssistant: <think>\n</think>\n"
     ],
     "max_tokens": 1024,
-    "stop_tokens": [0, 261, 24281],
+    "stop_tokens": ["\nUser:"],
     "temperature": 0.8,
     "top_k": 50,
     "top_p": 0.6,
@@ -360,7 +360,7 @@ curl -X POST 'http://localhost:8000/big_batch/completions' \
       "English: That night, a bolt of lightning splits the same chestnut tree under which Rochester and Jane had been sitting that evening.\n\nChinese:"
     ],
     "max_tokens": 1024,
-    "stop_tokens": [0, 261, 24281],
+    "stop_tokens": ["\nUser:"],
     "temperature": 1.0,
     "chunk_size": 8,
     "stream": true,
@@ -392,7 +392,7 @@ curl -X POST http://localhost:8000/FIM/v1/batch-FIM \
       "And then, from inside, a single lamp clicked on."
     ],
     "max_tokens": 1024,
-    "stop_tokens": [0, 261, 24281],
+    "stop_tokens": ["✿"],
     "temperature": 0.8,
     "top_k": 50,
     "top_p": 0.6,
@@ -421,7 +421,7 @@ curl -X POST http://localhost:8000/FIM/v1/batch-FIM \
       "And then, from inside, a single lamp clicked on."
     ],
     "max_tokens": 1024,
-    "stop_tokens": [0, 261, 24281],
+    "stop_tokens": ["✿"],
     "temperature": 0.8,
     "top_k": 50,
     "top_p": 0.6,

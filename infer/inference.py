@@ -28,6 +28,69 @@ class InferenceEngine:
     def shutdown(self):
         self.executor.shutdown(wait=False)
 
+    @staticmethod
+    def _normalize_stop_strings(stop_tokens):
+        if not stop_tokens:
+            return ()
+        return tuple(token for token in stop_tokens if isinstance(token, str) and token)
+
+    @staticmethod
+    def _match_stop_suffix(decoded_text, stop_strings):
+        for stop_string in stop_strings:
+            if decoded_text.endswith(stop_string):
+                return stop_string
+        return None
+
+    def _create_stop_state(self, stop_tokens):
+        return {
+            "stop_strings": self._normalize_stop_strings(stop_tokens),
+            "pending_tokens": deque(),
+            "window_size": 6,
+        }
+
+    def _ingest_token_with_stop(self, stop_state, token):
+        if token == 0:
+            return "", True
+
+        pending_tokens = stop_state["pending_tokens"]
+        pending_tokens.append(token)
+
+        decoded_window = self.tokenizer.decode(
+            list(pending_tokens), utf8_errors="ignore"
+        )
+        matched_stop = self._match_stop_suffix(
+            decoded_window, stop_state["stop_strings"]
+        )
+        if matched_stop is not None:
+            pending_tokens.clear()
+            return decoded_window[: -len(matched_stop)], True
+
+        if len(pending_tokens) > stop_state["window_size"]:
+            pending_tokens.popleft()
+            trailing_text = self.tokenizer.decode(
+                list(pending_tokens), utf8_errors="ignore"
+            )
+            if not trailing_text:
+                return decoded_window, False
+            if decoded_window.endswith(trailing_text):
+                return decoded_window[: -len(trailing_text)], False
+
+            return self.tokenizer.decode([token], utf8_errors="ignore"), False
+
+        return "", False
+
+    def _flush_stop_state(self, stop_state, final=False):
+        pending_tokens = stop_state["pending_tokens"]
+        if not pending_tokens:
+            return ""
+
+        if not final and len(pending_tokens) <= stop_state["window_size"]:
+            return ""
+
+        decoded = self.tokenizer.decode(list(pending_tokens), utf8_errors="ignore")
+        pending_tokens.clear()
+        return decoded
+
     def _init_cuda_graph_state(self, token, state, out):
         x_emb = self.model.z["emb.weight"][token]
 
@@ -185,7 +248,7 @@ class InferenceEngine:
         alpha_presence=1.0,
         alpha_frequency=0.1,
         alpha_decay=0.996,
-        stop_tokens=(0, 261, 24281),
+        stop_tokens=("\nUser:",),
     ):
         batch_size = len(prompts)
         state = self.model.generate_zero_state(batch_size)
@@ -193,7 +256,8 @@ class InferenceEngine:
         out = self.model.forward_batch(encoded_prompts, state).float()
 
         finished = [False] * batch_size
-        generated_tokens = [[] for _ in range(batch_size)]
+        stop_states = [self._create_stop_state(stop_tokens) for _ in range(batch_size)]
+        generated_text = [""] * batch_size
 
         for _ in range(max_length):
             sample_rand_states = sample.setup_rand(
@@ -222,10 +286,14 @@ class InferenceEngine:
                 )
                 if finished[i]:
                     continue
-                if tok in stop_tokens:
+
+                content, should_stop = self._ingest_token_with_stop(stop_states[i], tok)
+                if content:
+                    generated_text[i] += content
+
+                if should_stop:
                     finished[i] = True
                     continue
-                generated_tokens[i].append(tok)
 
             if all(finished):
                 break
@@ -235,8 +303,8 @@ class InferenceEngine:
 
         decoded = []
         for i in range(batch_size):
-            text = self.tokenizer.decode(generated_tokens[i], utf8_errors="ignore")
-            decoded.append(text)
+            generated_text[i] += self._flush_stop_state(stop_states[i], final=True)
+            decoded.append(generated_text[i])
         torch.cuda.empty_cache()
         return decoded
 
@@ -250,7 +318,7 @@ class InferenceEngine:
         alpha_presence=1.0,
         alpha_frequency=0.1,
         alpha_decay=0.996,
-        stop_tokens=(0, 261, 24281),
+        stop_tokens=("\nUser:",),
         chunk_size=32,
     ):
         batch_size = len(prompts)
@@ -259,8 +327,9 @@ class InferenceEngine:
         out = self.model.forward_batch(encoded_prompts, state).float()
 
         finished = [False] * batch_size
-        generated_tokens = [[] for _ in range(batch_size)]
-        token_buffers = [[] for _ in range(batch_size)]
+        stop_states = [self._create_stop_state(stop_tokens) for _ in range(batch_size)]
+        chunk_token_counts = [0] * batch_size
+        text_buffers = [""] * batch_size
 
         try:
             while not all(finished) and max_length > 0:
@@ -295,23 +364,25 @@ class InferenceEngine:
                         else new_tokens[i]
                     )
 
-                    if tok in stop_tokens:
+                    content, should_stop = self._ingest_token_with_stop(stop_states[i], tok)
+                    if content:
+                        text_buffers[i] += content
+
+                    if should_stop:
                         finished[i] = True
-                        if token_buffers[i]:
-                            contents_to_send[i] = self.tokenizer.decode(
-                                token_buffers[i], utf8_errors="ignore"
-                            )
-                            token_buffers[i].clear()
+                        flushed = self._flush_stop_state(stop_states[i], final=True)
+                        if flushed:
+                            text_buffers[i] += flushed
+                        if text_buffers[i]:
+                            contents_to_send[i] += text_buffers[i]
+                            text_buffers[i] = ""
                         continue
 
-                    token_buffers[i].append(tok)
-                    generated_tokens[i].append(tok)
-
-                    if len(token_buffers[i]) >= chunk_size:
-                        contents_to_send[i] = self.tokenizer.decode(
-                            token_buffers[i], utf8_errors="ignore"
-                        )
-                        token_buffers[i].clear()
+                    chunk_token_counts[i] += 1
+                    if chunk_token_counts[i] >= chunk_size and text_buffers[i]:
+                        contents_to_send[i] += text_buffers[i]
+                        text_buffers[i] = ""
+                        chunk_token_counts[i] = 0
 
                 if any(contents_to_send):
                     chunk = {
@@ -329,11 +400,10 @@ class InferenceEngine:
 
             remaining_contents = [""] * batch_size
             for i in range(batch_size):
-                if token_buffers[i]:
-                    remaining_contents[i] = self.tokenizer.decode(
-                        token_buffers[i], utf8_errors="ignore"
-                    )
-                    token_buffers[i].clear()
+                flushed = self._flush_stop_state(stop_states[i], final=True)
+                if flushed:
+                    text_buffers[i] += flushed
+                remaining_contents[i] = text_buffers[i]
 
             if any(remaining_contents):
                 chunk = {
@@ -364,14 +434,15 @@ class InferenceEngine:
         alpha_presence=1.0,
         alpha_frequency=0.1,
         alpha_decay=0.996,
-        stop_tokens=(0, 261, 24281),
+        stop_tokens=("\nUser:",),
     ):
         encoded_prompts = [self.tokenizer.encode(p) for p in prompts]
 
         tokens = encoded_prompts[0]
         out = self.model.forward(tokens, state).float()
 
-        generated_tokens = []
+        stop_state = self._create_stop_state(stop_tokens)
+        generated_text = ""
         for _ in range(max_length):
             if out.dim() == 1:
                 out = out.unsqueeze(0)
@@ -392,12 +463,16 @@ class InferenceEngine:
 
             tok = new_tokens[0]
 
-            if tok in stop_tokens:
+            content, should_stop = self._ingest_token_with_stop(stop_state, tok)
+            if content:
+                generated_text += content
+
+            if should_stop:
                 break
 
-            generated_tokens.append(tok)
             out = self.model.forward(tok, state).float()
-        decoded = [self.tokenizer.decode(generated_tokens, utf8_errors="ignore")]
+        generated_text += self._flush_stop_state(stop_state, final=True)
+        decoded = [generated_text]
 
         gc.collect()
         torch.cuda.empty_cache()
@@ -413,10 +488,11 @@ class InferenceEngine:
         alpha_presence=1.0,
         alpha_frequency=0.1,
         alpha_decay=0.996,
-        stop_tokens=(0, 261, 24281),
+        stop_tokens=("\nUser:",),
         prefix_cache_manager=None,
     ):
-        generated_tokens = []
+        stop_state = self._create_stop_state(stop_tokens)
+        generated_text = ""
         finish_reason = "length"
 
         try:
@@ -442,16 +518,19 @@ class InferenceEngine:
                 ).tolist()
 
                 tok = new_tokens[0]
-                if tok in stop_tokens:
+                content, should_stop = self._ingest_token_with_stop(stop_state, tok)
+                if content:
+                    generated_text += content
+
+                if should_stop:
                     finish_reason = "stop"
                     break
 
-                generated_tokens.append(tok)
                 out = self.model.forward(tok, state).float()
                 await asyncio.sleep(0)
 
-            decoded = self.tokenizer.decode(generated_tokens, utf8_errors="ignore")
-            return decoded, finish_reason
+            generated_text += self._flush_stop_state(stop_state, final=True)
+            return generated_text, finish_reason
         finally:
             del state
             torch.cuda.empty_cache()
@@ -467,7 +546,7 @@ class InferenceEngine:
         alpha_presence=1.0,
         alpha_frequency=0.1,
         alpha_decay=0.996,
-        stop_tokens=(0, 261, 24281),
+        stop_tokens=("\nUser:",),
         chunk_size=32,
         prefix_cache_manager=None,
     ):
@@ -477,7 +556,9 @@ class InferenceEngine:
             _, state, out, _, _ = self._prefill_prompt_with_prefix_cache(
                 prompt, prefix_cache_manager=prefix_cache_manager
             )
-            token_buffer = []
+            stop_state = self._create_stop_state(stop_tokens)
+            buffered_tokens = 0
+            text_buffer = ""
 
             while max_length > 0:
                 max_length -= 1
@@ -497,44 +578,46 @@ class InferenceEngine:
                 ).tolist()
 
                 tok = new_tokens[0]
-                if tok in stop_tokens:
-                    finish_reason = "stop"
-                    if token_buffer:
-                        content = self.tokenizer.decode(
-                            token_buffer, utf8_errors="ignore"
-                        )
-                        token_buffer.clear()
-                        if content:
-                            chunk = {
-                                "object": "chat.completion.chunk",
-                                "choices": [{"index": 0, "delta": {"content": content}}],
-                            }
-                            yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
-                    break
+                content, should_stop = self._ingest_token_with_stop(stop_state, tok)
+                if content:
+                    text_buffer += content
 
-                token_buffer.append(tok)
-                if len(token_buffer) >= chunk_size:
-                    content = self.tokenizer.decode(token_buffer, utf8_errors="ignore")
-                    token_buffer.clear()
-                    if content:
+                if should_stop:
+                    finish_reason = "stop"
+                    flushed = self._flush_stop_state(stop_state, final=True)
+                    if flushed:
+                        text_buffer += flushed
+                    if text_buffer:
                         chunk = {
                             "object": "chat.completion.chunk",
-                            "choices": [{"index": 0, "delta": {"content": content}}],
+                            "choices": [{"index": 0, "delta": {"content": text_buffer}}],
                         }
                         yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+                        text_buffer = ""
+                    break
+
+                buffered_tokens += 1
+                if buffered_tokens >= chunk_size and text_buffer:
+                    chunk = {
+                        "object": "chat.completion.chunk",
+                        "choices": [{"index": 0, "delta": {"content": text_buffer}}],
+                    }
+                    yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+                    text_buffer = ""
+                    buffered_tokens = 0
 
                 out = self.model.forward(tok, state).float()
                 await asyncio.sleep(0)
 
-            if token_buffer:
-                content = self.tokenizer.decode(token_buffer, utf8_errors="ignore")
-                token_buffer.clear()
-                if content:
-                    chunk = {
-                        "object": "chat.completion.chunk",
-                        "choices": [{"index": 0, "delta": {"content": content}}],
-                    }
-                    yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+            flushed = self._flush_stop_state(stop_state, final=True)
+            if flushed:
+                text_buffer += flushed
+            if text_buffer:
+                chunk = {
+                    "object": "chat.completion.chunk",
+                    "choices": [{"index": 0, "delta": {"content": text_buffer}}],
+                }
+                yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
 
             chunk = {
                 "object": "chat.completion.chunk",
@@ -559,7 +642,7 @@ class InferenceEngine:
         alpha_presence=1.0,
         alpha_frequency=0.1,
         alpha_decay=0.996,
-        stop_tokens=(0, 261, 24281),
+        stop_tokens=("\nUser:",),
         chunk_size=32,
         session_id=None,
         state_manager=None,
@@ -571,7 +654,9 @@ class InferenceEngine:
             tokens = encoded_prompts[0]
             out = self.model.forward(tokens, state).float()
 
-            token_buffer = []
+            stop_state = self._create_stop_state(stop_tokens)
+            buffered_tokens = 0
+            text_buffer = ""
 
             while max_length > 0:
                 max_length -= 1
@@ -594,45 +679,46 @@ class InferenceEngine:
 
                 tok = new_tokens[0]
 
-                if tok in stop_tokens:
-                    if token_buffer:
-                        content = self.tokenizer.decode(
-                            token_buffer, utf8_errors="ignore"
-                        )
-                        token_buffer.clear()
+                content, should_stop = self._ingest_token_with_stop(stop_state, tok)
+                if content:
+                    text_buffer += content
+
+                if should_stop:
+                    flushed = self._flush_stop_state(stop_state, final=True)
+                    if flushed:
+                        text_buffer += flushed
+                    if text_buffer:
                         chunk = {
                             "object": "chat.completion.chunk",
-                            "choices": [{"index": 0, "delta": {"content": content}}],
+                            "choices": [{"index": 0, "delta": {"content": text_buffer}}],
                         }
                         yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+                        text_buffer = ""
                     break
 
-                token_buffer.append(tok)
-                if len(token_buffer) >= chunk_size:
-                    content = self.tokenizer.decode(
-                        token_buffer, utf8_errors="ignore"
-                    )
-                    token_buffer.clear()
-                    if content:
-                        chunk = {
-                            "object": "chat.completion.chunk",
-                            "choices": [{"index": 0, "delta": {"content": content}}],
-                        }
-                        yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+                buffered_tokens += 1
+                if buffered_tokens >= chunk_size and text_buffer:
+                    chunk = {
+                        "object": "chat.completion.chunk",
+                        "choices": [{"index": 0, "delta": {"content": text_buffer}}],
+                    }
+                    yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+                    text_buffer = ""
+                    buffered_tokens = 0
 
                 out = self.model.forward(tok, state).float()
 
                 await asyncio.sleep(0)
 
-            if token_buffer:
-                content = self.tokenizer.decode(token_buffer, utf8_errors="ignore")
-                token_buffer.clear()
-                if content:
-                    chunk = {
-                        "object": "chat.completion.chunk",
-                        "choices": [{"index": 0, "delta": {"content": content}}],
-                    }
-                    yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+            flushed = self._flush_stop_state(stop_state, final=True)
+            if flushed:
+                text_buffer += flushed
+            if text_buffer:
+                chunk = {
+                    "object": "chat.completion.chunk",
+                    "choices": [{"index": 0, "delta": {"content": text_buffer}}],
+                }
+                yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
 
         finally:
             if state_manager and session_id:
@@ -642,210 +728,6 @@ class InferenceEngine:
             del state
             torch.cuda.empty_cache()
             gc.collect()
-
-        yield "data: [DONE]\n\n"
-
-    async def graph_generate(
-        self,
-        inputs,
-        stop_tokens,
-        max_generate_tokens,
-        temperature=1.0,
-        top_k=50,
-        top_p=0.3,
-        alpha_presence=0.5,
-        alpha_frequency=0.5,
-        alpha_decay=0.996,
-    ):
-        prompt = inputs[0]
-        encoded_prompt = self.tokenizer.encode(prompt)
-        state = self.model.generate_zero_state(0)
-
-        try:
-            if max_generate_tokens <= 0:
-                return [""]
-
-            out = self.model.forward(encoded_prompt, state)
-
-            token = sampler_gumbel_batch(logits=out, temp=temperature).item()
-            if token in stop_tokens:
-                return [""]
-
-            static_input, _static_state, static_output, g = self._init_cuda_graph_state(
-                token, state, out
-            )
-
-            generated_tokens = [token]
-
-            for _ in range(max_generate_tokens - 1):
-                x_emb = self.model.z["emb.weight"][token]
-                static_input.copy_(x_emb)
-
-                g.replay()
-                token = self._sample_next_token(
-                    static_output,
-                    alpha_presence,
-                    alpha_frequency,
-                    alpha_decay,
-                    temperature,
-                    top_k,
-                    top_p,
-                )
-                if token in stop_tokens:
-                    break
-                generated_tokens.append(token)
-
-            decoded = self.tokenizer.decode(generated_tokens, utf8_errors="ignore")
-            return [decoded]
-        finally:
-            self._cleanup_cuda_state(state)
-
-    async def graph_infer_stream(
-        self,
-        inputs,
-        stop_tokens,
-        max_generate_tokens,
-        temperature=1.0,
-        top_k=50,
-        top_p=0.3,
-        alpha_presence=0.5,
-        alpha_frequency=0.5,
-        alpha_decay=0.996,
-        chunk_size=32,
-    ):
-        prompt = inputs[0]
-        if self.rocm_flag or not torch.cuda.is_available():
-            async for item in self.dynamic_batch_infer_stream(
-                prompt=prompt,
-                max_generate_tokens=max_generate_tokens,
-                stop_tokens=stop_tokens,
-                temperature=temperature,
-                top_k=top_k,
-                top_p=top_p,
-                alpha_presence=alpha_presence,
-                alpha_frequency=alpha_frequency,
-                alpha_decay=alpha_decay,
-                chunk_size=chunk_size,
-            ):
-                if item["type"] == "delta" and item["text"]:
-                    chunk = {
-                        "object": "chat.completion.chunk",
-                        "choices": [{"index": 0, "delta": {"content": item["text"]}}],
-                    }
-                    yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
-                    continue
-                if item["type"] == "done":
-                    chunk = {
-                        "object": "chat.completion.chunk",
-                        "choices": [
-                            {
-                                "index": 0,
-                                "delta": {},
-                                "finish_reason": item["finish_reason"],
-                            }
-                        ],
-                    }
-                    yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
-                    break
-            yield "data: [DONE]\n\n"
-            return
-
-        encoded_prompt = self.tokenizer.encode(prompt)
-        finish_reason = "length"
-        token_buffer = []
-        state = self.model.generate_zero_state(0)
-
-        try:
-            if max_generate_tokens <= 0:
-                chunk = {
-                    "object": "chat.completion.chunk",
-                    "choices": [
-                        {"index": 0, "delta": {}, "finish_reason": finish_reason}
-                    ],
-                }
-                yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
-                yield "data: [DONE]\n\n"
-                return
-
-            out = self.model.forward(encoded_prompt, state)
-            token = self._sample_next_token(
-                out,
-                alpha_presence,
-                alpha_frequency,
-                alpha_decay,
-                temperature,
-                top_k,
-                top_p,
-            )
-
-            if token in stop_tokens:
-                finish_reason = "stop"
-            else:
-                content = self.tokenizer.decode([token], utf8_errors="ignore")
-                if content:
-                    chunk = {
-                        "object": "chat.completion.chunk",
-                        "choices": [{"index": 0, "delta": {"content": content}}],
-                    }
-                    yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
-                else:
-                    token_buffer.append(token)
-
-                static_input, _static_state, static_output, g = (
-                    self._init_cuda_graph_state(token, state, out)
-                )
-
-                for _ in range(max_generate_tokens - 1):
-                    x_emb = self.model.z["emb.weight"][token]
-                    static_input.copy_(x_emb)
-
-                    g.replay()
-                    token = self._sample_next_token(
-                        static_output,
-                        alpha_presence,
-                        alpha_frequency,
-                        alpha_decay,
-                        temperature,
-                        top_k,
-                        top_p,
-                    )
-                    if token in stop_tokens:
-                        finish_reason = "stop"
-                        break
-
-                    token_buffer.append(token)
-
-                    if len(token_buffer) >= chunk_size:
-                        content = self.tokenizer.decode(token_buffer, utf8_errors="ignore")
-                        token_buffer.clear()
-                        if content:
-                            chunk = {
-                                "object": "chat.completion.chunk",
-                                "choices": [{"index": 0, "delta": {"content": content}}],
-                            }
-                            yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
-
-                    await asyncio.sleep(0)
-
-            if token_buffer:
-                content = self.tokenizer.decode(token_buffer, utf8_errors="ignore")
-                if content:
-                    chunk = {
-                        "object": "chat.completion.chunk",
-                        "choices": [{"index": 0, "delta": {"content": content}}],
-                    }
-                    yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
-
-            chunk = {
-                "object": "chat.completion.chunk",
-                "choices": [
-                    {"index": 0, "delta": {}, "finish_reason": finish_reason}
-                ],
-            }
-            yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
-
-        finally:
-            self._cleanup_cuda_state(state)
 
         yield "data: [DONE]\n\n"
 
@@ -865,7 +747,6 @@ class InferenceEngine:
         alpha_decay=0.996,
         chunk_size=32,
     ):
-        stop_tokens_set = stop_tokens
         max_generate_tokens = max_generate_tokens
         batch_size = batch_size
         pad_zero = pad_zero
@@ -890,7 +771,9 @@ class InferenceEngine:
 
         states = self.model.generate_zero_state(batch_size)
         task_pool = []
-        token_buffers = {}
+        stop_states = {}
+        chunk_token_counts = {}
+        text_buffers = {}
 
         prompt_idx = 0
         for i in range(batch_size):
@@ -905,7 +788,9 @@ class InferenceEngine:
                     "new_token": None,
                 }
             )
-            token_buffers[prompt_idx] = []
+            stop_states[prompt_idx] = self._create_stop_state(stop_tokens)
+            chunk_token_counts[prompt_idx] = 0
+            text_buffers[prompt_idx] = ""
             prompt_idx += 1
 
         occurrence = torch.zeros(
@@ -930,33 +815,48 @@ class InferenceEngine:
                         new_token = task["new_token"]
                         prompt_id = task["prompt_idx"]
 
-                        is_finished = (
-                            new_token in stop_tokens_set
-                            or len(task["generated_tokens"]) >= max_generate_tokens
+                        content, should_stop = self._ingest_token_with_stop(
+                            stop_states[prompt_id], new_token
+                        )
+
+                        if content:
+                            text_buffers[prompt_id] += content
+
+                        is_finished = should_stop or (
+                            len(task["generated_tokens"]) >= max_generate_tokens
                         )
 
                         if not is_finished:
                             task["generated_tokens"].append(new_token)
-                            token_buffers[prompt_id].append(new_token)
+                            chunk_token_counts[prompt_id] += 1
 
-                            if len(token_buffers[prompt_id]) >= chunk_size:
-                                text_chunk = self.tokenizer.decode(
-                                    token_buffers[prompt_id], utf8_errors="ignore"
+                            if (
+                                chunk_token_counts[prompt_id] >= chunk_size
+                                and text_buffers[prompt_id]
+                            ):
+                                contents_to_send[prompt_id] = (
+                                    contents_to_send.get(prompt_id, "")
+                                    + text_buffers[prompt_id]
                                 )
-                                contents_to_send[prompt_id] = text_chunk
-                                token_buffers[prompt_id].clear()
+                                text_buffers[prompt_id] = ""
+                                chunk_token_counts[prompt_id] = 0
 
                         if is_finished:
-                            if token_buffers[prompt_id]:
-                                text_chunk = self.tokenizer.decode(
-                                    token_buffers[prompt_id], utf8_errors="ignore"
-                                )
+                            text_chunk = self._flush_stop_state(
+                                stop_states[prompt_id], final=True
+                            )
+                            if text_chunk:
+                                text_buffers[prompt_id] += text_chunk
+                            if text_buffers[prompt_id]:
                                 contents_to_send[prompt_id] = (
-                                    contents_to_send.get(prompt_id, "") + text_chunk
+                                    contents_to_send.get(prompt_id, "")
+                                    + text_buffers[prompt_id]
                                 )
-                                token_buffers[prompt_id].clear()
+                                text_buffers[prompt_id] = ""
 
-                            del token_buffers[prompt_id]
+                            del stop_states[prompt_id]
+                            del chunk_token_counts[prompt_id]
+                            del text_buffers[prompt_id]
 
                             if len(input_queue) > 0:
                                 prompt, input_token = input_queue.popleft()
@@ -969,7 +869,11 @@ class InferenceEngine:
                                     "generated_tokens": [],
                                     "new_token": None,
                                 }
-                                token_buffers[new_prompt_idx] = []
+                                stop_states[new_prompt_idx] = self._create_stop_state(
+                                    stop_tokens
+                                )
+                                chunk_token_counts[new_prompt_idx] = 0
+                                text_buffers[new_prompt_idx] = ""
                                 prompt_idx += 1
 
                                 state_pos = task["state_pos"]
@@ -1098,7 +1002,6 @@ class InferenceEngine:
         alpha_frequency=0.5,
         alpha_decay=0.996,
     ):
-        stop_tokens_set = stop_tokens
         max_generate_tokens = max_generate_tokens
         batch_size = batch_size
         pad_zero = pad_zero
@@ -1123,6 +1026,8 @@ class InferenceEngine:
         states = self.model.generate_zero_state(batch_size)
         task_pool = []
         results = {}
+        stop_states = {}
+        result_parts = {}
 
         prompt_idx = 0
         for i in range(batch_size):
@@ -1137,6 +1042,8 @@ class InferenceEngine:
                     "new_token": None,
                 }
             )
+            stop_states[prompt_idx] = self._create_stop_state(stop_tokens)
+            result_parts[prompt_idx] = []
             prompt_idx += 1
 
         occurrence = torch.zeros(
@@ -1160,22 +1067,27 @@ class InferenceEngine:
                         new_token = task["new_token"]
                         prompt_id = task["prompt_idx"]
 
-                        is_finished = (
-                            new_token in stop_tokens_set
-                            or len(task["generated_tokens"]) >= max_generate_tokens
+                        content, should_stop = self._ingest_token_with_stop(
+                            stop_states[prompt_id], new_token
+                        )
+                        if content:
+                            result_parts[prompt_id].append(content)
+                        is_finished = should_stop or (
+                            len(task["generated_tokens"]) >= max_generate_tokens
                         )
 
                         if not is_finished:
                             task["generated_tokens"].append(new_token)
 
                         if is_finished:
-                            if task["generated_tokens"]:
-                                text = self.tokenizer.decode(
-                                    task["generated_tokens"], utf8_errors="ignore"
+                            result_parts[prompt_id].append(
+                                self._flush_stop_state(
+                                    stop_states[prompt_id], final=True
                                 )
-                                results[prompt_id] = text
-                            else:
-                                results[prompt_id] = ""
+                            )
+                            results[prompt_id] = "".join(result_parts[prompt_id])
+                            del stop_states[prompt_id]
+                            del result_parts[prompt_id]
 
                             if len(input_queue) > 0:
                                 prompt, input_token = input_queue.popleft()
@@ -1188,6 +1100,10 @@ class InferenceEngine:
                                     "generated_tokens": [],
                                     "new_token": None,
                                 }
+                                stop_states[new_prompt_idx] = self._create_stop_state(
+                                    stop_tokens
+                                )
+                                result_parts[new_prompt_idx] = []
                                 prompt_idx += 1
 
                                 state_pos = task["state_pos"]
@@ -1388,7 +1304,7 @@ class InferenceEngine:
         prompts,
         max_length=512,
         temperature=1.0,
-        stop_tokens=(0, 261, 24281),
+        stop_tokens=("\nUser:",),
         chunk_size=32,
     ):
         batch_size = len(prompts)
@@ -1408,8 +1324,9 @@ class InferenceEngine:
                 out = self.model.forward_batch(encoded_prompts, state)
 
                 finished = [False] * batch_size
-                generated_tokens = [[] for _ in range(batch_size)]
-                token_buffers = [[] for _ in range(batch_size)]
+                stop_states = [self._create_stop_state(stop_tokens) for _ in range(batch_size)]
+                chunk_token_counts = [0] * batch_size
+                text_buffers = [""] * batch_size
 
                 step_count = 0
                 cleanup_interval = 100
@@ -1441,23 +1358,29 @@ class InferenceEngine:
                             else new_tokens[i]
                         )
 
-                        if tok in stop_tokens:
+                        content, should_stop = self._ingest_token_with_stop(
+                            stop_states[i], tok
+                        )
+                        if content:
+                            text_buffers[i] += content
+
+                        if should_stop:
                             finished[i] = True
-                            if token_buffers[i]:
-                                contents_to_send[i] = self.tokenizer.decode(
-                                    token_buffers[i], utf8_errors="ignore"
-                                )
-                                token_buffers[i].clear()
+                            flushed = self._flush_stop_state(
+                                stop_states[i], final=True
+                            )
+                            if flushed:
+                                text_buffers[i] += flushed
+                            if text_buffers[i]:
+                                contents_to_send[i] += text_buffers[i]
+                                text_buffers[i] = ""
                             continue
 
-                        token_buffers[i].append(tok)
-                        generated_tokens[i].append(tok)
-
-                        if len(token_buffers[i]) >= chunk_size:
-                            contents_to_send[i] = self.tokenizer.decode(
-                                token_buffers[i], utf8_errors="ignore"
-                            )
-                            token_buffers[i].clear()
+                        chunk_token_counts[i] += 1
+                        if chunk_token_counts[i] >= chunk_size and text_buffers[i]:
+                            contents_to_send[i] += text_buffers[i]
+                            text_buffers[i] = ""
+                            chunk_token_counts[i] = 0
 
                     if any(contents_to_send):
                         chunk = {
@@ -1481,11 +1404,12 @@ class InferenceEngine:
 
                 remaining_contents = [""] * batch_size
                 for i in range(batch_size):
-                    if token_buffers[i]:
-                        remaining_contents[i] = self.tokenizer.decode(
-                            token_buffers[i], utf8_errors="ignore"
-                        )
-                        token_buffers[i].clear()
+                    flushed = self._flush_stop_state(
+                        stop_states[i], final=True
+                    )
+                    if flushed:
+                        text_buffers[i] += flushed
+                    remaining_contents[i] = text_buffers[i]
 
                 if any(remaining_contents):
                     chunk = {

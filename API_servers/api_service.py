@@ -18,7 +18,7 @@ class ChatRequest(BaseModel):
     prefix: list[str] = []
     suffix: list[str] = []
     max_tokens: int = 8192
-    stop_tokens: list[int] = [0, 261, 24281]
+    stop_tokens: list[str] = ["\nUser:"]
     temperature: float = 1.0
     top_k: int = 50
     top_p: float = 0.6
@@ -77,6 +77,18 @@ def create_app(engine, password=None):
             description=json.dumps(payload, ensure_ascii=False),
             headers={"Content-Type": "application/json"},
         )
+
+    def _normalize_state_prompts(prompts: list[str], reuse_existing_state: bool) -> list[str]:
+        if not reuse_existing_state:
+            return prompts
+
+        normalized_prompts = []
+        for prompt in prompts:
+            if prompt and not prompt.startswith("\n\n"):
+                normalized_prompts.append(f"\n\n{prompt}")
+            else:
+                normalized_prompts.append(prompt)
+        return normalized_prompts
 
     def _collect_session_indices(state_manager, session_index: str) -> list[int]:
         prefix = f"{session_index}:"
@@ -340,7 +352,7 @@ def create_app(engine, password=None):
                 alpha_presence=0,
                 alpha_frequency=0,
                 alpha_decay=0.996,
-                stop_tokens=[0],
+                stop_tokens=[],
             )
 
             translations_result = []
@@ -394,56 +406,6 @@ def create_app(engine, password=None):
             prompt = f"✿prefix✿✿suffix✿{suffix}✿middle✿{prefix}"
             prompts.append(prompt)
 
-        if len(prompts) == 1:
-            if req.stream:
-                return StreamingResponse(
-                    engine.graph_infer_stream(
-                        inputs=prompts,
-                        stop_tokens=req.stop_tokens,
-                        max_generate_tokens=req.max_tokens,
-                        temperature=req.temperature,
-                        top_k=req.top_k,
-                        top_p=req.top_p,
-                        alpha_presence=req.alpha_presence,
-                        alpha_frequency=req.alpha_frequency,
-                        alpha_decay=req.alpha_decay,
-                        chunk_size=req.chunk_size,
-                    ),
-                    media_type="text/event-stream",
-                )
-            results = await engine.graph_generate(
-                inputs=prompts,
-                stop_tokens=req.stop_tokens,
-                max_generate_tokens=req.max_tokens,
-                temperature=req.temperature,
-                top_k=req.top_k,
-                top_p=req.top_p,
-                alpha_presence=req.alpha_presence,
-                alpha_frequency=req.alpha_frequency,
-                alpha_decay=req.alpha_decay,
-            )
-            choices = []
-            for i, text in enumerate(results):
-                choices.append(
-                    {
-                        "index": i,
-                        "message": {"role": "assistant", "content": text},
-                        "finish_reason": "stop",
-                    }
-                )
-
-            response = {
-                "id": "rwkv7-batch-v3",
-                "object": "chat.completion",
-                "model": req.model,
-                "choices": choices,
-            }
-            return Response(
-                status_code=200,
-                description=json.dumps(response, ensure_ascii=False),
-                headers={"Content-Type": "application/json"},
-            )
-
         if req.stream:
             return StreamingResponse(
                 engine.batch_infer_stream(
@@ -455,7 +417,7 @@ def create_app(engine, password=None):
                     alpha_presence=req.alpha_presence,
                     alpha_frequency=req.alpha_frequency,
                     alpha_decay=req.alpha_decay,
-                    stop_tokens=req.stop_tokens,
+                    stop_tokens=[],
                     chunk_size=req.chunk_size,
                 ),
                 media_type="text/event-stream",
@@ -469,7 +431,7 @@ def create_app(engine, password=None):
             alpha_presence=req.alpha_presence,
             alpha_frequency=req.alpha_frequency,
             alpha_decay=req.alpha_decay,
-            stop_tokens=req.stop_tokens,
+            stop_tokens=[],
         )
         choices = []
         for i, text in enumerate(results):
@@ -520,6 +482,7 @@ def create_app(engine, password=None):
 
         state_manager = get_state_manager()
         state = state_manager.get_state(session_id)
+        had_existing_state = state is not None
 
         if state is None:
             batch_size = len(prompts)
@@ -538,6 +501,10 @@ def create_app(engine, password=None):
             print(f"[INIT] Created new state for session: {session_id}")
         else:
             print(f"[REUSE] Reusing existing state for session: {session_id}")
+
+        prompts = _normalize_state_prompts(
+            prompts, reuse_existing_state=had_existing_state
+        )
 
         if req.stream:
             return StreamingResponse(
@@ -641,6 +608,7 @@ def create_app(engine, password=None):
 
         state_manager = get_state_manager()
         state = state_manager.get_state(state_key)
+        had_existing_state = state is not None
 
         if state is None:
             if dialogue_idx != 0:
@@ -655,6 +623,10 @@ def create_app(engine, password=None):
             print(f"[INIT] Created new root state for session: {session_index}")
         else:
             print(f"[REUSE] Reusing state for session: {state_key}")
+
+        prompts = _normalize_state_prompts(
+            prompts, reuse_existing_state=had_existing_state
+        )
 
         if req.stream:
 
