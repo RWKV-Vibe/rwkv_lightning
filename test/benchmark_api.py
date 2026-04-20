@@ -216,7 +216,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--alpha-presence", type=float, default=1.0)
     p.add_argument("--alpha-frequency", type=float, default=0.1)
     p.add_argument("--alpha-decay", type=float, default=0.99)
-    p.add_argument("--stop-tokens", type=int, nargs="+", default=[0, 261, 24281])
+    p.add_argument("--stop-tokens", nargs="+", default=["\nUser:"])
     p.add_argument("--vocab", default="infer/rwkv_batch/rwkv_vocab_v20230424.txt")
     p.add_argument("--prompts-file", default="", help="Optional JSON file with a list of prompts")
     p.add_argument("--dataset", default="", help="ShareGPT JSON dataset file")
