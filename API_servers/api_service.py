@@ -1,7 +1,7 @@
 import json
 import os
 from threading import Lock
-from typing import Optional
+from typing import Any, Optional
 
 import torch
 from pydantic import BaseModel, Field, ValidationError
@@ -15,6 +15,7 @@ class ChatRequest(BaseModel):
     model: str = "rwkv7"
     runtime: Optional[str] = None
     scheduler: str = "auto"
+    n: int = 1
     contents: list[str] = Field(default_factory=list)
     messages: list[dict] = Field(default_factory=list)
     system: Optional[str] = None
@@ -37,6 +38,9 @@ class ChatRequest(BaseModel):
     session_id: Optional[str] = None
     dialogue_idx: Optional[int] = 0
     use_prefix_cache: bool = True
+    seed: Optional[int] = None
+    response_format: Optional[dict[str, Any]] = None
+    stream_options: Optional[dict[str, Any]] = None
 
 
 class TranslateRequest(BaseModel):

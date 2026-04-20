@@ -126,6 +126,12 @@ def run_benchmark(args: argparse.Namespace) -> None:
         "stream": True,
         "password": args.password,
     }
+    if args.model:
+        body["model"] = args.model
+    if args.runtime:
+        body["runtime"] = args.runtime
+    if args.scheduler:
+        body["scheduler"] = args.scheduler
 
     total_input_tokens = sum(len(tokenizer.encode(p)) for p in args.prompts)
 
@@ -209,6 +215,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Benchmark RWKV Lightning chat completions (streaming).")
     p.add_argument("--url", default="http://localhost:8000/v1/chat/completions", help="API endpoint")
     p.add_argument("--password", default="rwkv7_7.2b", help="API password")
+    p.add_argument("--model", default="", help="Optional served model alias")
+    p.add_argument("--runtime", default="", help="Optional runtime override")
+    p.add_argument("--scheduler", default="", help="Optional scheduler override")
     p.add_argument("--max-tokens", type=int, default=1024)
     p.add_argument("--temperature", type=float, default=0.8)
     p.add_argument("--top-k", type=int, default=50)

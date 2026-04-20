@@ -3,12 +3,12 @@ import os
 import time
 import traceback
 import uuid
-import json
 from typing import Any
 
 from pydantic import ValidationError
 from robyn import Response, StreamingResponse
 
+from infer.xgrammar_utils import has_xgrammar, normalize_response_format
 from state_manager.state_pool import get_state_manager
 
 
@@ -130,28 +130,40 @@ def build_internal_chat_request(body: dict, prompt: str) -> dict:
     if chunk_size is None:
         chunk_size = 1 if stream else 16
 
+    response_format = normalize_response_format(body.get("response_format"))
+
     return {
         "model": body.get("model", "rwkv7"),
         "runtime": body.get("runtime"),
         "scheduler": body.get("scheduler", "auto"),
+        "n": body.get("n", 1),
         "contents": [prompt],
         "messages": body.get("messages", []),
         "system": body.get("system"),
-        "max_tokens": body.get("max_tokens", 4096),
-        "stop_tokens": body.get("stop_tokens", ["\nUser:"]),
+        "max_tokens": _resolve_openai_max_tokens(body),
+        "stop_tokens": _normalize_openai_stop(
+            body.get("stop") if "stop" in body else body.get("stop_tokens")
+        ),
         "temperature": body.get("temperature", 1.0),
         "top_k": body.get("top_k", 20),
         "top_p": body.get("top_p", 0.6),
         "stream": stream,
         "pad_zero": body.get("pad_zero", False),
-        "alpha_presence": body.get("alpha_presence", 1),
-        "alpha_frequency": body.get("alpha_frequency", 0.1),
+        "alpha_presence": body.get(
+            "alpha_presence", body.get("presence_penalty", 0.0)
+        ),
+        "alpha_frequency": body.get(
+            "alpha_frequency", body.get("frequency_penalty", 0.0)
+        ),
         "alpha_decay": body.get("alpha_decay", 0.996),
         "enable_think": body.get("enable_think", False),
         "chunk_size": chunk_size,
         "password": body.get("password"),
         "session_id": body.get("session_id"),
         "use_prefix_cache": body.get("use_prefix_cache", True),
+        "seed": body.get("seed"),
+        "response_format": response_format,
+        "stream_options": body.get("stream_options"),
     }
 
 
@@ -197,6 +209,72 @@ def _json_response(status_code: int, payload: dict):
     )
 
 
+def _openai_error_response(
+    status_code: int,
+    message: str,
+    *,
+    error_type: str = "invalid_request_error",
+    param: str | None = None,
+    code: str | None = None,
+):
+    payload = {
+        "error": {
+            "message": message,
+            "type": error_type,
+            "param": param,
+            "code": code,
+        }
+    }
+    return _json_response(status_code, payload)
+
+
+def _normalize_openai_stop(stop_value):
+    if stop_value is None:
+        return ["\nUser:"]
+    if isinstance(stop_value, str):
+        return [stop_value]
+    if isinstance(stop_value, list) and all(isinstance(item, str) for item in stop_value):
+        return stop_value
+    raise ValueError("'stop' must be a string or a list of strings")
+
+
+def _resolve_openai_max_tokens(body: dict) -> int:
+    if body.get("max_tokens") is not None:
+        return int(body["max_tokens"])
+    if body.get("max_completion_tokens") is not None:
+        return int(body["max_completion_tokens"])
+    return 4096
+
+
+def _validate_openai_features(body: dict):
+    if int(body.get("n", 1)) != 1:
+        raise ValueError("Only n=1 is currently supported")
+
+    unsupported_fields = {
+        "tools": body.get("tools"),
+        "tool_choice": body.get("tool_choice"),
+        "functions": body.get("functions"),
+        "function_call": body.get("function_call"),
+        "audio": body.get("audio"),
+        "modalities": body.get("modalities"),
+    }
+    for field_name, value in unsupported_fields.items():
+        if value not in (None, [], {}, "none"):
+            raise ValueError(f"OpenAI field '{field_name}' is not supported yet")
+
+    if body.get("logprobs") not in (None, False):
+        raise ValueError("OpenAI field 'logprobs' is not supported yet")
+    if body.get("top_logprobs") not in (None, 0):
+        raise ValueError("OpenAI field 'top_logprobs' is not supported yet")
+
+    response_format = normalize_response_format(body.get("response_format"))
+    if response_format and response_format.get("type") in {"json_object", "json_schema"} and not has_xgrammar():
+        raise RuntimeError(
+            "response_format JSON modes require the optional 'xgrammar' package to be installed"
+        )
+    return response_format
+
+
 def _extract_bearer_token(request):
     headers = getattr(request, "headers", {}) or {}
     auth_header = headers.get("authorization") or headers.get("Authorization")
@@ -212,7 +290,12 @@ def _check_openai_auth(request, body: dict, password):
     body_password = body.get("password")
     if bearer_token == password or body_password == password:
         return None
-    return _json_response(401, {"error": "Unauthorized: invalid or missing password"})
+    return _openai_error_response(
+        401,
+        "Unauthorized: invalid or missing password",
+        error_type="authentication_error",
+        code="invalid_api_key",
+    )
 
 
 async def _stream_openai_chunks(
@@ -223,8 +306,10 @@ async def _stream_openai_chunks(
     created: int,
     model_name: str,
     prefix_cache_manager=None,
+    grammar_constraint=None,
 ):
     emitted_finish_reason = False
+    accumulated_text = []
     start_chunk = {
         "id": response_id,
         "object": "chat.completion.chunk",
@@ -252,6 +337,8 @@ async def _stream_openai_chunks(
         stop_tokens=req.stop_tokens,
         chunk_size=req.chunk_size,
         prefix_cache_manager=prefix_cache_manager,
+        seed=req.seed,
+        grammar_constraint=grammar_constraint,
     ):
         payload = _extract_sse_payload(item)
         if payload is None:
@@ -286,6 +373,7 @@ async def _stream_openai_chunks(
         content = choices[0].get("delta", {}).get("content")
         if not content:
             continue
+        accumulated_text.append(content)
 
         chunk = {
             "id": response_id,
@@ -302,6 +390,20 @@ async def _stream_openai_chunks(
         }
         yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
 
+    include_usage = bool((req.stream_options or {}).get("include_usage"))
+    if include_usage:
+        usage_chunk = {
+            "id": response_id,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": model_name,
+            "choices": [],
+            "usage": build_openai_usage(
+                engine.tokenizer, prompt_formatted, "".join(accumulated_text)
+            ),
+        }
+        yield f"data: {json.dumps(usage_chunk, ensure_ascii=False)}\n\n"
+
     yield "data: [DONE]\n\n"
 
 
@@ -314,6 +416,8 @@ def register_openai_routes(app, engine, password, chat_request_model):
             if auth_error is not None:
                 return auth_error
 
+            _validate_openai_features(body)
+
             served_model_id = getattr(
                 engine.args,
                 "served_model_id",
@@ -322,28 +426,24 @@ def register_openai_routes(app, engine, password, chat_request_model):
             served_aliases = set(getattr(engine.args, "model_aliases", (served_model_id,)))
             requested_model = str(body.get("model", "rwkv7")).strip()
             if requested_model and requested_model not in served_aliases:
-                return _json_response(
+                return _openai_error_response(
                     404,
-                    {
-                        "error": f"Model '{requested_model}' is not served by this process",
-                        "available_models": [served_model_id],
-                    },
+                    f"Model '{requested_model}' is not served by this process",
+                    code="model_not_found",
                 )
 
             requested_runtime = body.get("runtime")
             served_runtime = getattr(engine.args, "runtime", "fp16")
             if requested_runtime and str(requested_runtime).strip().lower() != served_runtime:
-                return _json_response(
+                return _openai_error_response(
                     400,
-                    {
-                        "error": f"Runtime '{requested_runtime}' is not available on this server",
-                        "served_runtime": served_runtime,
-                    },
+                    f"Runtime '{requested_runtime}' is not available on this server",
+                    param="runtime",
                 )
 
             prompt = extract_openai_prompt(body)
             if not prompt and not (body.get("messages") or []):
-                return _json_response(400, {"error": "Empty prompt"})
+                return _openai_error_response(400, "Empty prompt")
 
             req = chat_request_model(**build_internal_chat_request(body, prompt))
 
@@ -357,6 +457,7 @@ def register_openai_routes(app, engine, password, chat_request_model):
             created = int(time.time())
             model_name = served_model_id
             prefix_cache_manager = get_state_manager() if req.use_prefix_cache else None
+            grammar_constraint = engine.build_response_format_constraint(req.response_format)
 
             if req.stream:
                 return StreamingResponse(
@@ -368,6 +469,7 @@ def register_openai_routes(app, engine, password, chat_request_model):
                         created,
                         model_name,
                         prefix_cache_manager,
+                        grammar_constraint,
                     ),
                     media_type="text/event-stream",
                 )
@@ -383,6 +485,8 @@ def register_openai_routes(app, engine, password, chat_request_model):
                 alpha_decay=req.alpha_decay,
                 stop_tokens=req.stop_tokens,
                 prefix_cache_manager=prefix_cache_manager,
+                seed=req.seed,
+                grammar_constraint=grammar_constraint,
             )
 
             message, response_finish_reason = build_openai_message_response(
@@ -406,9 +510,18 @@ def register_openai_routes(app, engine, password, chat_request_model):
             }
             return _json_response(200, response)
         except json.JSONDecodeError as exc:
-            return _json_response(400, {"error": f"Invalid JSON: {str(exc)}"})
+            return _openai_error_response(400, f"Invalid JSON: {str(exc)}")
         except ValidationError as exc:
-            return _json_response(400, {"error": exc.errors()})
+            return _openai_error_response(400, str(exc), param="request")
+        except ValueError as exc:
+            return _openai_error_response(400, str(exc))
+        except RuntimeError as exc:
+            return _openai_error_response(400, str(exc))
         except Exception as exc:
             print(f"[ERROR] /openai/v1/chat/completions: {traceback.format_exc()}")
-            return _json_response(500, {"error": str(exc)})
+            return _openai_error_response(
+                500,
+                str(exc),
+                error_type="server_error",
+                code="internal_error",
+            )

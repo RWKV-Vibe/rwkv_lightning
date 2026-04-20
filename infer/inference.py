@@ -13,6 +13,7 @@ import torch
 
 from infer.rwkv_batch.sampler import sample
 from infer.rwkv_batch.utils import sampler_gumbel_batch
+from infer.xgrammar_utils import XGrammarRuntime
 
 
 class PagedStateManager:
@@ -74,6 +75,7 @@ class InferenceEngine:
         self._flashinfer = None
         self._flashinfer_checked = False
         self._continuous_prefill_candidates = (256, 128, 64, 32, 16, 8, 4, 2)
+        self._xgrammar_runtime = None
 
     def shutdown(self):
         self.executor.shutdown(wait=False)
@@ -168,15 +170,76 @@ class InferenceEngine:
 
         return static_input, static_state, static_output, g
 
-    def _create_sampling_state(self, batch_size, device, vocab_size=None):
+    def _create_sampling_state(self, batch_size, device, vocab_size=None, seed=None):
         return {
             "penalties": torch.zeros(
                 (batch_size, vocab_size or self.args.vocab_size),
                 dtype=torch.float32,
                 device=device,
             ),
-            "rand_states": sample.setup_rand(random.randint(0, 2**63 - 1), batch_size),
+            "rand_states": sample.setup_rand(
+                int(seed) if seed is not None else random.randint(0, 2**63 - 1),
+                batch_size,
+            ),
         }
+
+    def _get_xgrammar_runtime(self):
+        if self._xgrammar_runtime is None:
+            self._xgrammar_runtime = XGrammarRuntime(self.tokenizer, self.args.vocab_size)
+        return self._xgrammar_runtime
+
+    def build_response_format_constraint(self, response_format):
+        if not response_format:
+            return None
+        return self._get_xgrammar_runtime().build_constraint(response_format)
+
+    @staticmethod
+    def _normalize_grammar_constraints(grammar_constraints):
+        if grammar_constraints is None:
+            return []
+        if isinstance(grammar_constraints, (list, tuple)):
+            return [constraint for constraint in grammar_constraints if constraint is not None]
+        return [grammar_constraints]
+
+    def _apply_grammar_constraints_inplace(self, logits, grammar_constraints=None):
+        constraints = self._normalize_grammar_constraints(grammar_constraints)
+        if not constraints:
+            return
+
+        logits_2d = logits if logits.dim() == 2 else logits.unsqueeze(0)
+        if len(constraints) == 1 and logits_2d.shape[0] == 1:
+            constraints[0].apply(logits_2d)
+            return
+
+        if len(constraints) != logits_2d.shape[0]:
+            raise ValueError(
+                f"Grammar constraint count {len(constraints)} does not match batch size {logits_2d.shape[0]}"
+            )
+
+        for row_idx, constraint in enumerate(constraints):
+            if constraint is not None:
+                constraint.apply(logits_2d[row_idx])
+
+    def _accept_grammar_tokens(self, grammar_constraints, token_ids):
+        constraints = self._normalize_grammar_constraints(grammar_constraints)
+        if not constraints:
+            return
+
+        if isinstance(token_ids, torch.Tensor):
+            token_values = token_ids.view(-1).tolist()
+        elif isinstance(token_ids, (list, tuple)):
+            token_values = list(token_ids)
+        else:
+            token_values = [token_ids]
+
+        if len(constraints) != len(token_values):
+            raise ValueError(
+                f"Grammar constraint count {len(constraints)} does not match token count {len(token_values)}"
+            )
+
+        for constraint, token_id in zip(constraints, token_values):
+            if constraint is not None and not constraint.accept_token(int(token_id)):
+                raise RuntimeError(f"Rejected token {token_id} by grammar matcher")
 
     def _sample_with_repetition(
         self,
@@ -188,8 +251,10 @@ class InferenceEngine:
         temperature,
         top_k,
         top_p,
+        grammar_constraints=None,
     ):
         logits_reshaped = logits.unsqueeze(0).float() if logits.dim() == 1 else logits.float()
+        self._apply_grammar_constraints_inplace(logits_reshaped, grammar_constraints)
         return sample.batch_sampling_repetition_temperature_topk_topp(
             logits_reshaped,
             sampling_state["penalties"],
@@ -202,10 +267,11 @@ class InferenceEngine:
             top_p,
         )
 
-    def _sample_top_k_top_p(self, logits, top_k, top_p, temperature=1.0):
+    def _sample_top_k_top_p(self, logits, top_k, top_p, temperature=1.0, grammar_constraints=None):
         logits_reshaped = logits.unsqueeze(0).float() if logits.dim() == 1 else logits.float()
         if temperature != 1.0:
             logits_reshaped = logits_reshaped / temperature
+        self._apply_grammar_constraints_inplace(logits_reshaped, grammar_constraints)
 
         if self.rocm_flag:
             return self._torch_top_k_top_p(logits_reshaped, top_k, top_p)
@@ -230,11 +296,12 @@ class InferenceEngine:
             self._flashinfer_checked = True
         return self._flashinfer
 
-    @staticmethod
-    def _sample_throughput_tokens(logits, temperature):
+    def _sample_throughput_tokens(self, logits, temperature, grammar_constraints=None):
+        logits_reshaped = logits.unsqueeze(0) if logits.dim() == 1 else logits
+        self._apply_grammar_constraints_inplace(logits_reshaped, grammar_constraints)
         if temperature <= 0:
-            return torch.argmax(logits, dim=-1, keepdim=True)
-        return sampler_gumbel_batch(logits=logits, temp=temperature)
+            return torch.argmax(logits_reshaped, dim=-1, keepdim=True)
+        return sampler_gumbel_batch(logits=logits_reshaped, temp=temperature)
 
     def _select_continuous_prefill_group(self, task_pool):
         prefill_tasks = [
@@ -1129,6 +1196,8 @@ class InferenceEngine:
         alpha_decay=0.996,
         stop_tokens=("\nUser:",),
         prefix_cache_manager=None,
+        seed=None,
+        grammar_constraint=None,
     ):
         stop_state = self._create_stop_state(stop_tokens)
         generated_text = ""
@@ -1138,7 +1207,7 @@ class InferenceEngine:
             _, state, out = self._prefill_prompt_from_state_or_prefix(
                 prompt, prefix_cache_manager=prefix_cache_manager
             )
-            sampling_state = self._create_sampling_state(1, out.device)
+            sampling_state = self._create_sampling_state(1, out.device, seed=seed)
 
             while max_length > 0:
                 max_length -= 1
@@ -1151,9 +1220,11 @@ class InferenceEngine:
                     temperature,
                     top_k,
                     top_p,
+                    grammar_constraints=grammar_constraint,
                 ).tolist()
 
                 tok = new_tokens[0]
+                self._accept_grammar_tokens(grammar_constraint, tok)
                 content, should_stop = self._ingest_token_with_stop(stop_state, tok)
                 if content:
                     generated_text += content
@@ -1184,6 +1255,8 @@ class InferenceEngine:
         stop_tokens=("\nUser:",),
         chunk_size=32,
         prefix_cache_manager=None,
+        seed=None,
+        grammar_constraint=None,
     ):
         finish_reason = "length"
 
@@ -1194,7 +1267,7 @@ class InferenceEngine:
             stop_state = self._create_stop_state(stop_tokens)
             buffered_tokens = 0
             text_buffer = ""
-            sampling_state = self._create_sampling_state(1, out.device)
+            sampling_state = self._create_sampling_state(1, out.device, seed=seed)
 
             while max_length > 0:
                 max_length -= 1
@@ -1207,9 +1280,11 @@ class InferenceEngine:
                     temperature,
                     top_k,
                     top_p,
+                    grammar_constraints=grammar_constraint,
                 ).tolist()
 
                 tok = new_tokens[0]
+                self._accept_grammar_tokens(grammar_constraint, tok)
                 content, should_stop = self._ingest_token_with_stop(stop_state, tok)
                 if content:
                     text_buffer += content
