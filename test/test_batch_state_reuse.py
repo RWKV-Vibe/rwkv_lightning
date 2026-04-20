@@ -1,18 +1,23 @@
-import os, types
+import os, sys, types
+os.environ.setdefault("TORCH_CUDA_ARCH_LIST", "8.0;8.6;9.0;12.0")
+os.environ.setdefault("RWKV_USE_COMPILE", "0")
+
 import time
 import torch
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 from infer.rwkv_batch.rwkv7 import RWKV_x070
 from infer.rwkv_batch.utils import TRIE_TOKENIZER, sampler_simple
 
 args = types.SimpleNamespace()
 args.vocab_size = 65536
 args.head_size = 64
-args.MODEL_NAME = "/mnt/3f7ab3b2-e663-407a-831c-ee4789165577/rwkv_translate/rwkv7-g1b-1.5b-20251202-ctx8192"
+args.MODEL_NAME = "/models/rwkv7-g1f-7.2b-20260414-ctx8192"
 
 print(f'\nLoading {args.MODEL_NAME} ...\n')
 GEN_LENGTH = 50 
 model = RWKV_x070(args)
-tokenizer = TRIE_TOKENIZER("rwkv_batch/rwkv_vocab_v20230424.txt")
+tokenizer = TRIE_TOKENIZER("infer/rwkv_batch/rwkv_vocab_v20230424.txt")
 
 def run_batch_inference(prompts, state, label="Batch Infer"):
     batch_size = len(prompts)
