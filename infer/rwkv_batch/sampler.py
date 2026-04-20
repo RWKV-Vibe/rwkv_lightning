@@ -14,7 +14,7 @@ else:
     sample = load(
         name="sample",
         sources = [f"{current_path}/cuda/sampling.cpp",f"{current_path}/cuda/sampling.cu"],
-        extra_cuda_cflags=["-O3", "-res-usage", "--extra-device-vectorization", "-Xptxas -O3"],
+        extra_cuda_cflags=["-O3", "-res-usage", "--extra-device-vectorization", "-Xptxas -O3", "-gencode=arch=compute_120,code=sm_120", "-gencode=arch=compute_120,code=compute_120"],
         verbose=True,
     )
 
