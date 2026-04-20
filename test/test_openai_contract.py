@@ -98,6 +98,28 @@ def test_invalid_model(base_url: str, password: str):
     return False
 
 
+def test_invalid_runtime(base_url: str, password: str, model_name: str):
+    payload = {
+        "model": model_name,
+        "runtime": "int4",
+        "messages": [{"role": "user", "content": "hi"}],
+    }
+    try:
+        request_json(
+            "POST",
+            f"{base_url}/openai/v1/chat/completions",
+            payload,
+            headers={"Authorization": f"Bearer {password}"},
+        )
+    except urllib.error.HTTPError as exc:
+        status, raw, data = parse_error_body(exc)
+        ok = status == 400 and data.get("error", {}).get("param") == "runtime"
+        print_result("invalid runtime", ok, raw[:160])
+        return ok
+    print_result("invalid runtime", False, "request unexpectedly succeeded")
+    return False
+
+
 def test_n_validation(base_url: str, password: str, model_name: str):
     payload = {
         "model": model_name,
@@ -117,6 +139,28 @@ def test_n_validation(base_url: str, password: str, model_name: str):
         print_result("n validation", ok, raw[:160])
         return ok
     print_result("n validation", False, "request unexpectedly succeeded")
+    return False
+
+
+def test_tools_validation(base_url: str, password: str, model_name: str):
+    payload = {
+        "model": model_name,
+        "messages": [{"role": "user", "content": "hi"}],
+        "tools": [{"type": "function", "function": {"name": "foo", "parameters": {"type": "object"}}}],
+    }
+    try:
+        request_json(
+            "POST",
+            f"{base_url}/openai/v1/chat/completions",
+            payload,
+            headers={"Authorization": f"Bearer {password}"},
+        )
+    except urllib.error.HTTPError as exc:
+        status, raw, data = parse_error_body(exc)
+        ok = status == 400 and data.get("error", {}).get("type") == "invalid_request_error"
+        print_result("tools validation", ok, raw[:160])
+        return ok
+    print_result("tools validation", False, "request unexpectedly succeeded")
     return False
 
 
@@ -286,7 +330,9 @@ def main():
     tests = [
         ("invalid auth", lambda: test_invalid_auth(args.base_url)),
         ("invalid model", lambda: test_invalid_model(args.base_url, args.password)),
+        ("invalid runtime", lambda: test_invalid_runtime(args.base_url, args.password, args.model)),
         ("n validation", lambda: test_n_validation(args.base_url, args.password, args.model)),
+        ("tools validation", lambda: test_tools_validation(args.base_url, args.password, args.model)),
         ("stop + penalties", lambda: test_stop_and_penalties(args.base_url, args.password, args.model)),
         ("seed determinism", lambda: test_seed_determinism(args.base_url, args.password, args.model)),
         ("stream usage", lambda: test_stream_usage(args.base_url, args.password, args.model)),
