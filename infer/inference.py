@@ -303,6 +303,99 @@ class InferenceEngine:
             return torch.argmax(logits_reshaped, dim=-1, keepdim=True)
         return sampler_gumbel_batch(logits=logits_reshaped, temp=temperature)
 
+    @staticmethod
+    def _filter_logits_top_k_top_p(logits, top_k, top_p):
+        filtered = logits.clone()
+        if top_k > 0:
+            top_k = min(top_k, filtered.size(-1))
+            threshold = torch.topk(filtered, top_k, dim=-1)[0][..., -1, None]
+            filtered = filtered.masked_fill(filtered < threshold, -float("Inf"))
+
+        if top_p < 1.0:
+            sorted_logits, sorted_indices = torch.sort(filtered, descending=True, dim=-1)
+            cumulative_probs = torch.cumsum(torch.softmax(sorted_logits, dim=-1), dim=-1)
+            sorted_indices_to_remove = cumulative_probs > top_p
+            sorted_indices_to_remove[..., :1] = False
+            indices_to_remove = sorted_indices_to_remove.scatter(
+                dim=-1,
+                index=sorted_indices,
+                src=sorted_indices_to_remove,
+            )
+            filtered = filtered.masked_fill(indices_to_remove, -float("Inf"))
+        return filtered
+
+    @staticmethod
+    def _safe_float(value):
+        if torch.isinf(value):
+            return float("-inf") if value < 0 else float("inf")
+        return float(value.item())
+
+    def _token_bytes(self, token_id):
+        raw = getattr(self.tokenizer, "idx2token", {}).get(int(token_id))
+        if isinstance(raw, bytes):
+            return list(raw)
+        if isinstance(raw, str):
+            return list(raw.encode("utf-8"))
+        try:
+            return list(self.tokenizer.decode([int(token_id)], utf8_errors="ignore").encode("utf-8"))
+        except Exception:
+            return []
+
+    def _token_text(self, token_id):
+        raw = getattr(self.tokenizer, "idx2token", {}).get(int(token_id))
+        if isinstance(raw, bytes):
+            return raw.decode("utf-8", errors="ignore")
+        if isinstance(raw, str):
+            return raw
+        try:
+            return self.tokenizer.decode([int(token_id)], utf8_errors="ignore")
+        except Exception:
+            return ""
+
+    def _prepare_logprob_logits(
+        self,
+        logits,
+        sampling_state,
+        alpha_presence,
+        alpha_frequency,
+        temperature,
+        top_k,
+        top_p,
+        grammar_constraint=None,
+    ):
+        logits_2d = logits.unsqueeze(0).float() if logits.dim() == 1 else logits.float()
+        adjusted = logits_2d.clone()
+        penalties = sampling_state["penalties"]
+        if penalties.shape[0] == adjusted.shape[0]:
+            penalty_mask = (penalties > 0).float()
+            adjusted = adjusted - penalty_mask * alpha_presence - penalties * alpha_frequency
+        if temperature != 1.0:
+            adjusted = adjusted / temperature
+        self._apply_grammar_constraints_inplace(adjusted, grammar_constraint)
+        return self._filter_logits_top_k_top_p(adjusted, top_k, top_p)
+
+    def _build_logprob_entry(self, filtered_logits, token_id, top_logprobs):
+        log_probs = torch.log_softmax(filtered_logits, dim=-1)
+        token_id = int(token_id)
+        entry = {
+            "token": self._token_text(token_id),
+            "logprob": self._safe_float(log_probs[token_id]),
+            "bytes": self._token_bytes(token_id),
+            "top_logprobs": [],
+        }
+
+        if top_logprobs > 0:
+            top_vals, top_ids = torch.topk(log_probs, min(top_logprobs, log_probs.shape[-1]))
+            entry["top_logprobs"] = [
+                {
+                    "token": self._token_text(idx),
+                    "logprob": self._safe_float(val),
+                    "bytes": self._token_bytes(idx),
+                }
+                for val, idx in zip(top_vals, top_ids.tolist())
+            ]
+        return entry
+
     def _select_continuous_prefill_group(self, task_pool):
         prefill_tasks = [
             task
@@ -1238,6 +1331,80 @@ class InferenceEngine:
 
             generated_text += self._flush_stop_state(stop_state, final=True)
             return generated_text, finish_reason
+        finally:
+            del state
+            gc.collect()
+
+    async def singe_infer_with_metadata(
+        self,
+        prompt,
+        max_length=512,
+        temperature=1.0,
+        top_k=50,
+        top_p=0.6,
+        alpha_presence=1.0,
+        alpha_frequency=0.1,
+        alpha_decay=0.996,
+        stop_tokens=("\nUser:",),
+        prefix_cache_manager=None,
+        seed=None,
+        grammar_constraint=None,
+        top_logprobs=0,
+    ):
+        stop_state = self._create_stop_state(stop_tokens)
+        generated_text = ""
+        finish_reason = "length"
+        logprob_entries = []
+
+        try:
+            _, state, out = self._prefill_prompt_from_state_or_prefix(
+                prompt, prefix_cache_manager=prefix_cache_manager
+            )
+            sampling_state = self._create_sampling_state(1, out.device, seed=seed)
+
+            while max_length > 0:
+                max_length -= 1
+                filtered_logits = self._prepare_logprob_logits(
+                    out,
+                    sampling_state,
+                    alpha_presence,
+                    alpha_frequency,
+                    temperature,
+                    top_k,
+                    top_p,
+                    grammar_constraint,
+                )
+                new_tokens = self._sample_with_repetition(
+                    out,
+                    sampling_state,
+                    alpha_presence,
+                    alpha_frequency,
+                    alpha_decay,
+                    temperature,
+                    top_k,
+                    top_p,
+                    grammar_constraints=grammar_constraint,
+                ).tolist()
+
+                tok = new_tokens[0]
+                self._accept_grammar_tokens(grammar_constraint, tok)
+                if tok != 0:
+                    logprob_entries.append(
+                        self._build_logprob_entry(filtered_logits[0], tok, top_logprobs)
+                    )
+                content, should_stop = self._ingest_token_with_stop(stop_state, tok)
+                if content:
+                    generated_text += content
+
+                if should_stop:
+                    finish_reason = "stop"
+                    break
+
+                out = self.model.forward(tok, state).float()
+                await asyncio.sleep(0)
+
+            generated_text += self._flush_stop_state(stop_state, final=True)
+            return generated_text, finish_reason, logprob_entries
         finally:
             del state
             gc.collect()
