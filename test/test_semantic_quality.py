@@ -161,6 +161,82 @@ def semantic_tool_call(base_url: str, password: str, model: str):
     return ok
 
 
+def semantic_tool_auto_answer(base_url: str, password: str, model: str):
+    payload = {
+        "model": model,
+        "messages": [{"role": "user", "content": "What is 10 minus 7? Reply with only the number."}],
+        "tools": [
+            {
+                "type": "function",
+                "function": {
+                    "name": "lookup_weather",
+                    "description": "Look up weather.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"city": {"type": "string"}},
+                        "required": ["city"],
+                    },
+                },
+            }
+        ],
+        "tool_choice": "auto",
+        "max_tokens": 8,
+        "temperature": 0.1,
+    }
+    status, data = request_json(
+        "POST",
+        f"{base_url}/openai/v1/chat/completions",
+        payload,
+        timeout=180,
+        headers={"Authorization": f"Bearer {password}"},
+    )
+    message = data.get("choices", [{}])[0].get("message", {})
+    content = (message.get("content") or "").strip()
+    ok = status == 200 and not message.get("tool_calls") and "3" in content
+    print_result("semantic tool auto answer", ok, content[:120])
+    return ok
+
+
+def semantic_tool_auto_tool(base_url: str, password: str, model: str):
+    payload = {
+        "model": model,
+        "messages": [{"role": "user", "content": "Please use the weather tool for Tokyo."}],
+        "tools": [
+            {
+                "type": "function",
+                "function": {
+                    "name": "lookup_weather",
+                    "description": "Get weather for a city.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"city": {"type": "string"}},
+                        "required": ["city"],
+                        "additionalProperties": False,
+                    },
+                },
+            }
+        ],
+        "tool_choice": "auto",
+        "max_tokens": 48,
+        "temperature": 0.2,
+    }
+    status, data = request_json(
+        "POST",
+        f"{base_url}/openai/v1/chat/completions",
+        payload,
+        timeout=180,
+        headers={"Authorization": f"Bearer {password}"},
+    )
+    message = data.get("choices", [{}])[0].get("message", {})
+    tool_calls = message.get("tool_calls") or []
+    arguments = {}
+    if tool_calls:
+        arguments = json.loads(tool_calls[0].get("function", {}).get("arguments", "{}"))
+    ok = status == 200 and tool_calls and tool_calls[0].get("function", {}).get("name") == "lookup_weather" and arguments.get("city") == "Tokyo"
+    print_result("semantic tool auto tool", ok, json.dumps(arguments, ensure_ascii=False)[:120])
+    return ok
+
+
 def main():
     parser = argparse.ArgumentParser(description="Semantic quality checks for RWKV Lightning")
     parser.add_argument("--base-url", default="http://127.0.0.1:8000")
@@ -173,6 +249,8 @@ def main():
         semantic_stateful_memory,
         semantic_json_schema,
         semantic_tool_call,
+        semantic_tool_auto_answer,
+        semantic_tool_auto_tool,
     ]
 
     failures = []

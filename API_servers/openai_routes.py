@@ -339,9 +339,13 @@ def _normalize_tool_choice(body: dict, tools: list[dict]):
 def _tool_choice_requires_tool_call(tool_choice, tools: list[dict]) -> bool:
     if not tools:
         return False
-    if tool_choice == "none":
+    if tool_choice is None:
         return False
-    return True
+    if isinstance(tool_choice, str):
+        if tool_choice in {"none", "auto"}:
+            return False
+        return tool_choice == "required"
+    return tool_choice == "required" or isinstance(tool_choice, dict)
 
 
 def _tool_names_for_choice(tool_choice, tools: list[dict]) -> list[str]:
@@ -364,36 +368,22 @@ def _build_tool_response_format(tools: list[dict], tool_choice) -> dict:
             {
                 "type": "object",
                 "properties": {
-                    "name": {"const": name},
+                    "tool_name": {"const": name},
                     "arguments": parameters_schema,
                 },
-                "required": ["name", "arguments"],
+                "required": ["tool_name", "arguments"],
                 "additionalProperties": False,
             }
         )
 
     if not one_of_items:
         raise ValueError("No valid tools available for tool_choice")
-
-    schema = {
-        "type": "object",
-        "properties": {
-            "tool_calls": {
-                "type": "array",
-                "minItems": 1,
-                "maxItems": 1,
-                "items": one_of_items[0] if len(one_of_items) == 1 else {"oneOf": one_of_items},
-            }
-        },
-        "required": ["tool_calls"],
-        "additionalProperties": False,
-    }
     return {
         "type": "json_schema",
         "json_schema": {
             "name": "tool_call_response",
             "strict": True,
-            "schema": schema,
+            "schema": one_of_items[0] if len(one_of_items) == 1 else {"oneOf": one_of_items},
         },
     }
 
@@ -402,7 +392,7 @@ def _build_tool_instruction_block(tools: list[dict], tool_choice) -> str:
     allowed_names = set(_tool_names_for_choice(tool_choice, tools))
     lines = [
         "You must respond by selecting a tool call in JSON.",
-        "Return only a JSON object with the shape {'tool_calls': [{'name': ..., 'arguments': {...}}] }.",
+        "Return only a JSON object with the shape {'tool_name': '...', 'arguments': {...}}.",
         "Do not answer in natural language.",
         "Available tools:",
     ]
@@ -417,6 +407,43 @@ def _build_tool_instruction_block(tools: list[dict], tool_choice) -> str:
     if isinstance(tool_choice, dict):
         lines.append(f"You must call exactly the function '{tool_choice['function']['name']}'.")
     return "\n".join(lines)
+
+
+def _build_tool_router_instruction_block(tools: list[dict]) -> str:
+    lines = [
+        "Decide whether the assistant should answer directly or call a tool.",
+        "Return only JSON.",
+        "Use {'mode':'answer'} when no tool is necessary.",
+        "Use {'mode':'tool','tool_name':'<name>'} when exactly one tool should be called.",
+        "Use 'answer' for simple arithmetic, general knowledge, summarization, or any request solvable from the prompt alone.",
+        "Use 'tool' only when the request explicitly needs one of the provided tools or external side effects/data.",
+        "Available tools:",
+    ]
+    for tool in tools:
+        lines.append(
+            f"- {tool['function']['name']}: {tool['function'].get('description') or ''}"
+        )
+    return "\n".join(lines)
+
+
+def _build_tool_router_response_format(tools: list[dict]) -> dict:
+    tool_names = [tool["function"]["name"] for tool in tools]
+    return {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "tool_router_response",
+            "strict": True,
+            "schema": {
+                "type": "object",
+                "properties": {
+                    "mode": {"type": "string", "enum": ["answer", "tool"]},
+                    "tool_name": {"type": "string", "enum": tool_names},
+                },
+                "required": ["mode"],
+                "additionalProperties": False,
+            },
+        },
+    }
 
 
 def _inject_instruction_before_assistant(prompt_formatted: str, instruction_block: str) -> str:
@@ -441,38 +468,174 @@ def _build_openai_usage_many(tokenizer, prompt_text: str, completion_texts: list
     }
 
 
+def _scan_json_string_end(text: str, start_idx: int):
+    escaped = False
+    idx = start_idx + 1
+    while idx < len(text):
+        ch = text[idx]
+        if escaped:
+            escaped = False
+        elif ch == "\\":
+            escaped = True
+        elif ch == '"':
+            return idx
+        idx += 1
+    return None
+
+
+def _skip_json_whitespace(text: str, idx: int) -> int:
+    while idx < len(text) and text[idx] in " \t\r\n":
+        idx += 1
+    return idx
+
+
+def _extract_json_string_field(text: str, field_name: str):
+    marker = f'"{field_name}"'
+    marker_idx = text.find(marker)
+    if marker_idx == -1:
+        return None
+    colon_idx = text.find(":", marker_idx + len(marker))
+    if colon_idx == -1:
+        return None
+    value_idx = _skip_json_whitespace(text, colon_idx + 1)
+    if value_idx >= len(text) or text[value_idx] != '"':
+        return None
+    end_idx = _scan_json_string_end(text, value_idx)
+    if end_idx is None:
+        return None
+    return json.loads(text[value_idx : end_idx + 1])
+
+
+def _find_json_value_start_for_field(text: str, field_name: str):
+    marker = f'"{field_name}"'
+    marker_idx = text.find(marker)
+    if marker_idx == -1:
+        return None
+    colon_idx = text.find(":", marker_idx + len(marker))
+    if colon_idx == -1:
+        return None
+    value_idx = _skip_json_whitespace(text, colon_idx + 1)
+    if value_idx >= len(text):
+        return None
+    return value_idx
+
+
+def _find_json_value_end(text: str, start_idx: int):
+    if start_idx is None or start_idx >= len(text):
+        return None
+
+    first = text[start_idx]
+    if first == '"':
+        end_idx = _scan_json_string_end(text, start_idx)
+        return None if end_idx is None else end_idx + 1
+
+    if first in "[{":
+        stack = [first]
+        idx = start_idx + 1
+        in_string = False
+        escaped = False
+        closing = {"{": "}", "[": "]"}
+        while idx < len(text):
+            ch = text[idx]
+            if in_string:
+                if escaped:
+                    escaped = False
+                elif ch == "\\":
+                    escaped = True
+                elif ch == '"':
+                    in_string = False
+            else:
+                if ch == '"':
+                    in_string = True
+                elif ch in "[{":
+                    stack.append(ch)
+                elif ch in "]}":
+                    if not stack:
+                        return None
+                    opener = stack.pop()
+                    if closing[opener] != ch:
+                        return None
+                    if not stack:
+                        return idx + 1
+            idx += 1
+        return None
+
+    for idx in range(start_idx, len(text)):
+        if text[idx] in ",}]\n\r\t ":
+            return idx
+    return len(text)
+
+
+class _IncrementalToolCallAssembler:
+    def __init__(self):
+        self.buffer = ""
+        self.tool_call_id = f"call_{uuid.uuid4().hex}"
+        self.tool_name = None
+        self.name_emitted = False
+        self.arguments_start = None
+        self.arguments_emitted_upto = None
+
+    def ingest(self, content: str):
+        self.buffer += content
+        deltas = []
+
+        if self.tool_name is None:
+            self.tool_name = _extract_json_string_field(self.buffer, "tool_name")
+
+        if self.tool_name is not None and not self.name_emitted:
+            self.name_emitted = True
+            deltas.append(
+                {
+                    "index": 0,
+                    "id": self.tool_call_id,
+                    "type": "function",
+                    "function": {"name": self.tool_name},
+                }
+            )
+
+        current_arg_start = _find_json_value_start_for_field(self.buffer, "arguments")
+        if current_arg_start is not None and self.arguments_start is None:
+            self.arguments_start = current_arg_start
+            self.arguments_emitted_upto = current_arg_start
+
+        if self.arguments_start is not None:
+            value_end = _find_json_value_end(self.buffer, self.arguments_start)
+            emit_upto = len(self.buffer) if value_end is None else value_end
+            if self.name_emitted and emit_upto > self.arguments_emitted_upto:
+                fragment = self.buffer[self.arguments_emitted_upto : emit_upto]
+                self.arguments_emitted_upto = emit_upto
+                if fragment:
+                    deltas.append(
+                        {
+                            "index": 0,
+                            "function": {"arguments": fragment},
+                        }
+                    )
+
+        return deltas
+
+
 def _parse_tool_response(result_text: str, tool_choice) -> tuple[dict[str, Any], str]:
     payload = json.loads(result_text)
-    tool_calls_payload = payload.get("tool_calls")
-    if not isinstance(tool_calls_payload, list) or not tool_calls_payload:
-        raise ValueError("Tool calling response did not contain a non-empty tool_calls array")
-
-    tool_calls = []
-    for tool_call in tool_calls_payload:
-        if not isinstance(tool_call, dict):
-            raise ValueError("Tool calling response contains an invalid tool_call entry")
-        name = str(tool_call.get("name", "")).strip()
-        if not name:
-            raise ValueError("Tool calling response is missing tool_call.name")
-        if isinstance(tool_choice, dict) and name != tool_choice["function"]["name"]:
-            raise ValueError(
-                f"Tool calling response used '{name}' but tool_choice requires '{tool_choice['function']['name']}'"
-            )
-        arguments = tool_call.get("arguments", {})
-        if isinstance(arguments, str):
-            arguments_json = arguments
-        else:
-            arguments_json = json.dumps(arguments, ensure_ascii=False)
-        tool_calls.append(
-            {
-                "id": f"call_{uuid.uuid4().hex}",
-                "type": "function",
-                "function": {
-                    "name": name,
-                    "arguments": arguments_json,
-                },
-            }
+    name = str(payload.get("tool_name", "")).strip()
+    if not name:
+        raise ValueError("Tool calling response is missing tool_name")
+    if isinstance(tool_choice, dict) and name != tool_choice["function"]["name"]:
+        raise ValueError(
+            f"Tool calling response used '{name}' but tool_choice requires '{tool_choice['function']['name']}'"
         )
+    arguments = payload.get("arguments", {})
+    arguments_json = arguments if isinstance(arguments, str) else json.dumps(arguments, ensure_ascii=False)
+    tool_calls = [
+        {
+            "id": f"call_{uuid.uuid4().hex}",
+            "type": "function",
+            "function": {
+                "name": name,
+                "arguments": arguments_json,
+            },
+        }
+    ]
 
     return {"role": "assistant", "content": None, "tool_calls": tool_calls}, "tool_calls"
 
@@ -493,11 +656,8 @@ def _validate_openai_features(body: dict):
         if value not in (None, [], {}, "none"):
             raise ValueError(f"OpenAI field '{field_name}' is not supported yet")
 
-    if body.get("stream") and logprobs_enabled:
-        raise ValueError("Streaming logprobs are not supported yet")
-
-    if body.get("stream") and _tool_choice_requires_tool_call(tool_choice, tools):
-        raise ValueError("Streaming tool calls are not supported yet")
+    if body.get("stream") and logprobs_enabled and tools:
+        raise ValueError("Streaming logprobs together with streaming tool calls are not supported yet")
 
     response_format = normalize_response_format(body.get("response_format"))
     if response_format and tools:
@@ -553,6 +713,8 @@ async def _stream_openai_chunks(
     choice_index: int = 0,
     usage_collector: list[str] | None = None,
     seed=None,
+    top_logprobs: int = 0,
+    tool_choice=None,
 ):
     emitted_finish_reason = False
     accumulated_text = []
@@ -571,73 +733,125 @@ async def _stream_openai_chunks(
     }
     yield f"data: {json.dumps(start_chunk, ensure_ascii=False)}\n\n"
 
-    async for item in engine.singe_infer_stream(
-        prompt=prompt_formatted,
-        max_length=req.max_tokens,
-        temperature=req.temperature,
-        top_k=req.top_k,
-        top_p=req.top_p,
-        alpha_presence=req.alpha_presence,
-        alpha_frequency=req.alpha_frequency,
-        alpha_decay=req.alpha_decay,
-        stop_tokens=req.stop_tokens,
-        chunk_size=req.chunk_size,
-        prefix_cache_manager=prefix_cache_manager,
-        seed=seed,
-        grammar_constraint=grammar_constraint,
-    ):
-        payload = _extract_sse_payload(item)
-        if payload is None:
-            continue
-
-        if payload == "[DONE]":
-            if not emitted_finish_reason:
+    if top_logprobs > 0:
+        async for event in engine.singe_infer_stream_with_metadata(
+            prompt=prompt_formatted,
+            max_length=req.max_tokens,
+            temperature=req.temperature,
+            top_k=req.top_k,
+            top_p=req.top_p,
+            alpha_presence=req.alpha_presence,
+            alpha_frequency=req.alpha_frequency,
+            alpha_decay=req.alpha_decay,
+            stop_tokens=req.stop_tokens,
+            chunk_size=req.chunk_size,
+            prefix_cache_manager=prefix_cache_manager,
+            seed=seed,
+            grammar_constraint=grammar_constraint,
+            top_logprobs=top_logprobs,
+        ):
+            if event["type"] == "done":
                 yield _emit_finish_reason_chunk(
-                    response_id, created, model_name, "stop", choice_index
+                    response_id,
+                    created,
+                    model_name,
+                    event["finish_reason"],
+                    choice_index,
                 )
-            break
+                emitted_finish_reason = True
+                continue
 
-        try:
-            chunk_payload = json.loads(payload)
-        except json.JSONDecodeError:
-            continue
-        choices = chunk_payload.get("choices") or []
-        if not choices:
-            continue
+            content = event.get("text", "")
+            logprobs = event.get("logprobs", [])
+            if not content and not logprobs:
+                continue
+            if content:
+                accumulated_text.append(content)
+                if usage_collector is not None:
+                    usage_collector.append(content)
+            chunk = {
+                "id": response_id,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": model_name,
+                "choices": [
+                    {
+                        "index": choice_index,
+                        "delta": {"content": content},
+                        "logprobs": _build_openai_logprobs_payload(logprobs),
+                        "finish_reason": None,
+                    }
+                ],
+            }
+            yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+    else:
+        async for item in engine.singe_infer_stream(
+            prompt=prompt_formatted,
+            max_length=req.max_tokens,
+            temperature=req.temperature,
+            top_k=req.top_k,
+            top_p=req.top_p,
+            alpha_presence=req.alpha_presence,
+            alpha_frequency=req.alpha_frequency,
+            alpha_decay=req.alpha_decay,
+            stop_tokens=req.stop_tokens,
+            chunk_size=req.chunk_size,
+            prefix_cache_manager=prefix_cache_manager,
+            seed=seed,
+            grammar_constraint=grammar_constraint,
+        ):
+            payload = _extract_sse_payload(item)
+            if payload is None:
+                continue
 
-        finish_reason = choices[0].get("finish_reason")
-        if finish_reason is not None:
-            yield _emit_finish_reason_chunk(
-                response_id,
-                created,
-                model_name,
-                finish_reason,
-                choice_index,
-            )
-            emitted_finish_reason = True
-            continue
+            if payload == "[DONE]":
+                if not emitted_finish_reason:
+                    yield _emit_finish_reason_chunk(
+                        response_id, created, model_name, "stop", choice_index
+                    )
+                break
 
-        content = choices[0].get("delta", {}).get("content")
-        if not content:
-            continue
-        accumulated_text.append(content)
-        if usage_collector is not None:
-            usage_collector.append(content)
+            try:
+                chunk_payload = json.loads(payload)
+            except json.JSONDecodeError:
+                continue
+            choices = chunk_payload.get("choices") or []
+            if not choices:
+                continue
 
-        chunk = {
-            "id": response_id,
-            "object": "chat.completion.chunk",
-            "created": created,
-            "model": model_name,
-            "choices": [
-                {
-                    "index": choice_index,
-                    "delta": {"content": content},
-                    "finish_reason": None,
-                }
-            ],
-        }
-        yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+            finish_reason = choices[0].get("finish_reason")
+            if finish_reason is not None:
+                yield _emit_finish_reason_chunk(
+                    response_id,
+                    created,
+                    model_name,
+                    finish_reason,
+                    choice_index,
+                )
+                emitted_finish_reason = True
+                continue
+
+            content = choices[0].get("delta", {}).get("content")
+            if not content:
+                continue
+            accumulated_text.append(content)
+            if usage_collector is not None:
+                usage_collector.append(content)
+
+            chunk = {
+                "id": response_id,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": model_name,
+                "choices": [
+                    {
+                        "index": choice_index,
+                        "delta": {"content": content},
+                        "finish_reason": None,
+                    }
+                ],
+            }
+            yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
 
     include_usage = bool((req.stream_options or {}).get("include_usage"))
     if include_usage and usage_collector is None:
@@ -656,6 +870,98 @@ async def _stream_openai_chunks(
     yield "data: [DONE]\n\n"
 
 
+async def _stream_openai_tool_chunks(
+    engine,
+    req,
+    prompt_formatted: str,
+    response_id: str,
+    created: int,
+    model_name: str,
+    *,
+    prefix_cache_manager=None,
+    grammar_constraint=None,
+    choice_index: int = 0,
+    usage_collector: list[str] | None = None,
+    seed=None,
+    tool_choice=None,
+    top_logprobs: int = 0,
+): 
+    start_chunk = {
+        "id": response_id,
+        "object": "chat.completion.chunk",
+        "created": created,
+        "model": model_name,
+        "choices": [
+            {
+                "index": choice_index,
+                "delta": {"role": "assistant"},
+                "finish_reason": None,
+            }
+        ],
+    }
+    yield f"data: {json.dumps(start_chunk, ensure_ascii=False)}\n\n"
+
+    result_text_parts = []
+    assembler = _IncrementalToolCallAssembler()
+    async for item in engine.singe_infer_stream(
+        prompt=prompt_formatted,
+        max_length=req.max_tokens,
+        temperature=req.temperature,
+        top_k=req.top_k,
+        top_p=req.top_p,
+        alpha_presence=req.alpha_presence,
+        alpha_frequency=req.alpha_frequency,
+        alpha_decay=req.alpha_decay,
+        stop_tokens=req.stop_tokens,
+        chunk_size=req.chunk_size,
+        prefix_cache_manager=prefix_cache_manager,
+        seed=seed,
+        grammar_constraint=grammar_constraint,
+    ):
+        payload = _extract_sse_payload(item)
+        if payload is None or payload == "[DONE]":
+            continue
+        try:
+            chunk_payload = json.loads(payload)
+        except json.JSONDecodeError:
+            continue
+        choices = chunk_payload.get("choices") or []
+        if not choices:
+            continue
+        content = choices[0].get("delta", {}).get("content")
+        if not content:
+            continue
+        result_text_parts.append(content)
+        if usage_collector is not None:
+            usage_collector.append(content)
+        for tool_delta in assembler.ingest(content):
+            chunk = {
+                "id": response_id,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": model_name,
+                "choices": [
+                    {
+                        "index": choice_index,
+                        "delta": {"tool_calls": [tool_delta]},
+                        "finish_reason": None,
+                    }
+                ],
+            }
+            yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+
+    result_text = "".join(result_text_parts)
+    _, finish_reason = _parse_tool_response(result_text, tool_choice)
+
+    yield _emit_finish_reason_chunk(
+        response_id,
+        created,
+        model_name,
+        finish_reason,
+        choice_index,
+    )
+
+
 def _choice_seed(base_seed, choice_index: int):
     if base_seed is None:
         return None
@@ -668,6 +974,49 @@ def _tool_prompt_and_response_format(prompt_formatted: str, tools: list[dict], t
         prompt_formatted, instruction_block
     )
     return prompt_with_tools, _build_tool_response_format(tools, tool_choice)
+
+
+async def _resolve_auto_tool_choice(
+    engine,
+    req,
+    prompt_formatted: str,
+    prefix_cache_manager,
+    tools: list[dict],
+):
+    router_prompt = _inject_instruction_before_assistant(
+        prompt_formatted, _build_tool_router_instruction_block(tools)
+    )
+    router_response_format = _build_tool_router_response_format(tools)
+    grammar_constraint = engine.build_response_format_constraint(router_response_format)
+    router_text, _ = await engine.singe_infer(
+        prompt=router_prompt,
+        max_length=64,
+        temperature=0.1,
+        top_k=1,
+        top_p=1.0,
+        alpha_presence=0.0,
+        alpha_frequency=0.0,
+        alpha_decay=req.alpha_decay,
+        stop_tokens=req.stop_tokens,
+        prefix_cache_manager=prefix_cache_manager,
+        seed=req.seed,
+        grammar_constraint=grammar_constraint,
+    )
+    try:
+        routing = json.loads(router_text)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Auto tool routing returned invalid JSON: {router_text}") from exc
+
+    mode = str(routing.get("mode", "answer")).strip().lower()
+    if mode == "answer":
+        return "none"
+    if mode != "tool":
+        raise ValueError(f"Unsupported auto tool routing mode '{mode}'")
+
+    tool_name = str(routing.get("tool_name", "")).strip()
+    if tool_name not in {tool["function"]["name"] for tool in tools}:
+        raise ValueError(f"Auto tool routing selected unknown tool '{tool_name}'")
+    return {"type": "function", "function": {"name": tool_name}}
 
 
 async def _generate_openai_choice(
@@ -779,6 +1128,14 @@ def register_openai_routes(app, engine, password, chat_request_model):
             prompt_formatted = format_openai_prompt(body, req.enable_think)
             tools = validated_features["tools"]
             tool_choice = validated_features["tool_choice"]
+            if tools and tool_choice == "auto":
+                tool_choice = await _resolve_auto_tool_choice(
+                    engine,
+                    req,
+                    prompt_formatted,
+                    prefix_cache_manager=get_state_manager() if req.use_prefix_cache else None,
+                    tools=tools,
+                )
             if _tool_choice_requires_tool_call(tool_choice, tools):
                 prompt_formatted, req.response_format = _tool_prompt_and_response_format(
                     prompt_formatted, tools, tool_choice
@@ -798,18 +1155,25 @@ def register_openai_routes(app, engine, password, chat_request_model):
                     usage_collector = [] if bool((req.stream_options or {}).get("include_usage")) else None
                     for choice_index in range(choice_count):
                         grammar_constraint = engine.build_response_format_constraint(req.response_format)
-                        async for chunk in _stream_openai_chunks(
+                        stream_fn = (
+                            _stream_openai_tool_chunks
+                            if _tool_choice_requires_tool_call(tool_choice, tools)
+                            else _stream_openai_chunks
+                        )
+                        async for chunk in stream_fn(
                             engine,
                             req,
                             prompt_formatted,
                             response_id,
                             created,
                             model_name,
-                            prefix_cache_manager,
-                            grammar_constraint,
+                            prefix_cache_manager=prefix_cache_manager,
+                            grammar_constraint=grammar_constraint,
                             choice_index=choice_index,
                             usage_collector=usage_collector,
                             seed=_choice_seed(req.seed, choice_index),
+                            top_logprobs=top_logprobs,
+                            tool_choice=tool_choice if _tool_choice_requires_tool_call(tool_choice, tools) else None,
                         ):
                             if chunk == "data: [DONE]\n\n":
                                 continue

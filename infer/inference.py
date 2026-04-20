@@ -396,6 +396,67 @@ class InferenceEngine:
             ]
         return entry
 
+    def _create_logprob_stop_state(self, stop_tokens):
+        return {
+            "stop_strings": self._normalize_stop_strings(stop_tokens),
+            "pending_tokens": deque(),
+            "pending_entries": deque(),
+            "window_size": 6,
+        }
+
+    def _ingest_token_with_logprobs(self, stop_state, token, logprob_entry):
+        if token == 0:
+            return "", [], True
+
+        pending_tokens = stop_state["pending_tokens"]
+        pending_entries = stop_state["pending_entries"]
+        pending_tokens.append(token)
+        pending_entries.append(logprob_entry)
+
+        decoded_window = self.tokenizer.decode(
+            list(pending_tokens), utf8_errors="ignore"
+        )
+        matched_stop = self._match_stop_suffix(
+            decoded_window, stop_state["stop_strings"]
+        )
+        if matched_stop is not None:
+            content = decoded_window[: -len(matched_stop)]
+            pending_tokens.clear()
+            # We cannot precisely map trailing stop-string bytes back to token boundaries here.
+            # Drop buffered logprobs on the matched stop boundary rather than returning wrong metadata.
+            pending_entries.clear()
+            return content, [], True
+
+        if len(pending_tokens) > stop_state["window_size"]:
+            oldest_entry = pending_entries.popleft()
+            pending_tokens.popleft()
+            trailing_text = self.tokenizer.decode(
+                list(pending_tokens), utf8_errors="ignore"
+            )
+            if not trailing_text:
+                return decoded_window, [oldest_entry], False
+            if decoded_window.endswith(trailing_text):
+                return decoded_window[: -len(trailing_text)], [oldest_entry], False
+
+            return self.tokenizer.decode([token], utf8_errors="ignore"), [logprob_entry], False
+
+        return "", [], False
+
+    def _flush_logprob_stop_state(self, stop_state, final=False):
+        pending_tokens = stop_state["pending_tokens"]
+        pending_entries = stop_state["pending_entries"]
+        if not pending_tokens:
+            return "", []
+
+        if not final and len(pending_tokens) <= stop_state["window_size"]:
+            return "", []
+
+        decoded = self.tokenizer.decode(list(pending_tokens), utf8_errors="ignore")
+        entries = list(pending_entries)
+        pending_tokens.clear()
+        pending_entries.clear()
+        return decoded, entries
+
     def _select_continuous_prefill_group(self, task_pool):
         prefill_tasks = [
             task
@@ -1503,6 +1564,126 @@ class InferenceEngine:
             gc.collect()
 
         yield "data: [DONE]\n\n"
+
+    async def singe_infer_stream_with_metadata(
+        self,
+        prompt,
+        max_length=512,
+        temperature=1.0,
+        top_k=50,
+        top_p=0.6,
+        alpha_presence=1.0,
+        alpha_frequency=0.1,
+        alpha_decay=0.996,
+        stop_tokens=("\nUser:",),
+        chunk_size=32,
+        prefix_cache_manager=None,
+        seed=None,
+        grammar_constraint=None,
+        top_logprobs=0,
+    ):
+        finish_reason = "length"
+
+        try:
+            _, state, out = self._prefill_prompt_from_state_or_prefix(
+                prompt, prefix_cache_manager=prefix_cache_manager
+            )
+            stop_state = self._create_logprob_stop_state(stop_tokens)
+            buffered_tokens = 0
+            text_buffer = ""
+            logprob_buffer = []
+            sampling_state = self._create_sampling_state(1, out.device, seed=seed)
+
+            while max_length > 0:
+                max_length -= 1
+                filtered_logits = self._prepare_logprob_logits(
+                    out,
+                    sampling_state,
+                    alpha_presence,
+                    alpha_frequency,
+                    temperature,
+                    top_k,
+                    top_p,
+                    grammar_constraint,
+                )
+                new_tokens = self._sample_with_repetition(
+                    out,
+                    sampling_state,
+                    alpha_presence,
+                    alpha_frequency,
+                    alpha_decay,
+                    temperature,
+                    top_k,
+                    top_p,
+                    grammar_constraints=grammar_constraint,
+                ).tolist()
+
+                tok = new_tokens[0]
+                self._accept_grammar_tokens(grammar_constraint, tok)
+                logprob_entry = (
+                    self._build_logprob_entry(filtered_logits[0], tok, top_logprobs)
+                    if tok != 0
+                    else None
+                )
+                content, new_entries, should_stop = self._ingest_token_with_logprobs(
+                    stop_state, tok, logprob_entry
+                )
+                if content:
+                    text_buffer += content
+                if new_entries:
+                    logprob_buffer.extend(new_entries)
+
+                if should_stop:
+                    finish_reason = "stop"
+                    flushed_text, flushed_entries = self._flush_logprob_stop_state(
+                        stop_state, final=True
+                    )
+                    if flushed_text:
+                        text_buffer += flushed_text
+                    if flushed_entries:
+                        logprob_buffer.extend(flushed_entries)
+                    if text_buffer or logprob_buffer:
+                        yield {
+                            "type": "delta",
+                            "text": text_buffer,
+                            "logprobs": logprob_buffer,
+                        }
+                        text_buffer = ""
+                        logprob_buffer = []
+                    break
+
+                buffered_tokens += 1
+                if buffered_tokens >= chunk_size and (text_buffer or logprob_buffer):
+                    yield {
+                        "type": "delta",
+                        "text": text_buffer,
+                        "logprobs": logprob_buffer,
+                    }
+                    text_buffer = ""
+                    logprob_buffer = []
+                    buffered_tokens = 0
+
+                out = self.model.forward(tok, state).float()
+                await asyncio.sleep(0)
+
+            flushed_text, flushed_entries = self._flush_logprob_stop_state(
+                stop_state, final=True
+            )
+            if flushed_text:
+                text_buffer += flushed_text
+            if flushed_entries:
+                logprob_buffer.extend(flushed_entries)
+            if text_buffer or logprob_buffer:
+                yield {
+                    "type": "delta",
+                    "text": text_buffer,
+                    "logprobs": logprob_buffer,
+                }
+
+            yield {"type": "done", "finish_reason": finish_reason}
+        finally:
+            del state
+            gc.collect()
 
     async def batch_infer_stream_state(
         self,

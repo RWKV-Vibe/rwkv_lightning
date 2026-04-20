@@ -243,50 +243,194 @@ def test_stream_n(base_url: str, password: str, model_name: str):
     return ok
 
 
-def test_stream_logprobs_rejected(base_url: str, password: str, model_name: str):
+def test_stream_logprobs(base_url: str, password: str, model_name: str):
     payload = {
         "model": model_name,
-        "messages": [{"role": "user", "content": "hi"}],
+        "messages": [{"role": "user", "content": "Reply with a short greeting."}],
         "stream": True,
         "logprobs": True,
+        "top_logprobs": 2,
+        "max_tokens": 8,
+        "temperature": 0.3,
     }
-    try:
-        request_json(
-            "POST",
-            f"{base_url}/openai/v1/chat/completions",
-            payload,
-            headers={"Authorization": f"Bearer {password}"},
-        )
-    except urllib.error.HTTPError as exc:
-        status, raw, _ = parse_error_body(exc)
-        ok = status == 400
-        print_result("stream logprobs rejected", ok, raw[:160])
-        return ok
-    print_result("stream logprobs rejected", False, "request unexpectedly succeeded")
-    return False
+    status, chunks, _ = request_stream(
+        f"{base_url}/openai/v1/chat/completions",
+        payload,
+        timeout=180,
+        headers={"Authorization": f"Bearer {password}"},
+    )
+    saw_logprobs = False
+    for chunk in chunks:
+        if not chunk.startswith("data: {"):
+            continue
+        data = json.loads(chunk[6:])
+        for choice in data.get("choices", []):
+            if choice.get("logprobs", {}).get("content"):
+                saw_logprobs = True
+    ok = status == 200 and saw_logprobs
+    print_result("stream logprobs", ok, chunks[1][:160] if len(chunks) > 1 else "")
+    return ok
 
 
-def test_stream_tools_rejected(base_url: str, password: str, model_name: str):
+def test_stream_tools(base_url: str, password: str, model_name: str):
     payload = {
         "model": model_name,
-        "messages": [{"role": "user", "content": "call foo"}],
+        "messages": [{"role": "user", "content": "Call the function create_task with title='Buy milk'."}],
         "stream": True,
-        "tools": [{"type": "function", "function": {"name": "foo", "parameters": {"type": "object"}}}],
+        "tools": [{
+            "type": "function",
+            "function": {
+                "name": "create_task",
+                "description": "Create a task.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"title": {"type": "string"}},
+                    "required": ["title"],
+                    "additionalProperties": False,
+                },
+            },
+        }],
+        "tool_choice": {"type": "function", "function": {"name": "create_task"}},
+        "max_tokens": 48,
+        "temperature": 0.2,
     }
-    try:
-        request_json(
-            "POST",
-            f"{base_url}/openai/v1/chat/completions",
-            payload,
-            headers={"Authorization": f"Bearer {password}"},
-        )
-    except urllib.error.HTTPError as exc:
-        status, raw, _ = parse_error_body(exc)
-        ok = status == 400
-        print_result("stream tools rejected", ok, raw[:160])
-        return ok
-    print_result("stream tools rejected", False, "request unexpectedly succeeded")
-    return False
+    status, chunks, _ = request_stream(
+        f"{base_url}/openai/v1/chat/completions",
+        payload,
+        timeout=240,
+        headers={"Authorization": f"Bearer {password}"},
+    )
+    saw_tool_name = False
+    saw_argument_fragments = []
+    saw_finish = False
+    for chunk in chunks:
+        if not chunk.startswith("data: {"):
+            continue
+        data = json.loads(chunk[6:])
+        for choice in data.get("choices", []):
+            delta = choice.get("delta", {})
+            for tool_delta in delta.get("tool_calls", []):
+                function = tool_delta.get("function", {})
+                if function.get("name") == "create_task":
+                    saw_tool_name = True
+                if "arguments" in function:
+                    saw_argument_fragments.append(function["arguments"])
+            if choice.get("finish_reason") == "tool_calls":
+                saw_finish = True
+    joined_arguments = "".join(saw_argument_fragments)
+    ok = (
+        status == 200
+        and saw_tool_name
+        and len(saw_argument_fragments) >= 2
+        and '"title"' in joined_arguments
+        and 'Buy milk' in joined_arguments
+        and saw_finish
+    )
+    print_result("stream tools", ok, chunks[-2][:160] if len(chunks) >= 2 else "")
+    return ok
+
+
+def test_stream_logprobs_n(base_url: str, password: str, model_name: str):
+    payload = {
+        "model": model_name,
+        "messages": [{"role": "user", "content": "Give two short greetings."}],
+        "stream": True,
+        "n": 2,
+        "logprobs": True,
+        "top_logprobs": 2,
+        "max_tokens": 8,
+        "temperature": 0.3,
+    }
+    status, chunks, _ = request_stream(
+        f"{base_url}/openai/v1/chat/completions",
+        payload,
+        timeout=240,
+        headers={"Authorization": f"Bearer {password}"},
+    )
+    seen_indices = set()
+    logprob_indices = set()
+    for chunk in chunks:
+        if not chunk.startswith("data: {"):
+            continue
+        data = json.loads(chunk[6:])
+        for choice in data.get("choices", []):
+            if "index" in choice:
+                seen_indices.add(choice["index"])
+            if choice.get("logprobs", {}).get("content"):
+                logprob_indices.add(choice.get("index"))
+    ok = status == 200 and seen_indices == {0, 1} and logprob_indices == {0, 1}
+    print_result("stream logprobs n>1", ok, ",".join(map(str, sorted(logprob_indices))))
+    return ok
+
+
+def test_tool_choice_auto_answer(base_url: str, password: str, model_name: str):
+    payload = {
+        "model": model_name,
+        "messages": [{"role": "user", "content": "What is 2+2? Reply with only the number."}],
+        "tools": [{
+            "type": "function",
+            "function": {
+                "name": "lookup_weather",
+                "description": "Look up weather.",
+                "parameters": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]},
+            },
+        }],
+        "tool_choice": "auto",
+        "max_tokens": 8,
+        "temperature": 0.1,
+    }
+    status, raw, _ = request_json(
+        "POST",
+        f"{base_url}/openai/v1/chat/completions",
+        payload,
+        timeout=180,
+        headers={"Authorization": f"Bearer {password}"},
+    )
+    data = json.loads(raw)
+    message = data.get("choices", [{}])[0].get("message", {})
+    content = (message.get("content") or "").strip()
+    ok = status == 200 and not message.get("tool_calls") and "4" in content
+    print_result("tool_choice auto answer", ok, raw[:160])
+    return ok
+
+
+def test_tool_choice_auto_tool(base_url: str, password: str, model_name: str):
+    payload = {
+        "model": model_name,
+        "messages": [{"role": "user", "content": "Use the weather tool to get weather for Paris."}],
+        "tools": [{
+            "type": "function",
+            "function": {
+                "name": "lookup_weather",
+                "description": "Get weather for a city.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"city": {"type": "string"}},
+                    "required": ["city"],
+                    "additionalProperties": False,
+                },
+            },
+        }],
+        "tool_choice": "auto",
+        "max_tokens": 48,
+        "temperature": 0.2,
+    }
+    status, raw, _ = request_json(
+        "POST",
+        f"{base_url}/openai/v1/chat/completions",
+        payload,
+        timeout=180,
+        headers={"Authorization": f"Bearer {password}"},
+    )
+    data = json.loads(raw)
+    message = data.get("choices", [{}])[0].get("message", {})
+    tool_calls = message.get("tool_calls") or []
+    arguments = {}
+    if tool_calls:
+        arguments = json.loads(tool_calls[0].get("function", {}).get("arguments", "{}"))
+    ok = status == 200 and tool_calls and tool_calls[0].get("function", {}).get("name") == "lookup_weather" and arguments.get("city") == "Paris"
+    print_result("tool_choice auto tool", ok, raw[:160])
+    return ok
 
 
 def test_stop_and_penalties(base_url: str, password: str, model_name: str):
@@ -460,8 +604,11 @@ def main():
         ("tool calling", lambda: test_tools_validation(args.base_url, args.password, args.model)),
         ("logprobs", lambda: test_logprobs(args.base_url, args.password, args.model)),
         ("stream n > 1", lambda: test_stream_n(args.base_url, args.password, args.model)),
-        ("stream logprobs rejected", lambda: test_stream_logprobs_rejected(args.base_url, args.password, args.model)),
-        ("stream tools rejected", lambda: test_stream_tools_rejected(args.base_url, args.password, args.model)),
+        ("stream logprobs", lambda: test_stream_logprobs(args.base_url, args.password, args.model)),
+        ("stream logprobs n>1", lambda: test_stream_logprobs_n(args.base_url, args.password, args.model)),
+        ("stream tools", lambda: test_stream_tools(args.base_url, args.password, args.model)),
+        ("tool_choice auto answer", lambda: test_tool_choice_auto_answer(args.base_url, args.password, args.model)),
+        ("tool_choice auto tool", lambda: test_tool_choice_auto_tool(args.base_url, args.password, args.model)),
         ("stop + penalties", lambda: test_stop_and_penalties(args.base_url, args.password, args.model)),
         ("seed determinism", lambda: test_seed_determinism(args.base_url, args.password, args.model)),
         ("stream usage", lambda: test_stream_usage(args.base_url, args.password, args.model)),
