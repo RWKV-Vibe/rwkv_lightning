@@ -101,6 +101,80 @@ __global__ void kernel_forward_w0_fp16_dither_seq(
     }
 }
 
+__global__ void kernel_forward_w0_fp16_dither_seq_paged(
+    const int B, const int T, const int C, const int H,
+    F *__restrict__ _state, const int *__restrict__ const _page_table, const F *__restrict__ const _r, const F *__restrict__ const _w, const F *__restrict__ const _k, const F *__restrict__ const _v, const F *__restrict__ const _a, const F *__restrict__ const _b,
+    F *__restrict__ const _y, const int *__restrict__ const _elapsed_t){
+
+    const int bbb = blockIdx.x / H;
+    const int h = blockIdx.x % H;
+    const int i = threadIdx.x;
+    const int page = _page_table[bbb];
+
+    __shared__ half2 state_smem[_N_][_N_ / 2];
+
+    _state += page * C * _N_ + h * _N_ * _N_;
+    constexpr int ldg_size = sizeof(int4) / sizeof(F);
+    #pragma unroll
+    for (int j0 = 0; j0 < _N_ / ldg_size; j0++){
+        int4 state_vec = ((int4 *)_state)[j0 * _N_ + i];
+        for (int j1 = 0; j1 < ldg_size / 2; j1++){
+            int row = j0 * ldg_size + i * ldg_size / _N_;
+            int col = i * ldg_size % _N_ / 2 + j1;
+            state_smem[row][(row % 32) ^ col] = ((half2 *)&state_vec)[j1];
+        }
+    }
+    __syncthreads();
+    half2 state[_N_ / 2];
+    #pragma unroll
+    for (int j = 0; j < _N_ / 2; j++)
+        state[j] = state_smem[i][(i % 32) ^ j];
+
+    __shared__ half2 r[_N_ / 2], k[_N_ / 2], w[_N_ / 2], a[_N_ / 2], b[_N_ / 2];
+
+    for (int _t = 0; _t < T; _t++){
+        const int t = bbb*T*C + h*_N_ + i + _t * C;
+        __syncthreads();
+        ((F *)w)[i] = F(exp2f(nexp_half_log2_e / (1.0f + exp2f(nlog2_e * _w[t]))) - 1.0f + rotator1(_elapsed_t[bbb]+_t));
+        ((F *)k)[i] = _k[t];
+        ((F *)a)[i] = _a[t];
+        ((F *)b)[i] = _b[t];
+        ((F *)r)[i] = _r[t];
+        __syncthreads();
+        half2 sa2 = {0., 0.};
+        #pragma unroll
+        for (int j = 0; j < _N_ / 2; j++)
+            sa2 += a[j] * state[j];
+        half sa = sa2.x + sa2.y;
+        sa2 = __half2(sa, sa);
+
+        half vv = _v[t];
+        half2 vv2 = {vv, vv};
+        half2 y2 = {0., 0.};
+        #pragma unroll
+        for (int j = 0; j < _N_ / 2; j++){
+            half2 &s = state[j];
+            s += s * w[j] + k[j] * vv2 + sa2 * b[j];
+            y2 += s * r[j];
+        }
+        _y[t] = y2.x + y2.y;
+    }
+    #pragma unroll
+    for (int j = 0; j < _N_ / 2; j++)
+        state_smem[i][(i % 32) ^ j] = state[j];
+    __syncthreads();
+    #pragma unroll
+    for (int j0 = 0; j0 < _N_ / ldg_size; j0++){
+        int4 state_vec;
+        for (int j1 = 0; j1 < ldg_size / 2; j1++){
+            int row = j0 * ldg_size + i * ldg_size / _N_;
+            int col = i * ldg_size % _N_ / 2 + j1;
+            ((half2 *)&state_vec)[j1] = state_smem[row][(row % 32) ^ col];
+        }
+        ((int4 *)_state)[j0 * _N_ + i] = state_vec;
+    }
+}
+
 __global__ void kernel_forward_w0_fp16_dither_one(
     const int B, const int C, const int H,
     F *__restrict__ _state, const F *__restrict__ const _r, const F *__restrict__ const _w, const F *__restrict__ const _k, const F *__restrict__ const _v, const F *__restrict__ const _a, const F *__restrict__ const _b,
@@ -112,6 +186,77 @@ __global__ void kernel_forward_w0_fp16_dither_one(
     __shared__ half2 state_smem[_N_][_N_ / 2];
 
     _state += bbb * C * _N_ + h * _N_ * _N_;
+    constexpr int ldg_size = sizeof(int4) / sizeof(F);
+    #pragma unroll
+    for (int j0 = 0; j0 < _N_ / ldg_size; j0++){
+        int4 state_vec = ((int4 *)_state)[j0 * _N_ + i];
+        for (int j1 = 0; j1 < ldg_size / 2; j1++){
+            int row = j0 * ldg_size + i * ldg_size / _N_;
+            int col = i * ldg_size % _N_ / 2 + j1;
+            state_smem[row][(row % 32) ^ col] = ((half2 *)&state_vec)[j1];
+        }
+    }
+    __syncthreads();
+    half2 state[_N_ / 2];
+    #pragma unroll
+    for (int j = 0; j < _N_ / 2; j++)
+        state[j] = state_smem[i][(i % 32) ^ j];
+    
+    __shared__ half2 r[_N_ / 2], k[_N_ / 2], w[_N_ / 2], a[_N_ / 2], b[_N_ / 2];
+
+    const int t = bbb * C + h * _N_ + i;
+    ((F *)w)[i] = F(exp2f(nexp_half_log2_e / (1.0f + exp2f(nlog2_e * _w[t]))) - 1.0f + rotator1(_elapsed_t[bbb]));
+    ((F *)k)[i] = _k[t];
+    ((F *)a)[i] = _a[t];
+    ((F *)b)[i] = _b[t];
+    ((F *)r)[i] = _r[t];
+    __syncthreads();
+    half2 sa2 = {0., 0.};
+    #pragma unroll
+    for (int j = 0; j < _N_ / 2; j++)
+        sa2 += a[j] * state[j];
+    half sa = sa2.x + sa2.y;
+    sa2 = __half2(sa, sa);
+
+    half vv = _v[t];
+    half2 vv2 = {vv, vv};
+    half2 y2 = {0., 0.};
+    #pragma unroll
+    for (int j = 0; j < _N_ / 2; j++){
+        half2 &s = state[j];
+        s += s * w[j] + k[j] * vv2 + sa2 * b[j];
+        y2 += s * r[j];
+    }
+    _y[t] = y2.x + y2.y;
+
+    #pragma unroll
+    for (int j = 0; j < _N_ / 2; j++)
+        state_smem[i][(i % 32) ^ j] = state[j];
+    __syncthreads();
+    #pragma unroll
+    for (int j0 = 0; j0 < _N_ / ldg_size; j0++){
+        int4 state_vec;
+        for (int j1 = 0; j1 < ldg_size / 2; j1++){
+            int row = j0 * ldg_size + i * ldg_size / _N_;
+            int col = i * ldg_size % _N_ / 2 + j1;
+            ((half2 *)&state_vec)[j1] = state_smem[row][(row % 32) ^ col];
+        }
+        ((int4 *)_state)[j0 * _N_ + i] = state_vec;
+    }
+}
+
+__global__ void kernel_forward_w0_fp16_dither_one_paged(
+    const int B, const int C, const int H,
+    F *__restrict__ _state, const int *__restrict__ const _page_table, const F *__restrict__ const _r, const F *__restrict__ const _w, const F *__restrict__ const _k, const F *__restrict__ const _v, const F *__restrict__ const _a, const F *__restrict__ const _b,
+    F *__restrict__ const _y, const int *__restrict__ const _elapsed_t){
+    const int bbb = blockIdx.x / H;
+    const int h = blockIdx.x % H;
+    const int i = threadIdx.x;
+    const int page = _page_table[bbb];
+
+    __shared__ half2 state_smem[_N_][_N_ / 2];
+
+    _state += page * C * _N_ + h * _N_ * _N_;
     constexpr int ldg_size = sizeof(int4) / sizeof(F);
     #pragma unroll
     for (int j0 = 0; j0 < _N_ / ldg_size; j0++){
@@ -347,6 +492,17 @@ void cuda_forward_one(int B, int C, int H, F *state, F *r, F *w, F *k, F *v, F *
     assert(H * _N_ == C);
     auto stream = at::hip::getCurrentHIPStreamMasqueradingAsCUDA();
    hipLaunchKernelGGL(( kernel_forward_w0_fp16_dither_one), dim3(B * H), dim3(_N_), 0, stream, B, C, H, state, r, w, k, v, a, b, y, elapsed_t);
+}
+
+void cuda_forward_seq_paged(int B, int T, int C, int H, F *state, int *page_table, F *r, F *w, F *k, F *v, F *a, F *b, F *y, int *elapsed_t){
+    assert(H * _N_ == C);
+   hipLaunchKernelGGL(( kernel_forward_w0_fp16_dither_seq_paged), dim3(B * H), dim3(_N_), 0, 0, B, T, C, H, state, page_table, r, w, k, v, a, b, y, elapsed_t);
+}
+
+void cuda_forward_one_paged(int B, int C, int H, F *state, int *page_table, F *r, F *w, F *k, F *v, F *a, F *b, F *y, int *elapsed_t){
+    assert(H * _N_ == C);
+    auto stream = at::hip::getCurrentHIPStreamMasqueradingAsCUDA();
+   hipLaunchKernelGGL(( kernel_forward_w0_fp16_dither_one_paged), dim3(B * H), dim3(_N_), 0, stream, B, C, H, state, page_table, r, w, k, v, a, b, y, elapsed_t);
 }
 
 void cuda_spmv_forward(int D, int C, F* vec1, F* mat, F* out) {

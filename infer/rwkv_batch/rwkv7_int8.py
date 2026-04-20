@@ -16,25 +16,24 @@ torch.backends.cudnn.benchmark = True
 torch.backends.cudnn.allow_tf32 = True
 torch.backends.cuda.matmul.allow_tf32 = True
 
-# torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = True
-# torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = True
+torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = True
+torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = True
 torch._C._jit_set_autocast_mode(False)
 
 import torch.nn as nn
 from torch.nn import functional as F
 from .mm_int8_kernel import linear_i8, quantize_mm8_for_linear
+from .rwkv_pointwise_op import CMIX_SHIFT_BATCH_T1_OP, TMIX_SHIFT_BATCH_T1_OP
 
-MyModule = torch.jit.ScriptModule
-MyFunction = torch.jit.script_method
-MyStatic = torch.jit.script
-# MyModule = nn.Module
-# MyFunction = torch.compile()
-# MyStatic = torch.compile()
+if os.getenv("RWKV_USE_JIT", "0") == "1":
+    MyModule = torch.jit.ScriptModule
+    MyFunction = torch.jit.script_method
+    MyStatic = torch.jit.script
+else:
+    MyModule = nn.Module
+    MyFunction = torch.compile(mode='max-autotune-no-cudagraphs')
+    MyStatic = torch.compile(mode='max-autotune-no-cudagraphs')
 MyDisable = torch.compiler.disable
-# def __nop(ob): return ob
-# MyFunction = __nop
-# MyStatic = __nop
-# MyDisable = __nop
 
 DTYPE = torch.half
 ROCm_flag = torch.version.hip is not None
@@ -152,6 +151,48 @@ def RWKV7_BATCH_OP(state:torch.Tensor, r:torch.Tensor, w:torch.Tensor, k:torch.T
 def _(state:torch.Tensor, r:torch.Tensor, w:torch.Tensor, k:torch.Tensor, v:torch.Tensor, a:torch.Tensor, b:torch.Tensor, elapsed_t:torch.Tensor) -> torch.Tensor:
     return torch.empty_like(r)
 
+
+class WKV_7_ONE_BATCH_PAGED(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, state_pool, page_table, r, w, k, v, a, b, elapsed_t):
+        with torch.no_grad():
+            B, C = r.size()
+            H = C // HEAD_SIZE
+            y = torch.empty((B, C), device=k.device, dtype=DTYPE, requires_grad=False, memory_format=torch.contiguous_format)
+            torch.ops.rwkv7_state_fwd_fp16.forward_one_paged(B, C, H, state_pool, page_table, r, w, k, v, a, b, y, elapsed_t)
+            return y
+
+
+@torch.library.custom_op("mylib::RWKV7_ONE_BATCH_PAGED_OP", mutates_args=())
+def RWKV7_ONE_BATCH_PAGED_OP(state_pool:torch.Tensor, page_table:torch.Tensor, r:torch.Tensor, w:torch.Tensor, k:torch.Tensor, v:torch.Tensor, a:torch.Tensor, b:torch.Tensor, elapsed_t:torch.Tensor) -> torch.Tensor:
+    return WKV_7_ONE_BATCH_PAGED.apply(state_pool, page_table, r, w, k, v, a, b, elapsed_t)
+
+
+@RWKV7_ONE_BATCH_PAGED_OP.register_fake
+def _(state_pool:torch.Tensor, page_table:torch.Tensor, r:torch.Tensor, w:torch.Tensor, k:torch.Tensor, v:torch.Tensor, a:torch.Tensor, b:torch.Tensor, elapsed_t:torch.Tensor) -> torch.Tensor:
+    return torch.empty_like(r)
+
+
+class WKV_7_SEQ_BATCH_PAGED(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, state_pool, page_table, r, w, k, v, a, b, elapsed_t):
+        with torch.no_grad():
+            B, T, C = r.size()
+            H = C // HEAD_SIZE
+            y = torch.empty((B, T, C), device=k.device, dtype=DTYPE, requires_grad=False, memory_format=torch.contiguous_format)
+            torch.ops.rwkv7_state_fwd_fp16.forward_seq_paged(B, T, C, H, state_pool, page_table, r, w, k, v, a, b, y, elapsed_t)
+            return y
+
+
+@torch.library.custom_op("mylib::RWKV7_BATCH_PAGED_OP", mutates_args=())
+def RWKV7_BATCH_PAGED_OP(state_pool:torch.Tensor, page_table:torch.Tensor, r:torch.Tensor, w:torch.Tensor, k:torch.Tensor, v:torch.Tensor, a:torch.Tensor, b:torch.Tensor, elapsed_t:torch.Tensor) -> torch.Tensor:
+    return WKV_7_SEQ_BATCH_PAGED.apply(state_pool, page_table, r, w, k, v, a, b, elapsed_t)
+
+
+@RWKV7_BATCH_PAGED_OP.register_fake
+def _(state_pool:torch.Tensor, page_table:torch.Tensor, r:torch.Tensor, w:torch.Tensor, k:torch.Tensor, v:torch.Tensor, a:torch.Tensor, b:torch.Tensor, elapsed_t:torch.Tensor) -> torch.Tensor:
+    return torch.empty_like(r)
+
 ########################################################################################################
 
 class RWKV_x070(MyModule):
@@ -258,6 +299,9 @@ class RWKV_x070(MyModule):
             return self.forward_one(x, state)
         
     def forward_batch(self, tokens, state, full_output=False): # will modify state in-place
+        if torch.is_tensor(tokens):
+            return self.forward_batch_same_length(tokens, state, full_output)
+
         assert type(tokens) is list
         lengths = [len(x) for x in tokens]
         if len(set(lengths)) == 1 and full_output == False:
@@ -290,8 +334,15 @@ class RWKV_x070(MyModule):
         return out
 
     def forward_batch_same_length(self, tokens, state, full_output=False):
-        assert type(tokens) is list
-        assert len(set([len(x) for x in tokens])) == 1, 'here all sequences must have the same length'
+        if torch.is_tensor(tokens):
+            seq_len = int(tokens.shape[1]) if tokens.ndim >= 2 else 1
+        else:
+            assert type(tokens) is list
+            assert len(set([len(x) for x in tokens])) == 1, 'here all sequences must have the same length'
+            seq_len = len(tokens[0]) if tokens else 0
+
+        if seq_len > 128:
+            return self.forward_seq_batch_chunk(tokens, state, chunk_len=128, full_output=full_output)
         return self.forward_seq_batch(tokens, state, full_output)
 
     @MyFunction
@@ -376,7 +427,8 @@ class RWKV_x070(MyModule):
     def forward_seq_batch(self, idxs:List[List[int]], state:List[torch.Tensor], full_output:bool=False):
         with torch.no_grad(): 
             z = self.z
-            x = z['emb.weight'][torch.tensor(idxs, device=z['emb.weight'].device)]
+            idx_tensor = idxs.to(device=z['emb.weight'].device, dtype=torch.long) if torch.is_tensor(idxs) else torch.tensor(idxs, device=z['emb.weight'].device)
+            x = z['emb.weight'][idx_tensor]
 
             v_first = torch.empty_like(x)
             for i in range(self.n_layer):
@@ -409,7 +461,7 @@ class RWKV_x070(MyModule):
             if not full_output: x = x[:,-1,:]
             x = F.layer_norm(x, (self.n_embd,), weight=z['ln_out.weight'], bias=z['ln_out.bias'])
             x = linear_i8(x, z['head.weight.q'], z['head.weight.mx'], z['head.weight.rx'], z['head.weight.my'], z['head.weight.ry'])
-            state[2] += len(idxs[0])
+            state[2] += int(idx_tensor.shape[1])
             return x
     @MyFunction
     def forward_seq_batch_chunk(self, idxs: List[List[int]], state: List[torch.Tensor], chunk_len: int = 64, full_output: bool = False):
@@ -418,7 +470,7 @@ class RWKV_x070(MyModule):
             device = z['emb.weight'].device
             
             # 转换为 Tensor，形状为 [Batch, Total_Seq_Len]
-            full_idxs = torch.tensor(idxs, device=device)
+            full_idxs = idxs.to(device=device, dtype=torch.long) if torch.is_tensor(idxs) else torch.tensor(idxs, device=device)
             batch_size, total_len = full_idxs.size()
             
             all_outputs = []
@@ -477,6 +529,157 @@ class RWKV_x070(MyModule):
             
             return x
 
+    def forward_batch_paged(self, tokens, state_pool, page_table, full_output=False):
+        if torch.is_tensor(tokens):
+            return self.forward_batch_same_length_paged(tokens, state_pool, page_table, full_output)
+
+        assert type(tokens) is list
+        lengths = [len(x) for x in tokens]
+        if len(set(lengths)) == 1 and full_output == False:
+            return self.forward_batch_same_length_paged(tokens, state_pool, page_table, full_output)
+
+        bsz = len(tokens)
+        pos = [0] * bsz
+
+        if full_output == False:
+            out = torch.empty((bsz, self.args.vocab_size), dtype=DTYPE, requires_grad=False, device="cuda")
+        else:
+            out = [torch.empty((0, self.args.vocab_size), dtype=DTYPE, requires_grad=False, device="cuda") for _ in range(bsz)]
+        while True:
+            active = [i for i in range(bsz) if pos[i] < lengths[i]]
+            if not active:
+                break
+            step = min(lengths[i] - pos[i] for i in active)
+            batch_tokens = [tokens[i][pos[i]:pos[i]+step] for i in active]
+            batch_pages = page_table[active]
+            new_out = self.forward_batch_same_length_paged(batch_tokens, state_pool, batch_pages, full_output)
+            for k, i in enumerate(active):
+                if full_output == False:
+                    out[i] = new_out[k]
+                else:
+                    out[i] = torch.cat([out[i], new_out[k]], dim=0)
+                pos[i] += step
+        return out
+
+    def forward_batch_same_length_paged(self, tokens, state_pool, page_table, full_output=False):
+        if torch.is_tensor(tokens):
+            seq_len = int(tokens.shape[1]) if tokens.ndim >= 2 else 1
+        else:
+            assert type(tokens) is list
+            assert len(set([len(x) for x in tokens])) == 1, 'here all sequences must have the same length'
+            seq_len = len(tokens[0]) if tokens else 0
+
+        if seq_len > 128:
+            return self.forward_seq_batch_chunk_paged(tokens, state_pool, page_table, chunk_len=128, full_output=full_output)
+        return self.forward_seq_batch_paged(tokens, state_pool, page_table, full_output)
+
+    @MyFunction
+    def forward_seq_batch_paged(self, idxs, state_pool: List[torch.Tensor], page_table: torch.Tensor, full_output: bool = False):
+        with torch.no_grad():
+            z = self.z
+            idx_tensor = idxs.to(device=z['emb.weight'].device, dtype=torch.long) if torch.is_tensor(idxs) else torch.tensor(idxs, device=z['emb.weight'].device)
+            page_idx = page_table.to(device=z['emb.weight'].device, dtype=torch.int32)
+            x = z['emb.weight'][idx_tensor]
+
+            state0_batch = state_pool[0][:, :, page_idx.long(), :].contiguous()
+            elapsed_t = state_pool[2][page_idx.long()].contiguous()
+            v_first = torch.empty_like(x)
+            for i in range(self.n_layer):
+                bbb = f'blocks.{i}.'
+                att = f'blocks.{i}.att.'
+                ffn = f'blocks.{i}.ffn.'
+
+                xx = F.layer_norm(x, (self.n_embd,), weight=z[bbb+'ln1.weight'], bias=z[bbb+'ln1.bias'])
+
+                xx, v_first = RWKV_x070_TMix_seq_batch_paged(i, self.n_head, self.head_size, xx, state0_batch[i], v_first, state_pool[1][i], page_idx,
+                    z[att+'x_r'], z[att+'x_w'], z[att+'x_k'], z[att+'x_v'], z[att+'x_a'], z[att+'x_g'],
+                    z[att+'w0'], z[att+'w1'], z[att+'w2'], z[att+'a0'], z[att+'a1'], z[att+'a2'], z[att+'v0'], z[att+'v1'], z[att+'v2'],
+                    z[att+'g1'], z[att+'g2'], z[att+'k_k'], z[att+'k_a'], z[att+'r_k'],
+                    z[att+'receptance.weight.q'], z[att+'receptance.weight.mx'], z[att+'receptance.weight.rx'], z[att+'receptance.weight.my'], z[att+'receptance.weight.ry'],
+                    z[att+'key.weight.q'], z[att+'key.weight.mx'], z[att+'key.weight.rx'], z[att+'key.weight.my'], z[att+'key.weight.ry'],
+                    z[att+'value.weight.q'], z[att+'value.weight.mx'], z[att+'value.weight.rx'], z[att+'value.weight.my'], z[att+'value.weight.ry'],
+                    z[att+'output.weight.q'], z[att+'output.weight.mx'], z[att+'output.weight.rx'], z[att+'output.weight.my'], z[att+'output.weight.ry'],
+                    z[att+'ln_x.weight'], z[att+'ln_x.bias'], elapsed_t)
+                x = x + xx
+
+                xx = F.layer_norm(x, (self.n_embd,), weight=z[bbb+'ln2.weight'], bias=z[bbb+'ln2.bias'])
+                xx = RWKV_x070_CMix_seq_batch(
+                    xx, state0_batch[i], z[ffn+'x_k'],
+                    z[ffn+'key.weight.q'], z[ffn+'key.weight.mx'], z[ffn+'key.weight.rx'], z[ffn+'key.weight.my'], z[ffn+'key.weight.ry'],
+                    z[ffn+'value.weight']
+                )
+                x = x + xx
+
+            state_pool[0][:, :, page_idx.long(), :] = state0_batch
+            state_pool[2][page_idx.long()] = elapsed_t + int(idx_tensor.shape[1])
+
+            if not full_output:
+                x = x[:, -1, :]
+            x = F.layer_norm(x, (self.n_embd,), weight=z['ln_out.weight'], bias=z['ln_out.bias'])
+            x = linear_i8(x, z['head.weight.q'], z['head.weight.mx'], z['head.weight.rx'], z['head.weight.my'], z['head.weight.ry'])
+            return x
+
+    @MyFunction
+    def forward_seq_batch_chunk_paged(self, idxs, state_pool: List[torch.Tensor], page_table: torch.Tensor, chunk_len: int = 64, full_output: bool = False):
+        with torch.no_grad():
+            z = self.z
+            device = z['emb.weight'].device
+            full_idxs = idxs.to(device=device, dtype=torch.long) if torch.is_tensor(idxs) else torch.tensor(idxs, device=device)
+            page_idx = page_table.to(device=device, dtype=torch.int32)
+            batch_size, total_len = full_idxs.size()
+
+            state0_batch = state_pool[0][:, :, page_idx.long(), :].contiguous()
+            elapsed_t = state_pool[2][page_idx.long()].contiguous()
+            all_outputs = []
+
+            for start in range(0, total_len, chunk_len):
+                end = min(start + chunk_len, total_len)
+                chunk_idxs = full_idxs[:, start:end]
+                x = z['emb.weight'][chunk_idxs]
+                v_first = torch.empty_like(x)
+
+                for i in range(self.n_layer):
+                    bbb = f'blocks.{i}.'
+                    att = f'blocks.{i}.att.'
+                    ffn = f'blocks.{i}.ffn.'
+
+                    xx = F.layer_norm(x, (self.n_embd,), weight=z[bbb+'ln1.weight'], bias=z[bbb+'ln1.bias'])
+                    xx, v_first = RWKV_x070_TMix_seq_batch_paged(
+                        i, self.n_head, self.head_size, xx, state0_batch[i], v_first, state_pool[1][i], page_idx,
+                        z[att+'x_r'], z[att+'x_w'], z[att+'x_k'], z[att+'x_v'], z[att+'x_a'], z[att+'x_g'],
+                        z[att+'w0'], z[att+'w1'], z[att+'w2'], z[att+'a0'], z[att+'a1'], z[att+'a2'], z[att+'v0'], z[att+'v1'], z[att+'v2'],
+                        z[att+'g1'], z[att+'g2'], z[att+'k_k'], z[att+'k_a'], z[att+'r_k'],
+                        z[att+'receptance.weight.q'], z[att+'receptance.weight.mx'], z[att+'receptance.weight.rx'], z[att+'receptance.weight.my'], z[att+'receptance.weight.ry'],
+                        z[att+'key.weight.q'], z[att+'key.weight.mx'], z[att+'key.weight.rx'], z[att+'key.weight.my'], z[att+'key.weight.ry'],
+                        z[att+'value.weight.q'], z[att+'value.weight.mx'], z[att+'value.weight.rx'], z[att+'value.weight.my'], z[att+'value.weight.ry'],
+                        z[att+'output.weight.q'], z[att+'output.weight.mx'], z[att+'output.weight.rx'], z[att+'output.weight.my'], z[att+'output.weight.ry'],
+                        z[att+'ln_x.weight'], z[att+'ln_x.bias'], elapsed_t
+                    )
+                    x = x + xx
+
+                    xx = F.layer_norm(x, (self.n_embd,), weight=z[bbb+'ln2.weight'], bias=z[bbb+'ln2.bias'])
+                    xx = RWKV_x070_CMix_seq_batch(
+                        xx, state0_batch[i], z[ffn+'x_k'],
+                        z[ffn+'key.weight.q'], z[ffn+'key.weight.mx'], z[ffn+'key.weight.rx'], z[ffn+'key.weight.my'], z[ffn+'key.weight.ry'],
+                        z[ffn+'value.weight']
+                    )
+                    x = x + xx
+
+                elapsed_t = elapsed_t + (end - start)
+
+                if full_output:
+                    all_outputs.append(x)
+                elif end == total_len:
+                    all_outputs.append(x[:, -1, :])
+
+            state_pool[0][:, :, page_idx.long(), :] = state0_batch
+            state_pool[2][page_idx.long()] = elapsed_t
+
+            x = torch.cat(all_outputs, dim=1) if full_output else all_outputs[0]
+            x = F.layer_norm(x, (self.n_embd,), weight=z['ln_out.weight'], bias=z['ln_out.bias'])
+            x = linear_i8(x, z['head.weight.q'], z['head.weight.mx'], z['head.weight.rx'], z['head.weight.my'], z['head.weight.ry'])
+            return x
+
 ########################################################################################################
 
 @MyStatic
@@ -485,7 +688,14 @@ def RWKV_x070_TMix_one(layer_id: int, H:int, N:int, x, x_prev, v_first, state, x
                        ln_w, ln_b, elapsed_t):
     xx = x_prev[0] - x
     x_prev[0] = x
-    xr, xw, xk, xv, xa, xg = x+xx*x_r, x+xx*x_w, x+xx*x_k, x+xx*x_v, x+xx*x_a, x+xx*x_g
+    xr, xw, xk, xv, xa, xg = (
+        torch.addcmul(x, xx, x_r),
+        torch.addcmul(x, xx, x_w),
+        torch.addcmul(x, xx, x_k),
+        torch.addcmul(x, xx, x_v),
+        torch.addcmul(x, xx, x_a),
+        torch.addcmul(x, xx, x_g),
+    )
 
     r = linear_i8(xr, R_q, R_mx, R_rx, R_my, R_ry)
     w = F.linear(torch.tanh(F.linear(xw, w1)), w2, bias=w0)
@@ -494,17 +704,21 @@ def RWKV_x070_TMix_one(layer_id: int, H:int, N:int, x, x_prev, v_first, state, x
     a = torch.sigmoid(F.linear(F.linear(xa, a1), a2, bias=a0))
     g = F.linear(torch.sigmoid(F.linear(xg, g1)), g2)
     kk = F.normalize((k * k_k).view(H,N), dim=-1, p=2.0).view(H*N)
-    k = k * (1 + (a-1) * k_a)
+    k = torch.addcmul(k, k, (a - 1) * k_a)
     kka = kk * a
 
     if layer_id == 0: v_first = v
-    else: v = v + (v_first - v) * torch.sigmoid(F.linear(F.linear(xv, v1), v2, bias=v0))
+    else: v = torch.addcmul(v, v_first - v, torch.sigmoid(F.linear(F.linear(xv, v1), v2, bias=v0)))
 
     xx = RWKV7_ONE_OP(state, r, w, k, v, -kk, kka, elapsed_t) # !!! using CUDA to modify state in-place !!! (faster too)
 
-    xx = F.group_norm(xx.view(1,H*N), num_groups=H, weight=ln_w, bias=ln_b, eps = 64e-5).view(H*N)    
-    xx = xx + ((r * k * r_k).view(H,N).sum(dim=-1, keepdim=True) * v.view(H,N)).view(H*N)
-    return linear_i8((xx * g), O_q, O_mx, O_rx, O_my, O_ry), v_first
+    xx = F.group_norm(xx.view(1,H*N), num_groups=H, weight=ln_w, bias=ln_b, eps = 64e-5).view(H*N)
+    xx = torch.addcmul(
+        xx.view(H, N),
+        (r * k * r_k).view(H, N).sum(dim=-1, keepdim=True),
+        v.view(H, N),
+    ).view(H * N)
+    return linear_i8(xx * g, O_q, O_mx, O_rx, O_my, O_ry), v_first
 
 @MyStatic
 def RWKV_x070_TMix_seq(layer_id: int, H:int, N:int, x, x_prev, v_first, state, x_r, x_w, x_k, x_v, x_a, x_g, w0, w1, w2, a0, a1, a2, v0, v1, v2, g1, g2, k_k, k_a, r_k,
@@ -513,7 +727,14 @@ def RWKV_x070_TMix_seq(layer_id: int, H:int, N:int, x, x_prev, v_first, state, x
     T = x.shape[0]
     xx = torch.cat((x_prev[0].unsqueeze(0), x[:-1,:])) - x
     x_prev[0] = x[-1,:]
-    xr, xw, xk, xv, xa, xg = x+xx*x_r, x+xx*x_w, x+xx*x_k, x+xx*x_v, x+xx*x_a, x+xx*x_g
+    xr, xw, xk, xv, xa, xg = (
+        torch.addcmul(x, xx, x_r),
+        torch.addcmul(x, xx, x_w),
+        torch.addcmul(x, xx, x_k),
+        torch.addcmul(x, xx, x_v),
+        torch.addcmul(x, xx, x_a),
+        torch.addcmul(x, xx, x_g),
+    )
 
     r = linear_i8(xr, R_q, R_mx, R_rx, R_my, R_ry)
     w = F.linear(torch.tanh(F.linear(xw, w1)), w2, bias=w0)
@@ -522,26 +743,74 @@ def RWKV_x070_TMix_seq(layer_id: int, H:int, N:int, x, x_prev, v_first, state, x
     a = torch.sigmoid(F.linear(F.linear(xa, a1), a2, bias=a0))
     g = F.linear(torch.sigmoid(F.linear(xg, g1)), g2)
     kk = F.normalize((k * k_k).view(T,H,N), dim=-1, p=2.0).view(T,H*N)
-    k = k * (1 + (a-1) * k_a)
+    k = torch.addcmul(k, k, (a - 1) * k_a)
     kka = kk * a
 
     if layer_id == 0: v_first = v
-    else: v = v + (v_first - v) * torch.sigmoid(F.linear(F.linear(xv, v1), v2, bias=v0))
+    else: v = torch.addcmul(v, v_first - v, torch.sigmoid(F.linear(F.linear(xv, v1), v2, bias=v0)))
 
     xx = RWKV7_SEQ_OP(state, r, w, k, v, -kk, kka, elapsed_t)
 
     xx = F.group_norm(xx.view(T,H*N), num_groups=H, weight=ln_w, bias=ln_b, eps = 64e-5).view(T,H*N)
-    xx = xx + ((r * k * r_k).view(T,H,N).sum(dim=-1, keepdim=True) * v.view(T,H,N)).view(T,H*N)
-    return linear_i8((xx * g), O_q, O_mx, O_rx, O_my, O_ry), v_first
+    xx = torch.addcmul(
+        xx.view(T, H, N),
+        (r * k * r_k).view(T, H, N).sum(dim=-1, keepdim=True),
+        v.view(T, H, N),
+    ).view(T, H * N)
+    return linear_i8(xx * g, O_q, O_mx, O_rx, O_my, O_ry), v_first
 
 @MyStatic
 def RWKV_x070_TMix_seq_batch(layer_id: int, H:int, N:int, x, x_prev, v_first, state, x_r, x_w, x_k, x_v, x_a, x_g, w0, w1, w2, a0, a1, a2, v0, v1, v2, g1, g2, k_k, k_a, r_k,
                              R_q, R_mx, R_rx, R_my, R_ry, K_q, K_mx, K_rx, K_my, K_ry, V_q, V_mx, V_rx, V_my, V_ry, O_q, O_mx, O_rx, O_my, O_ry,
                              ln_w, ln_b, elapsed_t):
     B,T,C = x.shape
+    if T == 1:
+        x_single = x[:, 0, :]
+        shifted = TMIX_SHIFT_BATCH_T1_OP(
+            x_single, x_prev[0], x_r, x_w, x_k, x_v, x_a, x_g
+        )
+        x_prev[0] = x_single
+        xr, xw, xk, xv, xa, xg = shifted[0], shifted[1], shifted[2], shifted[3], shifted[4], shifted[5]
+
+        r = linear_i8(xr, R_q, R_mx, R_rx, R_my, R_ry)
+        w = F.linear(torch.tanh(F.linear(xw, w1)), w2, bias=w0)
+        k = linear_i8(xk, K_q, K_mx, K_rx, K_my, K_ry)
+        v = linear_i8(xv, V_q, V_mx, V_rx, V_my, V_ry)
+        a = torch.sigmoid(F.linear(F.linear(xa, a1), a2, bias=a0))
+        g = F.linear(torch.sigmoid(F.linear(xg, g1)), g2)
+
+        kk = F.normalize((k * k_k).view(B, H, N), dim=-1, p=2.0).view(B, H * N)
+        k = torch.addcmul(k, k, (a - 1) * k_a)
+        kka = kk * a
+
+        if layer_id == 0:
+            v_first = v.unsqueeze(1)
+        else:
+            v = torch.addcmul(
+                v,
+                v_first[:, 0, :] - v,
+                torch.sigmoid(F.linear(F.linear(xv, v1), v2, bias=v0)),
+            )
+
+        xx = RWKV7_ONE_BATCH_OP(state, r, w, k, v, -kk, kka, elapsed_t)
+        xx = F.group_norm(xx.view(B, H * N), num_groups=H, weight=ln_w, bias=ln_b, eps=64e-5).view(B, H * N)
+        xx = torch.addcmul(
+            xx.view(B, H, N),
+            (r * k * r_k).view(B, H, N).sum(dim=-1, keepdim=True),
+            v.view(B, H, N),
+        ).view(B, H * N)
+        return linear_i8(xx * g, O_q, O_mx, O_rx, O_my, O_ry).unsqueeze(1), v_first
+
     xx = torch.cat((x_prev[0].unsqueeze(1), x[:,:-1,:]), dim=1) - x
     x_prev[0] = x[:,-1,:]
-    xr, xw, xk, xv, xa, xg = x+xx*x_r, x+xx*x_w, x+xx*x_k, x+xx*x_v, x+xx*x_a, x+xx*x_g
+    xr, xw, xk, xv, xa, xg = (
+        torch.addcmul(x, xx, x_r),
+        torch.addcmul(x, xx, x_w),
+        torch.addcmul(x, xx, x_k),
+        torch.addcmul(x, xx, x_v),
+        torch.addcmul(x, xx, x_a),
+        torch.addcmul(x, xx, x_g),
+    )
 
     r = linear_i8(xr, R_q, R_mx, R_rx, R_my, R_ry)
     w = F.linear(torch.tanh(F.linear(xw, w1)), w2, bias=w0)
@@ -551,11 +820,11 @@ def RWKV_x070_TMix_seq_batch(layer_id: int, H:int, N:int, x, x_prev, v_first, st
     g = F.linear(torch.sigmoid(F.linear(xg, g1)), g2)
 
     kk = F.normalize((k * k_k).view(B,T,H,N), dim=-1, p=2.0).view(B,T,H*N)
-    k = k * (1 + (a-1) * k_a)
+    k = torch.addcmul(k, k, (a - 1) * k_a)
     kka = kk * a
 
     if layer_id == 0: v_first = v
-    else: v = v + (v_first - v) * torch.sigmoid(F.linear(F.linear(xv, v1), v2, bias=v0))
+    else: v = torch.addcmul(v, v_first - v, torch.sigmoid(F.linear(F.linear(xv, v1), v2, bias=v0)))
 
     # if T == 1:
     #     vk = v.view(B,H,N,1) @ k.view(B,H,1,N)
@@ -566,8 +835,88 @@ def RWKV_x070_TMix_seq_batch(layer_id: int, H:int, N:int, x, x_prev, v_first, st
     xx = RWKV7_BATCH_OP(state, r, w, k, v, -kk, kka, elapsed_t).view(B*T,H*N)
 
     xx = F.group_norm(xx.view(B*T,H*N), num_groups=H, weight=ln_w, bias=ln_b, eps = 64e-5).view(B,T,H*N)
-    xx = xx + ((r * k * r_k).view(B,T,H,N).sum(dim=-1, keepdim=True) * v.view(B,T,H,N)).view(B,T,H*N)
-    return linear_i8((xx * g), O_q, O_mx, O_rx, O_my, O_ry), v_first
+    xx = torch.addcmul(
+        xx.view(B, T, H, N),
+        (r * k * r_k).view(B, T, H, N).sum(dim=-1, keepdim=True),
+        v.view(B, T, H, N),
+    ).view(B, T, H * N)
+    return linear_i8(xx * g, O_q, O_mx, O_rx, O_my, O_ry), v_first
+
+@MyStatic
+def RWKV_x070_TMix_seq_batch_paged(layer_id: int, H:int, N:int, x, x_prev, v_first, state_pool, page_table, x_r, x_w, x_k, x_v, x_a, x_g, w0, w1, w2, a0, a1, a2, v0, v1, v2, g1, g2, k_k, k_a, r_k,
+                             R_q, R_mx, R_rx, R_my, R_ry, K_q, K_mx, K_rx, K_my, K_ry, V_q, V_mx, V_rx, V_my, V_ry, O_q, O_mx, O_rx, O_my, O_ry,
+                             ln_w, ln_b, elapsed_t):
+    B,T,C = x.shape
+    if T == 1:
+        x_single = x[:, 0, :]
+        shifted = TMIX_SHIFT_BATCH_T1_OP(
+            x_single, x_prev[0], x_r, x_w, x_k, x_v, x_a, x_g
+        )
+        x_prev[0] = x_single
+        xr, xw, xk, xv, xa, xg = shifted[0], shifted[1], shifted[2], shifted[3], shifted[4], shifted[5]
+
+        r = linear_i8(xr, R_q, R_mx, R_rx, R_my, R_ry)
+        w = F.linear(torch.tanh(F.linear(xw, w1)), w2, bias=w0)
+        k = linear_i8(xk, K_q, K_mx, K_rx, K_my, K_ry)
+        v = linear_i8(xv, V_q, V_mx, V_rx, V_my, V_ry)
+        a = torch.sigmoid(F.linear(F.linear(xa, a1), a2, bias=a0))
+        g = F.linear(torch.sigmoid(F.linear(xg, g1)), g2)
+
+        kk = F.normalize((k * k_k).view(B, H, N), dim=-1, p=2.0).view(B, H * N)
+        k = torch.addcmul(k, k, (a - 1) * k_a)
+        kka = kk * a
+
+        if layer_id == 0:
+            v_first = v.unsqueeze(1)
+        else:
+            v = torch.addcmul(
+                v,
+                v_first[:, 0, :] - v,
+                torch.sigmoid(F.linear(F.linear(xv, v1), v2, bias=v0)),
+            )
+
+        xx = RWKV7_ONE_BATCH_PAGED_OP(state_pool, page_table, r, w, k, v, -kk, kka, elapsed_t)
+        xx = F.group_norm(xx.view(B, H * N), num_groups=H, weight=ln_w, bias=ln_b, eps=64e-5).view(B, H * N)
+        xx = torch.addcmul(
+            xx.view(B, H, N),
+            (r * k * r_k).view(B, H, N).sum(dim=-1, keepdim=True),
+            v.view(B, H, N),
+        ).view(B, H * N)
+        return linear_i8(xx * g, O_q, O_mx, O_rx, O_my, O_ry).unsqueeze(1), v_first
+
+    xx = torch.cat((x_prev[0].unsqueeze(1), x[:,:-1,:]), dim=1) - x
+    x_prev[0] = x[:,-1,:]
+    xr, xw, xk, xv, xa, xg = (
+        torch.addcmul(x, xx, x_r),
+        torch.addcmul(x, xx, x_w),
+        torch.addcmul(x, xx, x_k),
+        torch.addcmul(x, xx, x_v),
+        torch.addcmul(x, xx, x_a),
+        torch.addcmul(x, xx, x_g),
+    )
+
+    r = linear_i8(xr, R_q, R_mx, R_rx, R_my, R_ry)
+    w = F.linear(torch.tanh(F.linear(xw, w1)), w2, bias=w0)
+    k = linear_i8(xk, K_q, K_mx, K_rx, K_my, K_ry)
+    v = linear_i8(xv, V_q, V_mx, V_rx, V_my, V_ry)
+    a = torch.sigmoid(F.linear(F.linear(xa, a1), a2, bias=a0))
+    g = F.linear(torch.sigmoid(F.linear(xg, g1)), g2)
+
+    kk = F.normalize((k * k_k).view(B,T,H,N), dim=-1, p=2.0).view(B,T,H*N)
+    k = torch.addcmul(k, k, (a - 1) * k_a)
+    kka = kk * a
+
+    if layer_id == 0: v_first = v
+    else: v = torch.addcmul(v, v_first - v, torch.sigmoid(F.linear(F.linear(xv, v1), v2, bias=v0)))
+
+    xx = RWKV7_BATCH_PAGED_OP(state_pool, page_table, r, w, k, v, -kk, kka, elapsed_t).view(B*T,H*N)
+    xx = F.group_norm(xx.view(B*T,H*N), num_groups=H, weight=ln_w, bias=ln_b, eps = 64e-5).view(B,T,H*N)
+    xx = torch.addcmul(
+        xx.view(B, T, H, N),
+        (r * k * r_k).view(B, T, H, N).sum(dim=-1, keepdim=True),
+        v.view(B, T, H, N),
+    ).view(B, T, H * N)
+    return linear_i8(xx * g, O_q, O_mx, O_rx, O_my, O_ry), v_first
 
 ########################################################################################################
 
@@ -575,8 +924,8 @@ def RWKV_x070_TMix_seq_batch(layer_id: int, H:int, N:int, x, x_prev, v_first, st
 def RWKV_x070_CMix_one(x, x_prev, x_k, K_q, K_mx, K_rx, K_my, K_ry, V_):
     xx = x_prev[1] - x
     x_prev[1] = x
-    k = x + xx * x_k
-    k = torch.relu(linear_i8(k, K_q, K_mx, K_rx, K_my, K_ry)) ** 2
+    k = torch.addcmul(x, xx, x_k)
+    k = torch.relu(linear_i8(k, K_q, K_mx, K_rx, K_my, K_ry)).square_()
     kv = rwkv_mm_sparsity(k, V_)
     # kv = k @ V_
     # kv = SPMV_OP(k, V_)
@@ -586,15 +935,22 @@ def RWKV_x070_CMix_one(x, x_prev, x_k, K_q, K_mx, K_rx, K_my, K_ry, V_):
 def RWKV_x070_CMix_seq(x, x_prev, x_k, K_q, K_mx, K_rx, K_my, K_ry, V_):
     xx = torch.cat((x_prev[1].unsqueeze(0), x[:-1,:])) - x
     x_prev[1] = x[-1,:]
-    k = x + xx * x_k
-    k = torch.relu(linear_i8(k, K_q, K_mx, K_rx, K_my, K_ry)) ** 2
+    k = torch.addcmul(x, xx, x_k)
+    k = torch.relu(linear_i8(k, K_q, K_mx, K_rx, K_my, K_ry)).square_()
     # print("Sparsity:", (k == 0).float().mean().item())
     return k @ V_ # F.linear(k, V_)
 
 @MyStatic
 def RWKV_x070_CMix_seq_batch(x, x_prev, x_k, K_q, K_mx, K_rx, K_my, K_ry, V_):
+    if x.shape[1] == 1:
+        x_single = x[:, 0, :]
+        k = CMIX_SHIFT_BATCH_T1_OP(x_single, x_prev[1], x_k)
+        x_prev[1] = x_single
+        k = torch.relu(linear_i8(k, K_q, K_mx, K_rx, K_my, K_ry)).square_()
+        return (k @ V_).unsqueeze(1)
+
     xx = torch.cat((x_prev[1].unsqueeze(1), x[:,:-1,:]), dim=1) - x
     x_prev[1] = x[:,-1,:]
-    k = x + xx * x_k
-    k = torch.relu(linear_i8(k, K_q, K_mx, K_rx, K_my, K_ry)) ** 2
+    k = torch.addcmul(x, xx, x_k)
+    k = torch.relu(linear_i8(k, K_q, K_mx, K_rx, K_my, K_ry)).square_()
     return k @ V_ # F.linear(k, V_)

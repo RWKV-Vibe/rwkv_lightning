@@ -12,6 +12,13 @@ from state_manager.state_pool import shutdown_state_manager
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model-path", type=str, required=True, help="RWKV model path")
+    parser.add_argument(
+        "--runtime",
+        type=str,
+        default="fp16",
+        choices=["fp16", "int8"],
+        help="Inference runtime variant to load",
+    )
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--password", type=str, default=None, help="API password for authentication")
     return parser.parse_args()
@@ -19,7 +26,9 @@ def parse_args():
 
 def main():
     args_cli = parse_args()
-    model, tokenizer, args, rocm_flag = load_model_and_tokenizer(args_cli.model_path)
+    model, tokenizer, args, rocm_flag = load_model_and_tokenizer(
+        args_cli.model_path, runtime=args_cli.runtime
+    )
     engine = InferenceEngine(model=model, tokenizer=tokenizer, args=args, rocm_flag=rocm_flag)
     app = create_app(engine, password=args_cli.password)
 

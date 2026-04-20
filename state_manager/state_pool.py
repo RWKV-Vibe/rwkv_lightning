@@ -5,6 +5,7 @@ import io
 import sqlite3
 import threading
 import time
+import zlib
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -19,6 +20,7 @@ DB_PATH = "rwkv_sessions.db"  # infinite cold state pool HaHa!
 PREFIX_CACHE_BUCKETS = (1024, 2048, 3072, 4096, 5120, 6144, 7168, 8192)
 PREFIX_CACHE_BUCKET_CAPACITY = 16
 PREFIX_HASH_COLUMNS = tuple(f"prefix_hash_{bucket}" for bucket in PREFIX_CACHE_BUCKETS)
+SERDE_MAGIC = b"Z1"
 
 
 def _serialize_token_ids(tokens: List[int] | Tuple[int, ...]) -> str:
@@ -220,9 +222,15 @@ class StateCacheManager:
     def _serialize(self, state) -> bytes:
         buffer = io.BytesIO()
         torch.save(state, buffer)
-        return buffer.getvalue()
+        payload = buffer.getvalue()
+        compressed = zlib.compress(payload, level=1)
+        if len(compressed) < len(payload):
+            return SERDE_MAGIC + compressed
+        return payload
 
     def _deserialize(self, blob: bytes):
+        if blob.startswith(SERDE_MAGIC):
+            blob = zlib.decompress(blob[len(SERDE_MAGIC) :])
         buffer = io.BytesIO(blob)
         return torch.load(buffer, map_location="cpu", weights_only=True)
 

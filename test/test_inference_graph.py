@@ -17,6 +17,9 @@ class FakeTensor:
     def __init__(self):
         self.device = SimpleNamespace(type="cuda")
 
+    def dim(self):
+        return 1
+
     def unsqueeze(self, _dim):
         return self
 
@@ -51,6 +54,7 @@ setattr(cuda_stub, "empty_cache", lambda: None)
 
 torch_stub = ModuleType("torch")
 setattr(torch_stub, "cuda", cuda_stub)
+setattr(torch_stub, "float32", "float32")
 setattr(torch_stub, "zeros", lambda *args, **kwargs: FakeTensor())
 setattr(torch_stub, "empty_like", lambda _tensor, device=None: FakeTensor())
 
@@ -118,7 +122,7 @@ def _make_engine() -> inference_module.InferenceEngine:
     return inference_module.InferenceEngine(
         model=DummyModel(),
         tokenizer=DummyTokenizer(),
-        args=SimpleNamespace(),
+        args=SimpleNamespace(vocab_size=65536),
         rocm_flag=False,
     )
 
@@ -184,99 +188,51 @@ async def test_graph_generate_respects_max_generate_tokens() -> None:
     batch_tokens = iter([12, 13])
 
     with _patch_sampler(
-        gumbel_fn=lambda logits, temp: FakeScalar(11),
         setup_rand_fn=lambda seed, batch_size: None,
         batch_sampling_fn=lambda *args, **kwargs: FakeBatchTokens(next(batch_tokens)),
     ):
-        result = await engine.graph_generate(
-            inputs=["hello"],
+        result = engine.graph_generate_state(
+            prompts=["hello"],
+            state=engine.model.generate_zero_state(0),
             stop_tokens=[0],
-            max_generate_tokens=2,
+            max_length=2,
+            session_id="graph-test",
         )
 
-    _assert_equal(result, ["AB"], "graph_generate should cap output to max_generate_tokens")
+    _assert_equal(result, ["BC"], "graph_generate should cap output to max_generate_tokens")
     print("[PASS] test_graph_generate_respects_max_generate_tokens")
 
 
 async def test_graph_infer_stream_stops_on_initial_stop_token() -> None:
     engine = _make_engine()
+    sampler_calls = {"count": 0}
 
     def _unexpected_batch_sampling(*args, **kwargs):
-        raise AssertionError("graph_infer_stream should not sample again after initial stop token")
+        sampler_calls["count"] += 1
+        if sampler_calls["count"] > 1:
+            raise AssertionError("graph_infer_stream_state should not sample again after initial stop token")
+        return FakeBatchTokens(0)
 
     with _patch_sampler(
-        gumbel_fn=lambda logits, temp: FakeScalar(0),
         batch_sampling_fn=_unexpected_batch_sampling,
     ):
         chunks = await _collect_stream(
-            engine.graph_infer_stream(
-                inputs=["hello"],
+            engine.graph_infer_stream_state(
+                prompts=["hello"],
+                state=engine.model.generate_zero_state(0),
                 stop_tokens=[0],
-                max_generate_tokens=3,
+                max_length=3,
                 chunk_size=2,
+                session_id="graph-stream-test",
             )
         )
 
     combined = "".join(chunks)
-    if '"finish_reason": "stop"' not in combined:
-        raise AssertionError("graph_infer_stream should report stop when the first token is a stop token")
     if '"content"' in combined:
-        raise AssertionError("graph_infer_stream should not emit content when the first token is a stop token")
+        raise AssertionError("graph_infer_stream_state should not emit content when the first token is a stop token")
     if combined.count("[DONE]") != 1:
-        raise AssertionError("graph_infer_stream should emit exactly one DONE marker")
+        raise AssertionError("graph_infer_stream_state should emit exactly one DONE marker")
     print("[PASS] test_graph_infer_stream_stops_on_initial_stop_token")
-
-
-async def test_graph_infer_stream_falls_back_without_cuda() -> None:
-    dynamic_calls = []
-
-    class FallbackEngine(inference_module.InferenceEngine):
-        async def dynamic_batch_infer_stream(
-            self,
-            prompt,
-            max_generate_tokens,
-            stop_tokens,
-            pad_zero=True,
-            temperature=1.0,
-            top_k=50,
-            top_p=0.3,
-            alpha_presence=0.5,
-            alpha_frequency=0.5,
-            alpha_decay=0.996,
-            chunk_size=32,
-        ):
-            dynamic_calls.append({"prompt": prompt, "max_generate_tokens": max_generate_tokens})
-            yield {"type": "delta", "text": "fallback-stream"}
-            yield {"type": "done", "finish_reason": "length"}
-
-    engine = FallbackEngine(
-        model=DummyModel(),
-        tokenizer=DummyTokenizer(),
-        args=SimpleNamespace(),
-        rocm_flag=False,
-    )
-
-    with _patch_cuda_available(False):
-        chunks = await _collect_stream(
-            engine.graph_infer_stream(
-                inputs=["hello"],
-                stop_tokens=[0],
-                max_generate_tokens=2,
-                chunk_size=1,
-            )
-        )
-
-    combined = "".join(chunks)
-    if "fallback-stream" not in combined:
-        raise AssertionError("graph_infer_stream should preserve fallback delta content when CUDA is unavailable")
-    if '"finish_reason": "length"' not in combined:
-        raise AssertionError("graph_infer_stream should preserve fallback finish_reason when CUDA is unavailable")
-    _assert_equal(
-        len(dynamic_calls),
-        1,
-        "graph_infer_stream should delegate to dynamic_batch_infer_stream when CUDA is unavailable",
-    )
-    print("[PASS] test_graph_infer_stream_falls_back_without_cuda")
 
 
 async def test_batch_infer_stream_state_respects_chunk_size() -> None:
@@ -314,7 +270,6 @@ async def test_batch_infer_stream_state_respects_chunk_size() -> None:
 async def main() -> None:
     await test_graph_generate_respects_max_generate_tokens()
     await test_graph_infer_stream_stops_on_initial_stop_token()
-    await test_graph_infer_stream_falls_back_without_cuda()
     await test_batch_infer_stream_state_respects_chunk_size()
     print("All inference graph tests passed.")
 

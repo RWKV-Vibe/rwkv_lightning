@@ -6,6 +6,7 @@ import uuid
 import json
 from typing import Any
 
+from pydantic import ValidationError
 from robyn import Response, StreamingResponse
 
 from state_manager.state_pool import get_state_manager
@@ -131,6 +132,8 @@ def build_internal_chat_request(body: dict, prompt: str) -> dict:
 
     return {
         "model": body.get("model", "rwkv7"),
+        "runtime": body.get("runtime"),
+        "scheduler": body.get("scheduler", "auto"),
         "contents": [prompt],
         "messages": body.get("messages", []),
         "system": body.get("system"),
@@ -311,6 +314,33 @@ def register_openai_routes(app, engine, password, chat_request_model):
             if auth_error is not None:
                 return auth_error
 
+            served_model_id = getattr(
+                engine.args,
+                "served_model_id",
+                os.path.basename(f"{engine.args.MODEL_NAME}"),
+            )
+            served_aliases = set(getattr(engine.args, "model_aliases", (served_model_id,)))
+            requested_model = str(body.get("model", "rwkv7")).strip()
+            if requested_model and requested_model not in served_aliases:
+                return _json_response(
+                    404,
+                    {
+                        "error": f"Model '{requested_model}' is not served by this process",
+                        "available_models": [served_model_id],
+                    },
+                )
+
+            requested_runtime = body.get("runtime")
+            served_runtime = getattr(engine.args, "runtime", "fp16")
+            if requested_runtime and str(requested_runtime).strip().lower() != served_runtime:
+                return _json_response(
+                    400,
+                    {
+                        "error": f"Runtime '{requested_runtime}' is not available on this server",
+                        "served_runtime": served_runtime,
+                    },
+                )
+
             prompt = extract_openai_prompt(body)
             if not prompt and not (body.get("messages") or []):
                 return _json_response(400, {"error": "Empty prompt"})
@@ -325,7 +355,7 @@ def register_openai_routes(app, engine, password, chat_request_model):
 
             response_id = f"chatcmpl-{uuid.uuid4().hex}"
             created = int(time.time())
-            model_name = os.path.basename(f"{engine.args.MODEL_NAME}")
+            model_name = served_model_id
             prefix_cache_manager = get_state_manager() if req.use_prefix_cache else None
 
             if req.stream:
@@ -377,6 +407,8 @@ def register_openai_routes(app, engine, password, chat_request_model):
             return _json_response(200, response)
         except json.JSONDecodeError as exc:
             return _json_response(400, {"error": f"Invalid JSON: {str(exc)}"})
+        except ValidationError as exc:
+            return _json_response(400, {"error": exc.errors()})
         except Exception as exc:
             print(f"[ERROR] /openai/v1/chat/completions: {traceback.format_exc()}")
             return _json_response(500, {"error": str(exc)})
