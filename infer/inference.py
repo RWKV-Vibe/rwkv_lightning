@@ -1,6 +1,7 @@
 import asyncio
 import gc
 import json
+import os
 import random
 import time
 from collections import deque
@@ -61,6 +62,9 @@ class InferenceEngine:
         self.tokenizer = tokenizer
         self.args = args
         self.rocm_flag = rocm_flag
+        self.enable_cuda_graphs = torch.cuda.is_available() and os.getenv(
+            "RWKV_USE_CUDA_GRAPHS", "0"
+        ) == "1"
         self.model_lock = Lock()
         self.executor = ThreadPoolExecutor(
             max_workers=128, thread_name_prefix="model_inference"
@@ -591,6 +595,22 @@ class InferenceEngine:
         session_id=None,
         prefix_cache_manager=None,
     ):
+        if not self.enable_cuda_graphs:
+            return self.batch_generate_state(
+                prompts=prompts,
+                state=state,
+                max_length=max_length,
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p,
+                alpha_presence=alpha_presence,
+                alpha_frequency=alpha_frequency,
+                alpha_decay=alpha_decay,
+                stop_tokens=stop_tokens,
+                prefix_cache_manager=prefix_cache_manager,
+                session_id=session_id,
+            )
+
         _, state, out = self._prefill_prompt_from_state_or_prefix(
             prompts[0], state, prefix_cache_manager=prefix_cache_manager
         )
@@ -662,6 +682,26 @@ class InferenceEngine:
         state_manager=None,
         prefix_cache_manager=None,
     ):
+        if not self.enable_cuda_graphs:
+            async for chunk in self.batch_infer_stream_state(
+                prompts=prompts,
+                state=state,
+                max_length=max_length,
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p,
+                alpha_presence=alpha_presence,
+                alpha_frequency=alpha_frequency,
+                alpha_decay=alpha_decay,
+                stop_tokens=stop_tokens,
+                chunk_size=chunk_size,
+                session_id=session_id,
+                state_manager=state_manager,
+                prefix_cache_manager=prefix_cache_manager,
+            ):
+                yield chunk
+            return
+
         chunk_size = max(1, int(chunk_size))
         static_state = None
         _, state, out = self._prefill_prompt_from_state_or_prefix(
@@ -875,7 +915,7 @@ class InferenceEngine:
             ).reshape(-1, 1)
             new_tokens = new_tokens_tensor.view(-1).tolist()
 
-            if batch_graph is None and torch.cuda.is_available():
+            if batch_graph is None and self.enable_cuda_graphs:
                 batch_graph = self._get_or_create_batch_cuda_graph(
                     batch_size, new_tokens_tensor, state, out
                 )
@@ -951,7 +991,7 @@ class InferenceEngine:
                 ).reshape(-1, 1)
                 new_tokens = new_tokens_tensor.view(-1).tolist()
 
-                if batch_graph is None and torch.cuda.is_available():
+                if batch_graph is None and self.enable_cuda_graphs:
                     batch_graph = self._get_or_create_batch_cuda_graph(
                         batch_size, new_tokens_tensor, state, out
                     )
@@ -1838,7 +1878,7 @@ class InferenceEngine:
                     new_tokens_tensor = self._sample_throughput_tokens(out, temperature)
                     new_tokens = new_tokens_tensor.tolist()
 
-                    if batch_graph is None and torch.cuda.is_available():
+                    if batch_graph is None and self.enable_cuda_graphs:
                         batch_graph = self._get_or_create_batch_cuda_graph(
                             batch_size, new_tokens_tensor, state, out
                         )
@@ -1984,7 +2024,7 @@ class InferenceEngine:
                     new_tokens_tensor = self._sample_throughput_tokens(out, temperature)
                     new_tokens = new_tokens_tensor.tolist()
 
-                    if batch_graph is None and torch.cuda.is_available():
+                    if batch_graph is None and self.enable_cuda_graphs:
                         batch_graph = self._get_or_create_batch_cuda_graph(
                             batch_size, new_tokens_tensor, state, out
                         )

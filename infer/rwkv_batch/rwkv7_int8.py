@@ -25,14 +25,23 @@ from torch.nn import functional as F
 from .mm_int8_kernel import linear_i8, quantize_mm8_for_linear
 from .rwkv_pointwise_op import CMIX_SHIFT_BATCH_T1_OP, TMIX_SHIFT_BATCH_T1_OP
 
+def _no_compile(fn):
+    return fn
+
+
 if os.getenv("RWKV_USE_JIT", "0") == "1":
     MyModule = torch.jit.ScriptModule
     MyFunction = torch.jit.script_method
     MyStatic = torch.jit.script
+elif os.getenv("RWKV_USE_COMPILE", "0") == "1":
+    MyModule = nn.Module
+    compile_mode = os.getenv("RWKV_COMPILE_MODE", "reduce-overhead")
+    MyFunction = torch.compile(mode=compile_mode)
+    MyStatic = torch.compile(mode=compile_mode)
 else:
     MyModule = nn.Module
-    MyFunction = torch.compile(mode='max-autotune-no-cudagraphs')
-    MyStatic = torch.compile(mode='max-autotune-no-cudagraphs')
+    MyFunction = _no_compile
+    MyStatic = _no_compile
 MyDisable = torch.compiler.disable
 
 DTYPE = torch.half

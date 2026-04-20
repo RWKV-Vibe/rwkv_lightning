@@ -321,7 +321,7 @@ def create_app(engine, password=None):
             prompts, reuse_existing_state=had_existing_state
         )
         prefix_cache_manager = state_manager if req.use_prefix_cache else None
-        use_cuda_graph = torch.cuda.is_available()
+        use_cuda_graph = getattr(engine, "enable_cuda_graphs", False)
 
         if req.stream:
             infer_fn = (

@@ -5,6 +5,7 @@ import signal
 import sys
 
 os.environ['TORCH_CUDA_ARCH_LIST'] = '8.0;8.6;9.0;12.0'
+os.environ.setdefault('RWKV_USE_COMPILE', '0')
 
 from API_servers.api_service import create_app
 from infer.inference import InferenceEngine
