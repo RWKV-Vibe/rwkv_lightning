@@ -821,7 +821,7 @@ def register_openai_routes(app, engine, password, chat_request_model):
                             "created": created,
                             "model": model_name,
                             "choices": [],
-                            "usage": build_openai_usage_many(
+                            "usage": _build_openai_usage_many(
                                 engine.tokenizer, prompt_formatted, ["".join(usage_collector)]
                             ),
                         }
@@ -854,7 +854,7 @@ def register_openai_routes(app, engine, password, chat_request_model):
                 "created": created,
                 "model": model_name,
                 "choices": choices,
-                "usage": build_openai_usage_many(
+                "usage": _build_openai_usage_many(
                     engine.tokenizer, prompt_formatted, completion_texts
                 ),
             }
