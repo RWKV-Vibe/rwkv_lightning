@@ -120,6 +120,533 @@ def test_invalid_runtime(base_url: str, password: str, model_name: str):
     return False
 
 
+def test_models_list(base_url: str, password: str):
+    status, raw, _ = request_json(
+        "GET",
+        f"{base_url}/openai/v1/models",
+        headers={"Authorization": f"Bearer {password}"},
+        timeout=60,
+    )
+    data = json.loads(raw)
+    models = data.get("data") or []
+    first = models[0] if models else {}
+    ok = (
+        status == 200
+        and data.get("object") == "list"
+        and bool(models)
+        and first.get("object") == "model"
+        and isinstance(first.get("id"), str)
+        and isinstance(first.get("created"), int)
+        and isinstance(first.get("owned_by"), str)
+    )
+    print_result("models list", ok, raw[:160])
+    return ok, first.get("id")
+
+
+def test_model_retrieve(base_url: str, password: str, model_id: str):
+    status, raw, _ = request_json(
+        "GET",
+        f"{base_url}/openai/v1/models/{model_id}",
+        headers={"Authorization": f"Bearer {password}"},
+        timeout=60,
+    )
+    data = json.loads(raw)
+    ok = (
+        status == 200
+        and data.get("id") == model_id
+        and data.get("object") == "model"
+        and isinstance(data.get("created"), int)
+        and isinstance(data.get("owned_by"), str)
+    )
+    print_result("model retrieve", ok, raw[:160])
+    return ok
+
+
+def test_models_endpoints(base_url: str, password: str):
+    ok, model_id = test_models_list(base_url, password)
+    if not ok or not model_id:
+        return False
+    return test_model_retrieve(base_url, password, model_id)
+
+
+def test_multimodal_rejection(base_url: str, password: str, model_name: str):
+    payload = {
+        "model": model_name,
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "Describe this image."},
+                    {"type": "image_url", "image_url": {"url": "https://example.com/cat.png"}},
+                ],
+            }
+        ],
+        "max_tokens": 8,
+    }
+    try:
+        request_json(
+            "POST",
+            f"{base_url}/openai/v1/chat/completions",
+            payload,
+            headers={"Authorization": f"Bearer {password}"},
+            timeout=60,
+        )
+    except urllib.error.HTTPError as exc:
+        status, raw, data = parse_error_body(exc)
+        ok = status == 400 and "text content parts" in data.get("error", {}).get("message", "")
+        print_result("multimodal rejection", ok, raw[:160])
+        return ok
+    print_result("multimodal rejection", False, "request unexpectedly succeeded")
+    return False
+
+
+def test_reasoning_effort(base_url: str, password: str, model_name: str):
+    payload = {
+        "model": model_name,
+        "messages": [{"role": "user", "content": "Reply with ok."}],
+        "reasoning_effort": "medium",
+        "max_tokens": 8,
+        "temperature": 0.1,
+    }
+    status, raw, _ = request_json(
+        "POST",
+        f"{base_url}/openai/v1/chat/completions",
+        payload,
+        headers={"Authorization": f"Bearer {password}"},
+        timeout=120,
+    )
+    data = json.loads(raw)
+    ok = status == 200 and bool(data.get("choices"))
+    print_result("reasoning_effort", ok, raw[:160])
+    return ok
+
+
+def test_invalid_reasoning_effort(base_url: str, password: str, model_name: str):
+    payload = {
+        "model": model_name,
+        "messages": [{"role": "user", "content": "hi"}],
+        "reasoning_effort": "turbo",
+    }
+    try:
+        request_json(
+            "POST",
+            f"{base_url}/openai/v1/chat/completions",
+            payload,
+            headers={"Authorization": f"Bearer {password}"},
+            timeout=60,
+        )
+    except urllib.error.HTTPError as exc:
+        status, raw, data = parse_error_body(exc)
+        ok = status == 400 and "reasoning_effort" in data.get("error", {}).get("message", "")
+        print_result("invalid reasoning_effort", ok, raw[:160])
+        return ok
+    print_result("invalid reasoning_effort", False, "request unexpectedly succeeded")
+    return False
+
+
+def test_service_tier(base_url: str, password: str, model_name: str):
+    payload = {
+        "model": model_name,
+        "messages": [{"role": "user", "content": "Reply with ok."}],
+        "service_tier": "priority",
+        "max_tokens": 8,
+        "temperature": 0.1,
+    }
+    status, raw, _ = request_json(
+        "POST",
+        f"{base_url}/openai/v1/chat/completions",
+        payload,
+        headers={"Authorization": f"Bearer {password}"},
+        timeout=120,
+    )
+    data = json.loads(raw)
+    ok = status == 200 and data.get("service_tier") == "default"
+    print_result("service_tier", ok, raw[:160])
+    return ok
+
+
+def test_invalid_service_tier(base_url: str, password: str, model_name: str):
+    payload = {
+        "model": model_name,
+        "messages": [{"role": "user", "content": "hi"}],
+        "service_tier": "instant",
+    }
+    try:
+        request_json(
+            "POST",
+            f"{base_url}/openai/v1/chat/completions",
+            payload,
+            headers={"Authorization": f"Bearer {password}"},
+            timeout=60,
+        )
+    except urllib.error.HTTPError as exc:
+        status, raw, data = parse_error_body(exc)
+        ok = status == 400 and "service_tier" in data.get("error", {}).get("message", "")
+        print_result("invalid service_tier", ok, raw[:160])
+        return ok
+    print_result("invalid service_tier", False, "request unexpectedly succeeded")
+    return False
+
+
+def test_metadata_store_user(base_url: str, password: str, model_name: str):
+    payload = {
+        "model": model_name,
+        "messages": [{"role": "user", "content": "Reply with ok."}],
+        "metadata": {"suite": "contract", "case": "metadata"},
+        "store": False,
+        "user": "contract-user",
+        "max_tokens": 8,
+        "temperature": 0.1,
+    }
+    status, raw, _ = request_json(
+        "POST",
+        f"{base_url}/openai/v1/chat/completions",
+        payload,
+        headers={"Authorization": f"Bearer {password}"},
+        timeout=120,
+    )
+    ok = status == 200
+    print_result("metadata/store/user", ok, raw[:160])
+    return ok
+
+
+def test_invalid_metadata(base_url: str, password: str, model_name: str):
+    payload = {
+        "model": model_name,
+        "messages": [{"role": "user", "content": "hi"}],
+        "metadata": {"suite": 123},
+    }
+    try:
+        request_json(
+            "POST",
+            f"{base_url}/openai/v1/chat/completions",
+            payload,
+            headers={"Authorization": f"Bearer {password}"},
+            timeout=60,
+        )
+    except urllib.error.HTTPError as exc:
+        status, raw, data = parse_error_body(exc)
+        ok = status == 400 and "metadata" in data.get("error", {}).get("message", "")
+        print_result("invalid metadata", ok, raw[:160])
+        return ok
+    print_result("invalid metadata", False, "request unexpectedly succeeded")
+    return False
+
+
+def test_logit_bias_validation(base_url: str, password: str, model_name: str):
+    payload = {
+        "model": model_name,
+        "messages": [{"role": "user", "content": "hi"}],
+        "logit_bias": {"abc": 1},
+    }
+    try:
+        request_json(
+            "POST",
+            f"{base_url}/openai/v1/chat/completions",
+            payload,
+            headers={"Authorization": f"Bearer {password}"},
+            timeout=60,
+        )
+    except urllib.error.HTTPError as exc:
+        status, raw, data = parse_error_body(exc)
+        ok = status == 400 and "logit_bias" in data.get("error", {}).get("message", "")
+        print_result("invalid logit_bias", ok, raw[:160])
+        return ok
+    print_result("invalid logit_bias", False, "request unexpectedly succeeded")
+    return False
+
+
+def test_logit_bias(base_url: str, password: str, model_name: str):
+    payload = {
+        "model": model_name,
+        "messages": [{"role": "user", "content": "Reply with a single token if possible."}],
+        "logit_bias": {"0": -100},
+        "max_tokens": 4,
+        "temperature": 0.2,
+    }
+    status, raw, _ = request_json(
+        "POST",
+        f"{base_url}/openai/v1/chat/completions",
+        payload,
+        headers={"Authorization": f"Bearer {password}"},
+        timeout=120,
+    )
+    data = json.loads(raw)
+    ok = status == 200 and bool(data.get("choices"))
+    print_result("logit_bias", ok, raw[:160])
+    return ok
+
+
+def test_parallel_tool_calls_validation(base_url: str, password: str, model_name: str):
+    payload = {
+        "model": model_name,
+        "messages": [{"role": "user", "content": "hi"}],
+        "parallel_tool_calls": "yes",
+    }
+    try:
+        request_json(
+            "POST",
+            f"{base_url}/openai/v1/chat/completions",
+            payload,
+            headers={"Authorization": f"Bearer {password}"},
+            timeout=60,
+        )
+    except urllib.error.HTTPError as exc:
+        status, raw, data = parse_error_body(exc)
+        ok = status == 400 and "parallel_tool_calls" in data.get("error", {}).get("message", "")
+        print_result("invalid parallel_tool_calls", ok, raw[:160])
+        return ok
+    print_result("invalid parallel_tool_calls", False, "request unexpectedly succeeded")
+    return False
+
+
+def test_missing_tool_call_id(base_url: str, password: str, model_name: str):
+    payload = {
+        "model": model_name,
+        "messages": [
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "id": "call_test",
+                        "type": "function",
+                        "function": {"name": "lookup_weather", "arguments": "{}"},
+                    }
+                ],
+            },
+            {"role": "tool", "content": "{}"},
+            {"role": "user", "content": "Continue."},
+        ],
+        "max_tokens": 8,
+    }
+    try:
+        request_json(
+            "POST",
+            f"{base_url}/openai/v1/chat/completions",
+            payload,
+            headers={"Authorization": f"Bearer {password}"},
+            timeout=60,
+        )
+    except urllib.error.HTTPError as exc:
+        status, raw, data = parse_error_body(exc)
+        ok = status == 400 and "tool_call_id" in data.get("error", {}).get("message", "")
+        print_result("missing tool_call_id", ok, raw[:160])
+        return ok
+    print_result("missing tool_call_id", False, "request unexpectedly succeeded")
+    return False
+
+
+def test_unknown_tool_call_id(base_url: str, password: str, model_name: str):
+    payload = {
+        "model": model_name,
+        "messages": [
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "id": "call_known",
+                        "type": "function",
+                        "function": {"name": "lookup_weather", "arguments": "{}"},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call_unknown", "content": "{}"},
+            {"role": "user", "content": "Continue."},
+        ],
+        "max_tokens": 8,
+    }
+    try:
+        request_json(
+            "POST",
+            f"{base_url}/openai/v1/chat/completions",
+            payload,
+            headers={"Authorization": f"Bearer {password}"},
+            timeout=60,
+        )
+    except urllib.error.HTTPError as exc:
+        status, raw, data = parse_error_body(exc)
+        ok = status == 400 and "Unknown tool_call_id" in data.get("error", {}).get("message", "")
+        print_result("unknown tool_call_id", ok, raw[:160])
+        return ok
+    print_result("unknown tool_call_id", False, "request unexpectedly succeeded")
+    return False
+
+
+def test_parallel_tool_calls_non_stream(base_url: str, password: str, model_name: str):
+    if importlib.util.find_spec("xgrammar") is None:
+        print_result("parallel tool_calls non-stream", True, "skipped: xgrammar not installed")
+        return True
+    payload = {
+        "model": model_name,
+        "messages": [{"role": "user", "content": "Call add_numbers with a=2 and b=3, and create_task with title='Buy milk'."}],
+        "parallel_tool_calls": True,
+        "tool_choice": "required",
+        "tools": [
+            {
+                "type": "function",
+                "function": {
+                    "name": "add_numbers",
+                    "description": "Add two integers.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"a": {"type": "integer"}, "b": {"type": "integer"}},
+                        "required": ["a", "b"],
+                        "additionalProperties": False,
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "create_task",
+                    "description": "Create a task.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"title": {"type": "string"}},
+                        "required": ["title"],
+                        "additionalProperties": False,
+                    },
+                },
+            },
+        ],
+        "max_tokens": 96,
+        "temperature": 0.2,
+    }
+    status, raw, _ = request_json(
+        "POST",
+        f"{base_url}/openai/v1/chat/completions",
+        payload,
+        headers={"Authorization": f"Bearer {password}"},
+        timeout=240,
+    )
+    data = json.loads(raw)
+    tool_calls = data.get("choices", [{}])[0].get("message", {}).get("tool_calls") or []
+    names = {item.get("function", {}).get("name") for item in tool_calls}
+    ok = status == 200 and len(tool_calls) >= 2 and {"add_numbers", "create_task"}.issubset(names)
+    print_result("parallel tool_calls non-stream", ok, raw[:160])
+    return ok
+
+
+def test_parallel_tool_calls_stream(base_url: str, password: str, model_name: str):
+    if importlib.util.find_spec("xgrammar") is None:
+        print_result("parallel tool_calls stream", True, "skipped: xgrammar not installed")
+        return True
+    payload = {
+        "model": model_name,
+        "messages": [{"role": "user", "content": "Call add_numbers with a=2 and b=3, and create_task with title='Buy milk'."}],
+        "parallel_tool_calls": True,
+        "tool_choice": "required",
+        "stream": True,
+        "tools": [
+            {
+                "type": "function",
+                "function": {
+                    "name": "add_numbers",
+                    "description": "Add two integers.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"a": {"type": "integer"}, "b": {"type": "integer"}},
+                        "required": ["a", "b"],
+                        "additionalProperties": False,
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "create_task",
+                    "description": "Create a task.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"title": {"type": "string"}},
+                        "required": ["title"],
+                        "additionalProperties": False,
+                    },
+                },
+            },
+        ],
+        "max_tokens": 96,
+        "temperature": 0.2,
+    }
+    status, chunks, _ = request_stream(
+        f"{base_url}/openai/v1/chat/completions",
+        payload,
+        timeout=240,
+        headers={"Authorization": f"Bearer {password}"},
+    )
+    seen_tool_indices = set()
+    seen_ids = set()
+    saw_finish = False
+    for chunk in chunks:
+        if not chunk.startswith("data: {"):
+            continue
+        data = json.loads(chunk[6:])
+        for choice in data.get("choices", []):
+            for tool_delta in choice.get("delta", {}).get("tool_calls", []):
+                seen_tool_indices.add(tool_delta.get("index"))
+                if tool_delta.get("id"):
+                    seen_ids.add(tool_delta.get("id"))
+            if choice.get("finish_reason") == "tool_calls":
+                saw_finish = True
+    ok = status == 200 and len(seen_tool_indices) >= 2 and len(seen_ids) >= 2 and saw_finish
+    print_result("parallel tool_calls stream", ok, ",".join(map(str, sorted(i for i in seen_tool_indices if i is not None))))
+    return ok
+
+
+def test_parallel_tool_calls_false(base_url: str, password: str, model_name: str):
+    if importlib.util.find_spec("xgrammar") is None:
+        print_result("parallel tool_calls false", True, "skipped: xgrammar not installed")
+        return True
+    payload = {
+        "model": model_name,
+        "messages": [{"role": "user", "content": "Call add_numbers with a=2 and b=3, and create_task with title='Buy milk'."}],
+        "parallel_tool_calls": False,
+        "tool_choice": "required",
+        "tools": [
+            {
+                "type": "function",
+                "function": {
+                    "name": "add_numbers",
+                    "description": "Add two integers.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"a": {"type": "integer"}, "b": {"type": "integer"}},
+                        "required": ["a", "b"],
+                        "additionalProperties": False,
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "create_task",
+                    "description": "Create a task.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"title": {"type": "string"}},
+                        "required": ["title"],
+                        "additionalProperties": False,
+                    },
+                },
+            },
+        ],
+        "max_tokens": 96,
+        "temperature": 0.2,
+    }
+    status, raw, _ = request_json(
+        "POST",
+        f"{base_url}/openai/v1/chat/completions",
+        payload,
+        headers={"Authorization": f"Bearer {password}"},
+        timeout=240,
+    )
+    data = json.loads(raw)
+    tool_calls = data.get("choices", [{}])[0].get("message", {}).get("tool_calls") or []
+    ok = status == 200 and len(tool_calls) <= 1
+    print_result("parallel tool_calls false", ok, raw[:160])
+    return ok
+
+
 def test_n_validation(base_url: str, password: str, model_name: str):
     payload = {
         "model": model_name,
@@ -598,15 +1125,31 @@ def main():
 
     tests = [
         ("invalid auth", lambda: test_invalid_auth(args.base_url)),
+        ("models endpoints", lambda: test_models_endpoints(args.base_url, args.password)),
         ("invalid model", lambda: test_invalid_model(args.base_url, args.password)),
         ("invalid runtime", lambda: test_invalid_runtime(args.base_url, args.password, args.model)),
+        ("multimodal rejection", lambda: test_multimodal_rejection(args.base_url, args.password, args.model)),
+        ("reasoning_effort", lambda: test_reasoning_effort(args.base_url, args.password, args.model)),
+        ("invalid reasoning_effort", lambda: test_invalid_reasoning_effort(args.base_url, args.password, args.model)),
+        ("service_tier", lambda: test_service_tier(args.base_url, args.password, args.model)),
+        ("invalid service_tier", lambda: test_invalid_service_tier(args.base_url, args.password, args.model)),
+        ("metadata/store/user", lambda: test_metadata_store_user(args.base_url, args.password, args.model)),
+        ("invalid metadata", lambda: test_invalid_metadata(args.base_url, args.password, args.model)),
+        ("logit_bias", lambda: test_logit_bias(args.base_url, args.password, args.model)),
+        ("invalid logit_bias", lambda: test_logit_bias_validation(args.base_url, args.password, args.model)),
+        ("invalid parallel_tool_calls", lambda: test_parallel_tool_calls_validation(args.base_url, args.password, args.model)),
+        ("missing tool_call_id", lambda: test_missing_tool_call_id(args.base_url, args.password, args.model)),
+        ("unknown tool_call_id", lambda: test_unknown_tool_call_id(args.base_url, args.password, args.model)),
         ("n > 1", lambda: test_n_validation(args.base_url, args.password, args.model)),
         ("tool calling", lambda: test_tools_validation(args.base_url, args.password, args.model)),
+        ("parallel tool_calls non-stream", lambda: test_parallel_tool_calls_non_stream(args.base_url, args.password, args.model)),
+        ("parallel tool_calls false", lambda: test_parallel_tool_calls_false(args.base_url, args.password, args.model)),
         ("logprobs", lambda: test_logprobs(args.base_url, args.password, args.model)),
         ("stream n > 1", lambda: test_stream_n(args.base_url, args.password, args.model)),
         ("stream logprobs", lambda: test_stream_logprobs(args.base_url, args.password, args.model)),
         ("stream logprobs n>1", lambda: test_stream_logprobs_n(args.base_url, args.password, args.model)),
         ("stream tools", lambda: test_stream_tools(args.base_url, args.password, args.model)),
+        ("parallel tool_calls stream", lambda: test_parallel_tool_calls_stream(args.base_url, args.password, args.model)),
         ("tool_choice auto answer", lambda: test_tool_choice_auto_answer(args.base_url, args.password, args.model)),
         ("tool_choice auto tool", lambda: test_tool_choice_auto_tool(args.base_url, args.password, args.model)),
         ("stop + penalties", lambda: test_stop_and_penalties(args.base_url, args.password, args.model)),

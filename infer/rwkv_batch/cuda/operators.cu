@@ -80,11 +80,14 @@ __global__ void kernel_mm_seq_fp32i8(
     const int k = blockIdx.y * blockDim.y + threadIdx.y;
 
     if (i < B && k < M) {
+        const float rx_k = rx[k];
+        const float mx_k = mx[k];
         float y_local = 0;
+        #pragma unroll 4
         for (int j = 0; j < N; ++j) {
             y_local += x[i * x_stride + j] * (
                 (float(w[j * w_stride + k]) + 0.5f)
-                * rx[k] * ry[j] + mx[k] + my[j]
+                * rx_k * ry[j] + mx_k + my[j]
             );
         }
         y[i * y_stride + k] = y_local;
@@ -127,12 +130,15 @@ __global__ void kernel_mm_seq_fp16i8(
     const int k = blockIdx.y * blockDim.y + threadIdx.y;
 
     if (i < B && k < M) {
+        const float rx_k = __half2float(rx[k]);
+        const float mx_k = __half2float(mx[k]);
         float y_local = 0;
+        #pragma unroll 4
         for (int j = 0; j < N; ++j) {
             y_local += __half2float(x[i * x_stride + j]) * (
                 (float(w[j * w_stride + k]) + 0.5f)
-                * __half2float(rx[k]) * __half2float(ry[j])
-                + __half2float(mx[k]) + __half2float(my[j])
+                * rx_k * __half2float(ry[j])
+                + mx_k + __half2float(my[j])
             );
         }
         y[i * y_stride + k] = __float2half(y_local);
@@ -153,8 +159,7 @@ void cuda_mm8_seq<fp16>(int B, int N, int M,
         cast(mx), cast(rx), cast(my), cast(ry), cast(y), y_stride);
 }
 
-#define MM8_ONE_JSPLIT 24
-#define MM8_ONE_TILE 1024
+#define MM8_ONE_TILE 256
 
 __global__ void kernel_mm_one_fp32i8(
     const int N, const int M,
@@ -166,19 +171,20 @@ __global__ void kernel_mm_one_fp32i8(
     const float *__restrict__ const ry,
     float *__restrict__ const y) {
 
-    const int k = blockIdx.y * blockDim.y + threadIdx.y;
-    const int j0 = min(N, blockIdx.x * ((N + MM8_ONE_JSPLIT - 1) / MM8_ONE_JSPLIT));
-    const int j1 = min(N, (blockIdx.x + 1) * ((N + MM8_ONE_JSPLIT - 1) / MM8_ONE_JSPLIT));
+    const int k = blockIdx.x * blockDim.x + threadIdx.x;
 
     if (k < M) {
+        const float rx_k = rx[k];
+        const float mx_k = mx[k];
         float y_local = 0;
-        for (int j = j0; j < j1; ++j) {
+        #pragma unroll 4
+        for (int j = 0; j < N; ++j) {
             y_local += x[j] * (
                 (float(w[j * w_stride + k]) + 0.5f)
-                * rx[k] * ry[j] + mx[k] + my[j]
+                * rx_k * ry[j] + mx_k + my[j]
             );
         }
-        atomicAdd(&y[k], y_local);
+        y[k] = y_local;
     }
 }
 
@@ -192,13 +198,13 @@ void cuda_mm8_one(int N, int M,
 
 template <>
 void cuda_mm8_one<float>(int N, int M,
-                        float *x,
-                        uint8_t *w, int w_stride,
-                        float *mx, float *rx,
-                        float *my, float *ry,
-                        float *y) {
-    dim3 blockSize(1, MM8_ONE_TILE);
-    dim3 gridSize(MM8_ONE_JSPLIT, (M + blockSize.y - 1) / blockSize.y);
+                         float *x,
+                         uint8_t *w, int w_stride,
+                         float *mx, float *rx,
+                         float *my, float *ry,
+                         float *y) {
+    dim3 blockSize(MM8_ONE_TILE);
+    dim3 gridSize((M + blockSize.x - 1) / blockSize.x);
     kernel_mm_one_fp32i8<<<gridSize, blockSize>>>(
         N, M, x, w, w_stride,
         mx, rx, my, ry, y);
@@ -214,20 +220,21 @@ __global__ void kernel_mm_one_fp16i8(
     const __half *__restrict__ const ry,
     float *__restrict__ const y) {
 
-    const int k = blockIdx.y * blockDim.y + threadIdx.y;
-    const int j0 = min(N, blockIdx.x * ((N + MM8_ONE_JSPLIT - 1) / MM8_ONE_JSPLIT));
-    const int j1 = min(N, (blockIdx.x + 1) * ((N + MM8_ONE_JSPLIT - 1) / MM8_ONE_JSPLIT));
+    const int k = blockIdx.x * blockDim.x + threadIdx.x;
 
     if (k < M) {
+        const float rx_k = __half2float(rx[k]);
+        const float mx_k = __half2float(mx[k]);
         float y_local = 0;
-        for (int j = j0; j < j1; ++j) {
+        #pragma unroll 4
+        for (int j = 0; j < N; ++j) {
             y_local += __half2float(x[j]) * (
                 (float(w[j * w_stride + k]) + 0.5f)
-                * __half2float(rx[k]) * __half2float(ry[j])
-                + __half2float(mx[k]) + __half2float(my[j])
+                * rx_k * __half2float(ry[j])
+                + mx_k + __half2float(my[j])
             );
         }
-        atomicAdd(&y[k], y_local);
+        y[k] = y_local;
     }
 }
 
@@ -238,8 +245,8 @@ void cuda_mm8_one<fp16>(int N, int M,
                         fp16 *mx, fp16 *rx,
                         fp16 *my, fp16 *ry,
                         float *y) {
-    dim3 blockSize(1, MM8_ONE_TILE);
-    dim3 gridSize(MM8_ONE_JSPLIT, (M + blockSize.y - 1) / blockSize.y);
+    dim3 blockSize(MM8_ONE_TILE);
+    dim3 gridSize((M + blockSize.x - 1) / blockSize.x);
     kernel_mm_one_fp16i8<<<gridSize, blockSize>>>(
         N, M, cast(x), w, w_stride,
         cast(mx), cast(rx), cast(my), cast(ry), y);

@@ -91,6 +91,9 @@ class FakeScalar:
     def item(self) -> int:
         return self.value
 
+    def tolist(self):
+        return [self.value]
+
 
 sampler_stub = ModuleType("infer.rwkv_batch.sampler")
 setattr(
@@ -98,7 +101,8 @@ setattr(
     "sample",
     SimpleNamespace(
         setup_rand=lambda seed, batch_size: None,
-        batch_sampling_repetition_temperature_topk_topp=lambda *args, **kwargs: None,
+        batch_sampling_repetition_temperature_topk_topp=lambda *args, **kwargs: FakeScalar(0),
+        batch_sampling_temperature_topk_topp=lambda *args, **kwargs: FakeScalar(0),
     ),
 )
 sys.modules.setdefault("infer.rwkv_batch.sampler", sampler_stub)
@@ -145,11 +149,15 @@ def _patch_sampler(
     gumbel_fn=None,
     setup_rand_fn=None,
     batch_sampling_fn=None,
+    temperature_sampling_fn=None,
 ):
     original_sampler = inference_module.sampler_gumbel_batch
     original_setup_rand = getattr(inference_module.sample, "setup_rand")
     original_batch_sampling = getattr(
         inference_module.sample, "batch_sampling_repetition_temperature_topk_topp"
+    )
+    original_temperature_sampling = getattr(
+        inference_module.sample, "batch_sampling_temperature_topk_topp"
     )
     try:
         if gumbel_fn is not None:
@@ -162,6 +170,12 @@ def _patch_sampler(
                 "batch_sampling_repetition_temperature_topk_topp",
                 batch_sampling_fn,
             )
+        if temperature_sampling_fn is not None:
+            setattr(
+                inference_module.sample,
+                "batch_sampling_temperature_topk_topp",
+                temperature_sampling_fn,
+            )
         yield
     finally:
         inference_module.sampler_gumbel_batch = original_sampler
@@ -170,6 +184,11 @@ def _patch_sampler(
             inference_module.sample,
             "batch_sampling_repetition_temperature_topk_topp",
             original_batch_sampling,
+        )
+        setattr(
+            inference_module.sample,
+            "batch_sampling_temperature_topk_topp",
+            original_temperature_sampling,
         )
 
 

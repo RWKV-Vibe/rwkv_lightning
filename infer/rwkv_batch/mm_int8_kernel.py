@@ -37,7 +37,7 @@ def cuda_mm8_seq(B: int, N: int, M: int, x, w, mx, rx, my, ry):
 
 @MyStatic
 def cuda_mm8_one(N: int, M: int, x, w, mx, rx, my, ry):
-    y = torch.zeros((M,), device=w.device, dtype=torch.float32)
+    y = torch.empty((M,), device=w.device, dtype=torch.float32)
     torch.ops.rwkv.mm8_one(N, M, x, w, mx, rx, my, ry, y)
     return y.to(dtype=x.dtype)
 

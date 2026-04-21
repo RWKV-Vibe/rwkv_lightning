@@ -26,4 +26,6 @@ ENV PORT=8000
 ENV PASSWORD=""
 ENV RUNTIME=fp16
 
+ENTRYPOINT ["/entrypoint.sh"]
+
 CMD ["bash", "-lc", "python app.py --model-path \"${MODEL_PATH}\" --runtime \"${RUNTIME}\" --port \"${PORT}\" ${PASSWORD:+--password \"${PASSWORD}\"}"]

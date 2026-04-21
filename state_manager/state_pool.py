@@ -166,6 +166,7 @@ class StateCacheManager:
         }
         self.prefix_entry_index: Dict[str, PrefixCacheEntry] = {}
         self.prefix_trie = _CompressedTrie()
+        self._prefix_trie_dirty = False
         
         self.cache_lock = threading.RLock()
         
@@ -297,20 +298,25 @@ class StateCacheManager:
         for entry in self.prefix_entry_index.values():
             trie.insert(entry.prefix_tokens, entry.state_id)
         self.prefix_trie = trie
+        self._prefix_trie_dirty = False
+
+    def _ensure_prefix_trie_locked(self):
+        if self._prefix_trie_dirty:
+            self._rebuild_prefix_trie()
 
     def _store_prefix_entry_locked(self, entry: PrefixCacheEntry, persist: bool):
         bucket_cache = self.prefix_l2_cache[entry.bucket_len]
-        if entry.state_id in bucket_cache:
-            del bucket_cache[entry.state_id]
+        existing_entry = bucket_cache.pop(entry.state_id, None)
         bucket_cache[entry.state_id] = entry
         self.prefix_entry_index[entry.state_id] = entry
+        if existing_entry is None:
+            self.prefix_trie.insert(entry.prefix_tokens, entry.state_id)
 
         evicted_entry = None
         if len(bucket_cache) > PREFIX_CACHE_BUCKET_CAPACITY:
             _, evicted_entry = bucket_cache.popitem(last=False)
             self.prefix_entry_index.pop(evicted_entry.state_id, None)
-
-        self._rebuild_prefix_trie()
+            self._prefix_trie_dirty = True
 
         if persist:
             self.io_executor.submit(self._persist_prefix_task, entry)
@@ -482,6 +488,7 @@ class StateCacheManager:
             return None
 
         with self.cache_lock:
+            self._ensure_prefix_trie_locked()
             state_id, matched_len = self.prefix_trie.longest_prefix(token_tuple)
             if state_id is not None:
                 entry = self.prefix_entry_index.get(state_id)
@@ -571,7 +578,8 @@ class StateCacheManager:
                     _, entry = bucket_cache.popitem()
                     prefix_entries_to_save.append(entry)
             self.prefix_entry_index.clear()
-            self._rebuild_prefix_trie()
+            self.prefix_trie.clear()
+            self._prefix_trie_dirty = False
 
         with self.db_lock:
             try:

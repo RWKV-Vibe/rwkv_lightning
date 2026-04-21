@@ -250,6 +250,7 @@ class RWKV_x070(MyModule):
         z['blocks.0.att.v0'] = z['blocks.0.att.a0'] # actually ignored
         z['blocks.0.att.v1'] = z['blocks.0.att.a1'] # actually ignored
         z['blocks.0.att.v2'] = z['blocks.0.att.a2'] # actually ignored
+        self._paged_state_buffers = {}
 
     def _quantize_one_linear_weight(self, key: str):
         z = self.z
@@ -299,6 +300,21 @@ class RWKV_x070(MyModule):
             state[1] = torch.zeros((args.n_layer, args.n_embd // args.head_size, args.head_size, args.head_size), dtype=DTYPE, requires_grad=False, device="cuda")
             state[2] = torch.zeros((), dtype=torch.int32, requires_grad=False, device="cuda")
         return state
+
+    def _get_paged_state_buffers(self, batch_size):
+        buffers = self._paged_state_buffers.get(batch_size)
+        if buffers is None:
+            device = self.z['emb.weight'].device
+            buffers = (
+                torch.empty(
+                    (self.n_layer, 2, batch_size, self.n_embd),
+                    dtype=DTYPE,
+                    device=device,
+                ),
+                torch.empty((batch_size,), dtype=torch.int32, device=device),
+            )
+            self._paged_state_buffers[batch_size] = buffers
+        return buffers
 
     def forward(self, idx, state, full_output=False): # will modify state in-place
         if type(idx) is list:
@@ -594,10 +610,12 @@ class RWKV_x070(MyModule):
             z = self.z
             idx_tensor = idxs.to(device=z['emb.weight'].device, dtype=torch.long) if torch.is_tensor(idxs) else torch.tensor(idxs, device=z['emb.weight'].device)
             page_idx = page_table.to(device=z['emb.weight'].device, dtype=torch.int32)
+            page_idx_long = page_idx.long()
             x = z['emb.weight'][idx_tensor]
 
-            state0_batch = state_pool[0][:, :, page_idx.long(), :].contiguous()
-            elapsed_t = state_pool[2][page_idx.long()].contiguous()
+            state0_batch, elapsed_t = self._get_paged_state_buffers(page_idx_long.numel())
+            torch.index_select(state_pool[0], 2, page_idx_long, out=state0_batch)
+            torch.index_select(state_pool[2], 0, page_idx_long, out=elapsed_t)
             v_first = torch.empty_like(x)
             for i in range(self.n_layer):
                 bbb = f'blocks.{i}.'
@@ -625,8 +643,9 @@ class RWKV_x070(MyModule):
                 )
                 x = x + xx
 
-            state_pool[0][:, :, page_idx.long(), :] = state0_batch
-            state_pool[2][page_idx.long()] = elapsed_t + int(idx_tensor.shape[1])
+            state_pool[0].index_copy_(2, page_idx_long, state0_batch)
+            elapsed_t.add_(int(idx_tensor.shape[1]))
+            state_pool[2].index_copy_(0, page_idx_long, elapsed_t)
 
             if not full_output:
                 x = x[:, -1, :]
@@ -641,10 +660,12 @@ class RWKV_x070(MyModule):
             device = z['emb.weight'].device
             full_idxs = idxs.to(device=device, dtype=torch.long) if torch.is_tensor(idxs) else torch.tensor(idxs, device=device)
             page_idx = page_table.to(device=device, dtype=torch.int32)
+            page_idx_long = page_idx.long()
             batch_size, total_len = full_idxs.size()
 
-            state0_batch = state_pool[0][:, :, page_idx.long(), :].contiguous()
-            elapsed_t = state_pool[2][page_idx.long()].contiguous()
+            state0_batch, elapsed_t = self._get_paged_state_buffers(page_idx_long.numel())
+            torch.index_select(state_pool[0], 2, page_idx_long, out=state0_batch)
+            torch.index_select(state_pool[2], 0, page_idx_long, out=elapsed_t)
             all_outputs = []
 
             for start in range(0, total_len, chunk_len):
@@ -687,8 +708,8 @@ class RWKV_x070(MyModule):
                 elif end == total_len:
                     all_outputs.append(x[:, -1, :])
 
-            state_pool[0][:, :, page_idx.long(), :] = state0_batch
-            state_pool[2][page_idx.long()] = elapsed_t
+            state_pool[0].index_copy_(2, page_idx_long, state0_batch)
+            state_pool[2].index_copy_(0, page_idx_long, elapsed_t)
 
             x = torch.cat(all_outputs, dim=1) if full_output else all_outputs[0]
             x = F.layer_norm(x, (self.n_embd,), weight=z['ln_out.weight'], bias=z['ln_out.bias'])

@@ -6,6 +6,7 @@ import random
 import time
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
+from itertools import islice
 from queue import Empty, Queue
 from threading import Event, Lock, Thread
 
@@ -32,6 +33,18 @@ class PagedStateManager:
             (self.total_pages, vocab_size), dtype=torch.float32, device=device
         )
         self.free_pages = deque(range(self.total_pages))
+        self.page_table_buffer = torch.empty(
+            (self.total_pages,), dtype=torch.int32, device=device
+        )
+        self.page_index_buffer = torch.empty(
+            (self.total_pages,), dtype=torch.long, device=device
+        )
+        self.decode_token_buffer = torch.empty(
+            (max(1, decode_capacity), 1), dtype=torch.long, device=device
+        )
+        self.prefill_token_buffer = torch.empty(
+            (max(1, prefill_capacity), 512), dtype=torch.long, device=device
+        )
 
     def allocate_page(self):
         if not self.free_pages:
@@ -49,12 +62,53 @@ class PagedStateManager:
         self.occurrence[page_idx, :].zero_()
         self.alpha_presence_vector[page_idx, :].zero_()
 
-    def page_table(self, tasks):
-        return torch.tensor(
-            [task["state_pos"] for task in tasks],
+    def _ensure_prefill_buffer(self, step_len):
+        if step_len <= self.prefill_token_buffer.shape[1]:
+            return
+        self.prefill_token_buffer = torch.empty(
+            (max(1, self.prefill_capacity), step_len),
+            dtype=torch.long,
             device=self.device,
-            dtype=torch.int32,
         )
+
+    def build_page_table(self, tasks):
+        count = len(tasks)
+        for idx, task in enumerate(tasks):
+            state_pos = int(task["state_pos"])
+            self.page_table_buffer[idx] = state_pos
+            self.page_index_buffer[idx] = state_pos
+        return self.page_table_buffer[:count], self.page_index_buffer[:count]
+
+    def prepare_decode_batch(self, tasks):
+        count = len(tasks)
+        for idx, task in enumerate(tasks):
+            state_pos = int(task["state_pos"])
+            self.page_table_buffer[idx] = state_pos
+            self.page_index_buffer[idx] = state_pos
+            self.decode_token_buffer[idx, 0] = task["input_token"].popleft()
+        return (
+            self.decode_token_buffer[:count],
+            self.page_table_buffer[:count],
+            self.page_index_buffer[:count],
+        )
+
+    def prepare_prefill_batch(self, tasks, step_len):
+        self._ensure_prefill_buffer(step_len)
+        count = len(tasks)
+        batch_tokens = self.prefill_token_buffer[:count, :step_len]
+        for idx, task in enumerate(tasks):
+            state_pos = int(task["state_pos"])
+            self.page_table_buffer[idx] = state_pos
+            self.page_index_buffer[idx] = state_pos
+            for token_idx, token in enumerate(islice(task["input_token"], 0, step_len)):
+                batch_tokens[idx, token_idx] = token
+        return batch_tokens, self.page_table_buffer[:count], self.page_index_buffer[:count]
+
+    @staticmethod
+    def consume_prefill_tokens(tasks, step_len):
+        for task in tasks:
+            for _ in range(step_len):
+                task["input_token"].popleft()
 
 
 class InferenceEngine:
@@ -72,9 +126,12 @@ class InferenceEngine:
         )
         self._cuda_graph_sessions = {}
         self._batch_cuda_graphs = {}
-        self._flashinfer = None
-        self._flashinfer_checked = False
         self._continuous_prefill_candidates = (256, 128, 64, 32, 16, 8, 4, 2)
+        self._no_penalty_token_ids = frozenset(
+            (33, 10, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58)
+        )
+        self._token_bytes_cache = {}
+        self._token_text_cache = {}
         self._xgrammar_runtime = None
 
     def shutdown(self):
@@ -99,7 +156,8 @@ class InferenceEngine:
     def _create_stop_state(self, stop_tokens):
         return {
             "stop_strings": self._normalize_stop_strings(stop_tokens),
-            "pending_tokens": deque(),
+            "pending_bytes": bytearray(),
+            "pending_lengths": deque(),
             "window_size": 6,
         }
 
@@ -107,43 +165,45 @@ class InferenceEngine:
         if token == 0:
             return "", True
 
-        pending_tokens = stop_state["pending_tokens"]
-        pending_tokens.append(token)
+        pending_bytes = stop_state["pending_bytes"]
+        pending_lengths = stop_state["pending_lengths"]
+        token_bytes = self._token_raw_bytes(token)
+        pending_bytes.extend(token_bytes)
+        pending_lengths.append(len(token_bytes))
 
-        decoded_window = self.tokenizer.decode(
-            list(pending_tokens), utf8_errors="ignore"
-        )
+        decoded_window = bytes(pending_bytes).decode("utf-8", errors="ignore")
         matched_stop = self._match_stop_suffix(
             decoded_window, stop_state["stop_strings"]
         )
         if matched_stop is not None:
-            pending_tokens.clear()
+            pending_bytes.clear()
+            pending_lengths.clear()
             return decoded_window[: -len(matched_stop)], True
 
-        if len(pending_tokens) > stop_state["window_size"]:
-            pending_tokens.popleft()
-            trailing_text = self.tokenizer.decode(
-                list(pending_tokens), utf8_errors="ignore"
-            )
+        if len(pending_lengths) > stop_state["window_size"]:
+            del pending_bytes[: pending_lengths.popleft()]
+            trailing_text = bytes(pending_bytes).decode("utf-8", errors="ignore")
             if not trailing_text:
                 return decoded_window, False
             if decoded_window.endswith(trailing_text):
                 return decoded_window[: -len(trailing_text)], False
 
-            return self.tokenizer.decode([token], utf8_errors="ignore"), False
+            return token_bytes.decode("utf-8", errors="ignore"), False
 
         return "", False
 
     def _flush_stop_state(self, stop_state, final=False):
-        pending_tokens = stop_state["pending_tokens"]
-        if not pending_tokens:
+        pending_bytes = stop_state["pending_bytes"]
+        pending_lengths = stop_state["pending_lengths"]
+        if not pending_lengths:
             return ""
 
-        if not final and len(pending_tokens) <= stop_state["window_size"]:
+        if not final and len(pending_lengths) <= stop_state["window_size"]:
             return ""
 
-        decoded = self.tokenizer.decode(list(pending_tokens), utf8_errors="ignore")
-        pending_tokens.clear()
+        decoded = bytes(pending_bytes).decode("utf-8", errors="ignore")
+        pending_bytes.clear()
+        pending_lengths.clear()
         return decoded
 
     def _init_cuda_graph_state(self, token, state, out):
@@ -171,17 +231,27 @@ class InferenceEngine:
         return static_input, static_state, static_output, g
 
     def _create_sampling_state(self, batch_size, device, vocab_size=None, seed=None):
+        state_seed = int(seed) if seed is not None else random.randint(0, 2**63 - 1)
         return {
             "penalties": torch.zeros(
                 (batch_size, vocab_size or self.args.vocab_size),
                 dtype=torch.float32,
                 device=device,
             ),
-            "rand_states": sample.setup_rand(
-                int(seed) if seed is not None else random.randint(0, 2**63 - 1),
-                batch_size,
-            ),
+            "rand_states": self._create_rand_states(batch_size, seed=state_seed),
+            "seed": state_seed,
         }
+
+    def _create_rand_states(self, batch_size, seed=None):
+        return sample.setup_rand(
+            int(seed) if seed is not None else random.randint(0, 2**63 - 1),
+            batch_size,
+        )
+
+    @staticmethod
+    def _maybe_contiguous(tensor):
+        contiguous = getattr(tensor, "contiguous", None)
+        return contiguous() if callable(contiguous) else tensor
 
     def _get_xgrammar_runtime(self):
         if self._xgrammar_runtime is None:
@@ -220,6 +290,14 @@ class InferenceEngine:
             if constraint is not None:
                 constraint.apply(logits_2d[row_idx])
 
+    @staticmethod
+    def _apply_logit_bias_inplace(logits, logit_bias=None):
+        if not logit_bias:
+            return
+        logits_2d = logits if logits.dim() == 2 else logits.unsqueeze(0)
+        for token_id, bias in logit_bias.items():
+            logits_2d[:, int(token_id)] += float(bias)
+
     def _accept_grammar_tokens(self, grammar_constraints, token_ids):
         constraints = self._normalize_grammar_constraints(grammar_constraints)
         if not constraints:
@@ -252,9 +330,17 @@ class InferenceEngine:
         top_k,
         top_p,
         grammar_constraints=None,
+        logit_bias=None,
     ):
-        logits_reshaped = logits.unsqueeze(0).float() if logits.dim() == 1 else logits.float()
+        logits_reshaped = self._maybe_contiguous(
+            logits.unsqueeze(0).float() if logits.dim() == 1 else logits.float()
+        )
+        self._apply_logit_bias_inplace(logits_reshaped, logit_bias)
         self._apply_grammar_constraints_inplace(logits_reshaped, grammar_constraints)
+        if temperature <= 0:
+            temperature = 1.0
+            top_k = 1
+            top_p = 1.0
         return sample.batch_sampling_repetition_temperature_topk_topp(
             logits_reshaped,
             sampling_state["penalties"],
@@ -267,37 +353,46 @@ class InferenceEngine:
             top_p,
         )
 
-    def _sample_top_k_top_p(self, logits, top_k, top_p, temperature=1.0, grammar_constraints=None):
-        logits_reshaped = logits.unsqueeze(0).float() if logits.dim() == 1 else logits.float()
-        if temperature != 1.0:
-            logits_reshaped = logits_reshaped / temperature
+    def _sample_top_k_top_p(
+        self,
+        logits,
+        top_k,
+        top_p,
+        temperature=1.0,
+        grammar_constraints=None,
+        rand_states=None,
+        logit_bias=None,
+    ):
+        logits_reshaped = self._maybe_contiguous(
+            logits.unsqueeze(0).float() if logits.dim() == 1 else logits.float()
+        )
+        self._apply_logit_bias_inplace(logits_reshaped, logit_bias)
         self._apply_grammar_constraints_inplace(logits_reshaped, grammar_constraints)
+        if temperature <= 0:
+            temperature = 1.0
+            top_k = 1
+            top_p = 1.0
 
-        if self.rocm_flag:
-            return self._torch_top_k_top_p(logits_reshaped, top_k, top_p)
-
-        flashinfer = self._get_flashinfer()
-        if flashinfer is not None:
-            return flashinfer.sampling.top_k_top_p_sampling_from_logits(
-                logits_reshaped, top_k, top_p
+        if rand_states is None:
+            rand_states = self._create_rand_states(logits_reshaped.shape[0])
+        elif rand_states.size(0) < logits_reshaped.shape[0]:
+            raise ValueError(
+                f"Random state batch size {rand_states.size(0)} is smaller than logits batch size {logits_reshaped.shape[0]}"
             )
-        return self._torch_top_k_top_p(logits_reshaped, top_k, top_p)
 
-    def _get_flashinfer(self):
-        if self.rocm_flag:
-            return None
-        if not self._flashinfer_checked:
-            try:
-                import flashinfer  # type: ignore
+        return sample.batch_sampling_temperature_topk_topp(
+            logits_reshaped,
+            rand_states,
+            temperature,
+            top_k,
+            top_p,
+        )
 
-                self._flashinfer = flashinfer
-            except Exception:
-                self._flashinfer = None
-            self._flashinfer_checked = True
-        return self._flashinfer
-
-    def _sample_throughput_tokens(self, logits, temperature, grammar_constraints=None):
+    def _sample_throughput_tokens(
+        self, logits, temperature, grammar_constraints=None, logit_bias=None
+    ):
         logits_reshaped = logits.unsqueeze(0) if logits.dim() == 1 else logits
+        self._apply_logit_bias_inplace(logits_reshaped, logit_bias)
         self._apply_grammar_constraints_inplace(logits_reshaped, grammar_constraints)
         if temperature <= 0:
             return torch.argmax(logits_reshaped, dim=-1, keepdim=True)
@@ -330,27 +425,50 @@ class InferenceEngine:
             return float("-inf") if value < 0 else float("inf")
         return float(value.item())
 
-    def _token_bytes(self, token_id):
-        raw = getattr(self.tokenizer, "idx2token", {}).get(int(token_id))
+    def _token_raw_bytes(self, token_id):
+        token_id = int(token_id)
+        cached = self._token_bytes_cache.get(token_id)
+        if cached is not None:
+            return cached
+
+        raw = getattr(self.tokenizer, "idx2token", {}).get(token_id)
         if isinstance(raw, bytes):
-            return list(raw)
-        if isinstance(raw, str):
-            return list(raw.encode("utf-8"))
-        try:
-            return list(self.tokenizer.decode([int(token_id)], utf8_errors="ignore").encode("utf-8"))
-        except Exception:
-            return []
+            payload = raw
+        elif isinstance(raw, str):
+            payload = raw.encode("utf-8")
+        else:
+            try:
+                payload = self.tokenizer.decode([token_id], utf8_errors="ignore").encode(
+                    "utf-8"
+                )
+            except Exception:
+                payload = b""
+
+        self._token_bytes_cache[token_id] = payload
+        return payload
+
+    def _token_bytes(self, token_id):
+        return list(self._token_raw_bytes(token_id))
 
     def _token_text(self, token_id):
-        raw = getattr(self.tokenizer, "idx2token", {}).get(int(token_id))
+        token_id = int(token_id)
+        cached = self._token_text_cache.get(token_id)
+        if cached is not None:
+            return cached
+
+        raw = getattr(self.tokenizer, "idx2token", {}).get(token_id)
         if isinstance(raw, bytes):
-            return raw.decode("utf-8", errors="ignore")
-        if isinstance(raw, str):
-            return raw
-        try:
-            return self.tokenizer.decode([int(token_id)], utf8_errors="ignore")
-        except Exception:
-            return ""
+            text = raw.decode("utf-8", errors="ignore")
+        elif isinstance(raw, str):
+            text = raw
+        else:
+            try:
+                text = self.tokenizer.decode([token_id], utf8_errors="ignore")
+            except Exception:
+                text = ""
+
+        self._token_text_cache[token_id] = text
+        return text
 
     def _prepare_logprob_logits(
         self,
@@ -362,9 +480,11 @@ class InferenceEngine:
         top_k,
         top_p,
         grammar_constraint=None,
+        logit_bias=None,
     ):
         logits_2d = logits.unsqueeze(0).float() if logits.dim() == 1 else logits.float()
         adjusted = logits_2d.clone()
+        self._apply_logit_bias_inplace(adjusted, logit_bias)
         penalties = sampling_state["penalties"]
         if penalties.shape[0] == adjusted.shape[0]:
             penalty_mask = (penalties > 0).float()
@@ -399,7 +519,8 @@ class InferenceEngine:
     def _create_logprob_stop_state(self, stop_tokens):
         return {
             "stop_strings": self._normalize_stop_strings(stop_tokens),
-            "pending_tokens": deque(),
+            "pending_bytes": bytearray(),
+            "pending_lengths": deque(),
             "pending_entries": deque(),
             "window_size": 6,
         }
@@ -408,52 +529,54 @@ class InferenceEngine:
         if token == 0:
             return "", [], True
 
-        pending_tokens = stop_state["pending_tokens"]
+        pending_bytes = stop_state["pending_bytes"]
+        pending_lengths = stop_state["pending_lengths"]
         pending_entries = stop_state["pending_entries"]
-        pending_tokens.append(token)
+        token_bytes = self._token_raw_bytes(token)
+        pending_bytes.extend(token_bytes)
+        pending_lengths.append(len(token_bytes))
         pending_entries.append(logprob_entry)
 
-        decoded_window = self.tokenizer.decode(
-            list(pending_tokens), utf8_errors="ignore"
-        )
+        decoded_window = bytes(pending_bytes).decode("utf-8", errors="ignore")
         matched_stop = self._match_stop_suffix(
             decoded_window, stop_state["stop_strings"]
         )
         if matched_stop is not None:
             content = decoded_window[: -len(matched_stop)]
-            pending_tokens.clear()
+            pending_bytes.clear()
+            pending_lengths.clear()
             # We cannot precisely map trailing stop-string bytes back to token boundaries here.
             # Drop buffered logprobs on the matched stop boundary rather than returning wrong metadata.
             pending_entries.clear()
             return content, [], True
 
-        if len(pending_tokens) > stop_state["window_size"]:
+        if len(pending_lengths) > stop_state["window_size"]:
             oldest_entry = pending_entries.popleft()
-            pending_tokens.popleft()
-            trailing_text = self.tokenizer.decode(
-                list(pending_tokens), utf8_errors="ignore"
-            )
+            del pending_bytes[: pending_lengths.popleft()]
+            trailing_text = bytes(pending_bytes).decode("utf-8", errors="ignore")
             if not trailing_text:
                 return decoded_window, [oldest_entry], False
             if decoded_window.endswith(trailing_text):
                 return decoded_window[: -len(trailing_text)], [oldest_entry], False
 
-            return self.tokenizer.decode([token], utf8_errors="ignore"), [logprob_entry], False
+            return token_bytes.decode("utf-8", errors="ignore"), [logprob_entry], False
 
         return "", [], False
 
     def _flush_logprob_stop_state(self, stop_state, final=False):
-        pending_tokens = stop_state["pending_tokens"]
+        pending_bytes = stop_state["pending_bytes"]
+        pending_lengths = stop_state["pending_lengths"]
         pending_entries = stop_state["pending_entries"]
-        if not pending_tokens:
+        if not pending_lengths:
             return "", []
 
-        if not final and len(pending_tokens) <= stop_state["window_size"]:
+        if not final and len(pending_lengths) <= stop_state["window_size"]:
             return "", []
 
-        decoded = self.tokenizer.decode(list(pending_tokens), utf8_errors="ignore")
+        decoded = bytes(pending_bytes).decode("utf-8", errors="ignore")
         entries = list(pending_entries)
-        pending_tokens.clear()
+        pending_bytes.clear()
+        pending_lengths.clear()
         pending_entries.clear()
         return decoded, entries
 
@@ -463,7 +586,7 @@ class InferenceEngine:
             for task in task_pool
             if task["pending_out"] is None
             and task["new_token"] is None
-            and not task["generated_tokens"]
+            and task["generated_count"] == 0
             and len(task["input_token"]) > 0
         ]
         if not prefill_tasks:
@@ -491,22 +614,15 @@ class InferenceEngine:
 
         return best_tasks, best_step
 
-    def _apply_continuous_prefill(self, tasks, states, step_len):
+    def _apply_continuous_prefill(self, tasks, state_manager, step_len):
         if not tasks or step_len <= 0:
             return
 
-        slot_indices = [task["state_pos"] for task in tasks]
-        device = self.model.z["head.weight"].device
-        batch_tokens = torch.tensor(
-            [task["input_token"][:step_len] for task in tasks],
-            device=device,
-            dtype=torch.long,
-        )
-        page_table = torch.tensor(slot_indices, device=device, dtype=torch.int32)
-        out = self.model.forward_batch_paged(batch_tokens, states, page_table)
+        batch_tokens, page_table, _ = state_manager.prepare_prefill_batch(tasks, step_len)
+        out = self.model.forward_batch_paged(batch_tokens, state_manager.states, page_table)
+        state_manager.consume_prefill_tokens(tasks, step_len)
 
         for idx, task in enumerate(tasks):
-            del task["input_token"][:step_len]
             if not task["input_token"]:
                 task["pending_out"] = out[idx]
 
@@ -516,7 +632,41 @@ class InferenceEngine:
             return False
         if len(task["input_token"]) == 1:
             return True
-        return bool(task["generated_tokens"] or task["new_token"] is not None)
+        return bool(task["generated_count"] or task["new_token"] is not None)
+
+    def _prepare_continuous_decode_batch(self, decode_tasks, state_manager):
+        ready_tasks = [task for task in decode_tasks if self._ready_for_decode(task)]
+        if not ready_tasks:
+            return [], None, None, None
+        token_tensor, page_table, page_index = state_manager.prepare_decode_batch(
+            ready_tasks
+        )
+        return ready_tasks, token_tensor, page_table, page_index
+
+    def _apply_continuous_penalties(
+        self,
+        out,
+        state_manager,
+        page_index,
+        alpha_presence,
+        alpha_frequency,
+        alpha_decay,
+    ):
+        decode_occurrence = torch.index_select(
+            state_manager.occurrence, 0, page_index
+        )
+        decode_presence = torch.index_select(
+            state_manager.alpha_presence_vector, 0, page_index
+        )
+
+        if alpha_presence != 0 or alpha_frequency != 0:
+            mask = (decode_occurrence > 0).float()
+            out -= mask * alpha_presence + decode_occurrence * alpha_frequency
+
+        decode_occurrence *= alpha_decay
+        out -= decode_presence + decode_occurrence * alpha_frequency
+        state_manager.occurrence.index_copy_(0, page_index, decode_occurrence)
+        return out
 
     @staticmethod
     def _state_token_count(state):
@@ -539,6 +689,35 @@ class InferenceEngine:
             torch.cuda.synchronize()
         except Exception:
             pass
+
+    @staticmethod
+    def _row_index_tensor(row_indices, device):
+        if torch.is_tensor(row_indices):
+            return row_indices.to(device=device, dtype=torch.long)
+        return torch.tensor(row_indices, device=device, dtype=torch.long)
+
+    def _select_rows(self, tensor, row_indices):
+        if tensor is None:
+            return None
+        row_index = self._row_index_tensor(row_indices, tensor.device)
+        return torch.index_select(tensor, 0, row_index).contiguous()
+
+    def _select_state_rows(self, state, row_indices):
+        row_index = self._row_index_tensor(row_indices, state[2].device)
+        return [
+            torch.index_select(state[0], 2, row_index).contiguous(),
+            torch.index_select(state[1], 1, row_index).contiguous(),
+            torch.index_select(state[2], 0, row_index).contiguous(),
+        ]
+
+    def _select_sampling_state_rows(self, sampling_state, row_indices):
+        penalties = self._select_rows(sampling_state["penalties"], row_indices)
+        seed = sampling_state.get("seed")
+        return {
+            "penalties": penalties,
+            "rand_states": self._create_rand_states(penalties.shape[0], seed=seed),
+            "seed": seed,
+        }
 
     @staticmethod
     def _copy_state_slot(states, occurrence, alpha_presence_vector, dst_slot, src_slot):
@@ -688,9 +867,9 @@ class InferenceEngine:
         return {
             "prompt_idx": prompt_idx,
             "prompt": prompt,
-            "input_token": prompt_tokens,
+            "input_token": deque(prompt_tokens),
             "state_pos": state_pos,
-            "generated_tokens": [],
+            "generated_count": 0,
             "new_token": None,
             "pending_out": pending_out,
         }
@@ -782,6 +961,56 @@ class InferenceEngine:
         self._batch_cuda_graphs[batch_size] = sess
         return sess
 
+    @staticmethod
+    def _snapshot_paged_state_rows(states, page_index):
+        return [
+            torch.index_select(states[0], 2, page_index).contiguous(),
+            torch.index_select(states[1], 1, page_index).contiguous(),
+            torch.index_select(states[2], 0, page_index).contiguous(),
+        ]
+
+    @staticmethod
+    def _restore_paged_state_rows(states, page_index, snapshot):
+        states[0].index_copy_(2, page_index, snapshot[0])
+        states[1].index_copy_(1, page_index, snapshot[1])
+        states[2].index_copy_(0, page_index, snapshot[2])
+
+    def _get_or_create_paged_batch_cuda_graph(
+        self, graph_cache, batch_size, token_tensor, states, page_table, page_index
+    ):
+        if batch_size in graph_cache:
+            sess = graph_cache[batch_size]
+            sess["static_tokens"].copy_(token_tensor)
+            sess["static_page_table"].copy_(page_table)
+            return sess
+
+        static_tokens = torch.empty_like(token_tensor, device=token_tensor.device)
+        static_page_table = torch.empty_like(page_table, device=page_table.device)
+        static_tokens.copy_(token_tensor)
+        static_page_table.copy_(page_table)
+
+        snapshot = self._snapshot_paged_state_rows(states, page_index)
+        static_output = self.model.forward_batch_paged(
+            static_tokens, states, static_page_table
+        )
+
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g):
+            static_output = self.model.forward_batch_paged(
+                static_tokens, states, static_page_table
+            )
+
+        self._restore_paged_state_rows(states, page_index, snapshot)
+
+        sess = {
+            "static_tokens": static_tokens,
+            "static_page_table": static_page_table,
+            "static_output": static_output,
+            "graph": g,
+        }
+        graph_cache[batch_size] = sess
+        return sess
+
     def cleanup_batch_cuda_graphs(self):
         for batch_size in list(self._batch_cuda_graphs.keys()):
             sess = self._batch_cuda_graphs.pop(batch_size, None)
@@ -794,6 +1023,17 @@ class InferenceEngine:
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+
+    @staticmethod
+    def _cleanup_paged_batch_cuda_graphs(graph_cache):
+        for batch_size in list(graph_cache.keys()):
+            sess = graph_cache.pop(batch_size, None)
+            if sess is None:
+                continue
+            del sess["graph"]
+            del sess["static_output"]
+            del sess["static_page_table"]
+            del sess["static_tokens"]
 
     @staticmethod
     def _sync_cuda_graph_state(static_state, state):
@@ -1021,34 +1261,6 @@ class InferenceEngine:
 
             yield "data: [DONE]\n\n"
 
-    @staticmethod
-    def _torch_top_k_top_p(logits, top_k, top_p):
-        if top_k > 0:
-            top_k = min(top_k, logits.size(-1))
-            indices_to_remove = (
-                logits < torch.topk(logits, top_k, dim=-1)[0][..., -1, None]
-            )
-            logits = logits.masked_fill(indices_to_remove, -float("Inf"))
-
-        if top_p < 1.0:
-            sorted_logits, sorted_indices = torch.sort(logits, descending=True, dim=-1)
-            cumulative_probs = torch.cumsum(
-                torch.softmax(sorted_logits, dim=-1), dim=-1
-            )
-
-            sorted_indices_to_remove = cumulative_probs > top_p
-            sorted_indices_to_remove[..., :1] = False
-
-            indices_to_remove = sorted_indices_to_remove.scatter(
-                dim=-1, index=sorted_indices, src=sorted_indices_to_remove
-            )
-            logits = logits.masked_fill(indices_to_remove, -float("Inf"))
-
-        probabilities = torch.softmax(logits, dim=-1)
-        sampled_tokens = torch.multinomial(probabilities, 1).squeeze(-1)
-
-        return sampled_tokens
-
     def _prefill_prompt_with_prefix_cache(self, prompt, prefix_cache_manager=None):
         encoded_prompt = self.tokenizer.encode(prompt)
         if not encoded_prompt:
@@ -1112,18 +1324,21 @@ class InferenceEngine:
         alpha_decay=0.996,
         stop_tokens=("\nUser:",),
     ):
-        batch_size = len(prompts)
+        total_batch_size = len(prompts)
+        batch_size = total_batch_size
         state = self.model.generate_zero_state(batch_size)
         encoded_prompts = [self.tokenizer.encode(p) for p in prompts]
         out = self.model.forward_batch(encoded_prompts, state).float()
         sampling_state = self._create_sampling_state(batch_size, out.device)
 
-        finished = [False] * batch_size
-        stop_states = [self._create_stop_state(stop_tokens) for _ in range(batch_size)]
-        generated_text = [""] * batch_size
+        active_indices = list(range(total_batch_size))
+        stop_states = [self._create_stop_state(stop_tokens) for _ in range(total_batch_size)]
+        generated_text = [""] * total_batch_size
         batch_graph = None
 
         for _ in range(max_length):
+            if not active_indices:
+                break
             new_tokens_tensor = self._sample_with_repetition(
                 out,
                 sampling_state,
@@ -1148,27 +1363,42 @@ class InferenceEngine:
             else:
                 out = self.model.forward_batch(new_tokens_tensor, state).float()
 
-            for i in range(batch_size):
-                tok = new_tokens[i]
-                if finished[i]:
-                    continue
+            surviving_local = []
+            surviving_indices = []
+            for local_idx, prompt_idx in enumerate(active_indices):
+                tok = new_tokens[local_idx]
 
-                content, should_stop = self._ingest_token_with_stop(stop_states[i], tok)
+                content, should_stop = self._ingest_token_with_stop(
+                    stop_states[prompt_idx], tok
+                )
                 if content:
-                    generated_text[i] += content
+                    generated_text[prompt_idx] += content
 
                 if should_stop:
-                    finished[i] = True
                     continue
 
-            if all(finished):
+                surviving_local.append(local_idx)
+                surviving_indices.append(prompt_idx)
+
+            if not surviving_indices:
                 break
+
+            if len(surviving_indices) != batch_size:
+                state = self._select_state_rows(state, surviving_local)
+                out = self._select_rows(out, surviving_local)
+                sampling_state = self._select_sampling_state_rows(
+                    sampling_state, surviving_local
+                )
+                batch_size = len(surviving_indices)
+                batch_graph = None
+
+            active_indices = surviving_indices
 
         del state
         gc.collect()
 
         decoded = []
-        for i in range(batch_size):
+        for i in range(total_batch_size):
             generated_text[i] += self._flush_stop_state(stop_states[i], final=True)
             decoded.append(generated_text[i])
         return decoded
@@ -1186,20 +1416,21 @@ class InferenceEngine:
         stop_tokens=("\nUser:",),
         chunk_size=32,
     ):
-        batch_size = len(prompts)
+        total_batch_size = len(prompts)
+        batch_size = total_batch_size
         state = self.model.generate_zero_state(batch_size)
         encoded_prompts = [self.tokenizer.encode(p) for p in prompts]
         out = self.model.forward_batch(encoded_prompts, state).float()
 
-        finished = [False] * batch_size
-        stop_states = [self._create_stop_state(stop_tokens) for _ in range(batch_size)]
-        chunk_token_counts = [0] * batch_size
-        text_buffers = [""] * batch_size
+        active_indices = list(range(total_batch_size))
+        stop_states = [self._create_stop_state(stop_tokens) for _ in range(total_batch_size)]
+        chunk_token_counts = [0] * total_batch_size
+        text_buffers = [""] * total_batch_size
         sampling_state = self._create_sampling_state(batch_size, out.device)
         batch_graph = None
 
         try:
-            while not all(finished) and max_length > 0:
+            while active_indices and max_length > 0:
                 new_tokens_tensor = self._sample_with_repetition(
                     out,
                     sampling_state,
@@ -1225,50 +1456,77 @@ class InferenceEngine:
                     out = self.model.forward_batch(new_tokens_tensor, state).float()
                 max_length -= 1
 
-                contents_to_send = [""] * batch_size
+                contents_to_send = {}
+                surviving_local = []
+                surviving_indices = []
 
-                for i in range(batch_size):
-                    if finished[i]:
-                        continue
+                for local_idx, prompt_idx in enumerate(active_indices):
+                    tok = new_tokens[local_idx]
 
-                    tok = new_tokens[i]
-
-                    content, should_stop = self._ingest_token_with_stop(stop_states[i], tok)
+                    content, should_stop = self._ingest_token_with_stop(
+                        stop_states[prompt_idx], tok
+                    )
                     if content:
-                        text_buffers[i] += content
+                        text_buffers[prompt_idx] += content
 
                     if should_stop:
-                        finished[i] = True
-                        flushed = self._flush_stop_state(stop_states[i], final=True)
+                        flushed = self._flush_stop_state(
+                            stop_states[prompt_idx], final=True
+                        )
                         if flushed:
-                            text_buffers[i] += flushed
-                        if text_buffers[i]:
-                            contents_to_send[i] += text_buffers[i]
-                            text_buffers[i] = ""
+                            text_buffers[prompt_idx] += flushed
+                        if text_buffers[prompt_idx]:
+                            contents_to_send[prompt_idx] = (
+                                contents_to_send.get(prompt_idx, "")
+                                + text_buffers[prompt_idx]
+                            )
+                            text_buffers[prompt_idx] = ""
                         continue
 
-                    chunk_token_counts[i] += 1
-                    if chunk_token_counts[i] >= chunk_size and text_buffers[i]:
-                        contents_to_send[i] += text_buffers[i]
-                        text_buffers[i] = ""
-                        chunk_token_counts[i] = 0
+                    surviving_local.append(local_idx)
+                    surviving_indices.append(prompt_idx)
+                    chunk_token_counts[prompt_idx] += 1
+                    if (
+                        chunk_token_counts[prompt_idx] >= chunk_size
+                        and text_buffers[prompt_idx]
+                    ):
+                        contents_to_send[prompt_idx] = (
+                            contents_to_send.get(prompt_idx, "")
+                            + text_buffers[prompt_idx]
+                        )
+                        text_buffers[prompt_idx] = ""
+                        chunk_token_counts[prompt_idx] = 0
 
-                if any(contents_to_send):
+                if contents_to_send:
                     chunk = {
                         "object": "chat.completion.chunk",
                         "choices": [
-                            {"index": i, "delta": {"content": contents_to_send[i]}}
-                            for i in range(batch_size)
-                            if contents_to_send[i]
+                            {"index": i, "delta": {"content": content}}
+                            for i, content in sorted(contents_to_send.items())
+                            if content
                         ],
                     }
                     if chunk["choices"]:
                         yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
 
+                if not surviving_indices:
+                    break
+
+                if len(surviving_indices) != batch_size:
+                    state = self._select_state_rows(state, surviving_local)
+                    out = self._select_rows(out, surviving_local)
+                    sampling_state = self._select_sampling_state_rows(
+                        sampling_state, surviving_local
+                    )
+                    batch_size = len(surviving_indices)
+                    batch_graph = None
+
+                active_indices = surviving_indices
+
                 await asyncio.sleep(0)
 
-            remaining_contents = [""] * batch_size
-            for i in range(batch_size):
+            remaining_contents = [""] * total_batch_size
+            for i in range(total_batch_size):
                 flushed = self._flush_stop_state(stop_states[i], final=True)
                 if flushed:
                     text_buffers[i] += flushed
@@ -1352,6 +1610,7 @@ class InferenceEngine:
         prefix_cache_manager=None,
         seed=None,
         grammar_constraint=None,
+        logit_bias=None,
     ):
         stop_state = self._create_stop_state(stop_tokens)
         generated_text = ""
@@ -1375,6 +1634,7 @@ class InferenceEngine:
                     top_k,
                     top_p,
                     grammar_constraints=grammar_constraint,
+                    logit_bias=logit_bias,
                 ).tolist()
 
                 tok = new_tokens[0]
@@ -1411,6 +1671,7 @@ class InferenceEngine:
         seed=None,
         grammar_constraint=None,
         top_logprobs=0,
+        logit_bias=None,
     ):
         stop_state = self._create_stop_state(stop_tokens)
         generated_text = ""
@@ -1434,6 +1695,7 @@ class InferenceEngine:
                     top_k,
                     top_p,
                     grammar_constraint,
+                    logit_bias=logit_bias,
                 )
                 new_tokens = self._sample_with_repetition(
                     out,
@@ -1445,6 +1707,7 @@ class InferenceEngine:
                     top_k,
                     top_p,
                     grammar_constraints=grammar_constraint,
+                    logit_bias=logit_bias,
                 ).tolist()
 
                 tok = new_tokens[0]
@@ -1485,6 +1748,7 @@ class InferenceEngine:
         prefix_cache_manager=None,
         seed=None,
         grammar_constraint=None,
+        logit_bias=None,
     ):
         finish_reason = "length"
 
@@ -1509,6 +1773,7 @@ class InferenceEngine:
                     top_k,
                     top_p,
                     grammar_constraints=grammar_constraint,
+                    logit_bias=logit_bias,
                 ).tolist()
 
                 tok = new_tokens[0]
@@ -1581,6 +1846,7 @@ class InferenceEngine:
         seed=None,
         grammar_constraint=None,
         top_logprobs=0,
+        logit_bias=None,
     ):
         finish_reason = "length"
 
@@ -1605,6 +1871,7 @@ class InferenceEngine:
                     top_k,
                     top_p,
                     grammar_constraint,
+                    logit_bias=logit_bias,
                 )
                 new_tokens = self._sample_with_repetition(
                     out,
@@ -1616,6 +1883,7 @@ class InferenceEngine:
                     top_k,
                     top_p,
                     grammar_constraints=grammar_constraint,
+                    logit_bias=logit_bias,
                 ).tolist()
 
                 tok = new_tokens[0]
@@ -1801,6 +2069,7 @@ class InferenceEngine:
         batch_size = batch_size
         pad_zero = pad_zero
         chunk_size = chunk_size
+        total_inputs = len(inputs)
 
         device = self.model.z["head.weight"].device
         alpha_presence_val = torch.tensor(
@@ -1820,13 +2089,14 @@ class InferenceEngine:
             decode_capacity,
             prefill_capacity,
         )
-        no_penalty_token_ids = set([33, 10, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58])
+        topk_rand_states = self._create_rand_states(decode_capacity)
+        paged_decode_graphs = {}
         input_queue = deque(inputs)
         prefill_tasks = []
         decode_tasks = []
-        stop_states = {}
-        chunk_token_counts = {}
-        text_buffers = {}
+        stop_states = [None] * total_inputs
+        chunk_token_counts = [0] * total_inputs
+        text_buffers = [""] * total_inputs
 
         def _register_prompt(prompt_id):
             stop_states[prompt_id] = self._create_stop_state(stop_tokens)
@@ -1863,7 +2133,7 @@ class InferenceEngine:
 
                 active_prefill_tasks, prefill_step = self._select_continuous_prefill_group(prefill_tasks)
                 if active_prefill_tasks:
-                    self._apply_continuous_prefill(active_prefill_tasks, state_manager.states, prefill_step)
+                    self._apply_continuous_prefill(active_prefill_tasks, state_manager, prefill_step)
 
                 self._promote_ready_prefill_tasks(
                     prefill_tasks,
@@ -1892,11 +2162,11 @@ class InferenceEngine:
                             text_buffers[prompt_id] += content
 
                         is_finished = should_stop or (
-                            len(task["generated_tokens"]) >= max_generate_tokens
+                            task["generated_count"] >= max_generate_tokens
                         )
 
                         if not is_finished:
-                            task["generated_tokens"].append(new_token)
+                            task["generated_count"] += 1
                             chunk_token_counts[prompt_id] += 1
 
                             if (
@@ -1923,15 +2193,15 @@ class InferenceEngine:
                                 )
                                 text_buffers[prompt_id] = ""
 
-                            del stop_states[prompt_id]
-                            del chunk_token_counts[prompt_id]
-                            del text_buffers[prompt_id]
+                            stop_states[prompt_id] = None
+                            chunk_token_counts[prompt_id] = 0
+                            text_buffers[prompt_id] = ""
 
                             state_manager.release_page(task["state_pos"])
                             accomplished_task_indices.append(task_idx)
                         else:
                             task["input_token"].append(new_token)
-                            www = 0.0 if new_token in no_penalty_token_ids else 1.0
+                            www = 0.0 if new_token in self._no_penalty_token_ids else 1.0
                             state_manager.occurrence[task["state_pos"], new_token] += www
                             state_manager.alpha_presence_vector[task["state_pos"], new_token] = (
                                 alpha_presence_val
@@ -1957,39 +2227,51 @@ class InferenceEngine:
                 if not decode_tasks and not prefill_tasks and not input_queue:
                     break
 
-                decode_ready_tasks = [task for task in decode_tasks if self._ready_for_decode(task)]
+                decode_ready_tasks, token_tensor, page_table, page_index = (
+                    self._prepare_continuous_decode_batch(decode_tasks, state_manager)
+                )
                 if not decode_ready_tasks:
                     continue
 
-                slot_indices = [task["state_pos"] for task in decode_ready_tasks]
-                token_tensor = torch.tensor(
-                    [[task["input_token"].pop(0)] for task in decode_ready_tasks],
-                    device=device,
-                    dtype=torch.long,
+                if self.enable_cuda_graphs and token_tensor.device.type == "cuda":
+                    batch_graph = self._get_or_create_paged_batch_cuda_graph(
+                        paged_decode_graphs,
+                        token_tensor.shape[0],
+                        token_tensor,
+                        state_manager.states,
+                        page_table,
+                        page_index,
+                    )
+                    batch_graph["graph"].replay()
+                    out = batch_graph["static_output"].float()
+                else:
+                    out = self.model.forward_batch_paged(
+                        token_tensor, state_manager.states, page_table
+                    )
+                out = self._apply_continuous_penalties(
+                    out,
+                    state_manager,
+                    page_index,
+                    alpha_presence,
+                    alpha_frequency,
+                    alpha_decay,
                 )
-                page_table = state_manager.page_table(decode_ready_tasks)
-                out = self.model.forward_batch_paged(token_tensor, state_manager.states, page_table)
-
-                decode_occurrence = state_manager.occurrence[slot_indices]
-                decode_presence = state_manager.alpha_presence_vector[slot_indices]
-
-                if alpha_presence != 0 or alpha_frequency != 0:
-                    mask = (decode_occurrence > 0).float()
-                    out -= mask * alpha_presence + decode_occurrence * alpha_frequency
-
-                decode_occurrence *= alpha_decay
-                out -= decode_presence + decode_occurrence * alpha_frequency
-                state_manager.occurrence[slot_indices] = decode_occurrence
 
                 if temperature != 1.0:
                     out /= temperature
 
-                new_tokens = self._sample_top_k_top_p(out, top_k, top_p).tolist()
+                new_tokens = self._sample_top_k_top_p(
+                    out,
+                    top_k,
+                    top_p,
+                    rand_states=topk_rand_states,
+                ).tolist()
 
                 for idx, task in enumerate(decode_ready_tasks):
                     task["new_token"] = new_tokens[idx]
 
         finally:
+            self._cleanup_paged_batch_cuda_graphs(paged_decode_graphs)
             del state_manager
             gc.collect()
             output_queue.put("EOF")
@@ -2012,6 +2294,7 @@ class InferenceEngine:
         max_generate_tokens = max_generate_tokens
         batch_size = batch_size
         pad_zero = pad_zero
+        total_inputs = len(inputs)
 
         device = self.model.z["head.weight"].device
         alpha_presence_val = torch.tensor(
@@ -2031,17 +2314,18 @@ class InferenceEngine:
             decode_capacity,
             prefill_capacity,
         )
-        no_penalty_token_ids = set([33, 10, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58])
+        topk_rand_states = self._create_rand_states(decode_capacity)
+        paged_decode_graphs = {}
         input_queue = deque(inputs)
         prefill_tasks = []
         decode_tasks = []
-        results = {}
-        stop_states = {}
-        result_parts = {}
+        results = [""] * total_inputs
+        stop_states = [None] * total_inputs
+        result_parts = [[] for _ in range(total_inputs)]
 
         def _register_prompt(prompt_id):
             stop_states[prompt_id] = self._create_stop_state(stop_tokens)
-            result_parts[prompt_id] = []
+            result_parts[prompt_id].clear()
 
         prompt_idx = 0
         prompt_idx = self._launch_prefill_tasks(
@@ -2072,7 +2356,7 @@ class InferenceEngine:
 
                 active_prefill_tasks, prefill_step = self._select_continuous_prefill_group(prefill_tasks)
                 if active_prefill_tasks:
-                    self._apply_continuous_prefill(active_prefill_tasks, state_manager.states, prefill_step)
+                    self._apply_continuous_prefill(active_prefill_tasks, state_manager, prefill_step)
 
                 self._promote_ready_prefill_tasks(
                     prefill_tasks,
@@ -2099,11 +2383,11 @@ class InferenceEngine:
                         if content:
                             result_parts[prompt_id].append(content)
                         is_finished = should_stop or (
-                            len(task["generated_tokens"]) >= max_generate_tokens
+                            task["generated_count"] >= max_generate_tokens
                         )
 
                         if not is_finished:
-                            task["generated_tokens"].append(new_token)
+                            task["generated_count"] += 1
 
                         if is_finished:
                             result_parts[prompt_id].append(
@@ -2112,14 +2396,14 @@ class InferenceEngine:
                                 )
                             )
                             results[prompt_id] = "".join(result_parts[prompt_id])
-                            del stop_states[prompt_id]
-                            del result_parts[prompt_id]
+                            stop_states[prompt_id] = None
+                            result_parts[prompt_id] = []
 
                             state_manager.release_page(task["state_pos"])
                             accomplished_task_indices.append(task_idx)
                         else:
                             task["input_token"].append(new_token)
-                            www = 0.0 if new_token in no_penalty_token_ids else 1.0
+                            www = 0.0 if new_token in self._no_penalty_token_ids else 1.0
                             state_manager.occurrence[task["state_pos"], new_token] += www
                             state_manager.alpha_presence_vector[task["state_pos"], new_token] = (
                                 alpha_presence_val
@@ -2131,43 +2415,55 @@ class InferenceEngine:
                 if not decode_tasks and not prefill_tasks and not input_queue:
                     break
 
-                decode_ready_tasks = [task for task in decode_tasks if self._ready_for_decode(task)]
+                decode_ready_tasks, token_tensor, page_table, page_index = (
+                    self._prepare_continuous_decode_batch(decode_tasks, state_manager)
+                )
                 if not decode_ready_tasks:
                     continue
 
-                slot_indices = [task["state_pos"] for task in decode_ready_tasks]
-                token_tensor = torch.tensor(
-                    [[task["input_token"].pop(0)] for task in decode_ready_tasks],
-                    device=device,
-                    dtype=torch.long,
+                if self.enable_cuda_graphs and token_tensor.device.type == "cuda":
+                    batch_graph = self._get_or_create_paged_batch_cuda_graph(
+                        paged_decode_graphs,
+                        token_tensor.shape[0],
+                        token_tensor,
+                        state_manager.states,
+                        page_table,
+                        page_index,
+                    )
+                    batch_graph["graph"].replay()
+                    out = batch_graph["static_output"].float()
+                else:
+                    out = self.model.forward_batch_paged(
+                        token_tensor, state_manager.states, page_table
+                    )
+                out = self._apply_continuous_penalties(
+                    out,
+                    state_manager,
+                    page_index,
+                    alpha_presence,
+                    alpha_frequency,
+                    alpha_decay,
                 )
-                page_table = state_manager.page_table(decode_ready_tasks)
-                out = self.model.forward_batch_paged(token_tensor, state_manager.states, page_table)
-
-                decode_occurrence = state_manager.occurrence[slot_indices]
-                decode_presence = state_manager.alpha_presence_vector[slot_indices]
-
-                if alpha_presence != 0 or alpha_frequency != 0:
-                    mask = (decode_occurrence > 0).float()
-                    out -= mask * alpha_presence + decode_occurrence * alpha_frequency
-
-                decode_occurrence *= alpha_decay
-                out -= decode_presence + decode_occurrence * alpha_frequency
-                state_manager.occurrence[slot_indices] = decode_occurrence
 
                 if temperature != 1.0:
                     out /= temperature
 
-                new_tokens = self._sample_top_k_top_p(out, top_k, top_p).tolist()
+                new_tokens = self._sample_top_k_top_p(
+                    out,
+                    top_k,
+                    top_p,
+                    rand_states=topk_rand_states,
+                ).tolist()
 
                 for idx, task in enumerate(decode_ready_tasks):
                     task["new_token"] = new_tokens[idx]
 
         finally:
+            self._cleanup_paged_batch_cuda_graphs(paged_decode_graphs)
             del state_manager
             gc.collect()
 
-        return [results.get(i, "") for i in range(len(inputs))]
+        return results
 
     async def continuous_batching_stream(
         self,
@@ -2185,11 +2481,9 @@ class InferenceEngine:
         chunk_size=32,
         prefix_cache_manager=None,
     ):
-        from queue import Queue
-
         output_queue = Queue()
 
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
 
         with self.model_lock:
             future = loop.run_in_executor(
@@ -2213,24 +2507,12 @@ class InferenceEngine:
 
         while True:
             try:
-                await asyncio.sleep(0.01)
-
-                while not output_queue.empty():
-                    data = output_queue.get_nowait()
-                    if data == "EOF":
-                        yield "data: [DONE]\n\n"
-                        await future
-                        return
-                    yield data
-
-                if future.done():
-                    while not output_queue.empty():
-                        data = output_queue.get_nowait()
-                        if data == "EOF":
-                            yield "data: [DONE]\n\n"
-                            return
-                        yield data
-                    break
+                data = await loop.run_in_executor(None, output_queue.get)
+                if data == "EOF":
+                    await future
+                    yield "data: [DONE]\n\n"
+                    return
+                yield data
             except Exception as exc:
                 print(f"Error in stream: {exc}")
                 break
@@ -2275,11 +2557,15 @@ class InferenceEngine:
         stop_tokens=("\nUser:",),
         chunk_size=32,
     ):
-        batch_size = len(prompts)
+        total_batch_size = len(prompts)
+        batch_size = total_batch_size
         state = None
         encoded_prompts = None
         out = None
-        finished = None
+        active_indices = None
+        stop_states = None
+        chunk_token_counts = None
+        text_buffers = None
         generated_tokens = None
         token_buffers = None
         new_tokens_tensor = None
@@ -2292,12 +2578,12 @@ class InferenceEngine:
                 encoded_prompts = [self.tokenizer.encode(p) for p in prompts]
                 out = self.model.forward_batch(encoded_prompts, state)
 
-                finished = [False] * batch_size
-                stop_states = [self._create_stop_state(stop_tokens) for _ in range(batch_size)]
-                chunk_token_counts = [0] * batch_size
-                text_buffers = [""] * batch_size
+                active_indices = list(range(total_batch_size))
+                stop_states = [self._create_stop_state(stop_tokens) for _ in range(total_batch_size)]
+                chunk_token_counts = [0] * total_batch_size
+                text_buffers = [""] * total_batch_size
 
-                while not all(finished) and max_length > 0:
+                while active_indices and max_length > 0:
                     new_tokens_tensor = self._sample_throughput_tokens(out, temperature)
                     new_tokens = new_tokens_tensor.tolist()
 
@@ -2320,49 +2606,58 @@ class InferenceEngine:
 
                     max_length -= 1
 
-                    contents_to_send = [""] * batch_size
+                    contents_to_send = {}
+                    surviving_local = []
+                    surviving_indices = []
 
-                    for i in range(batch_size):
-                        if finished[i]:
-                            continue
-
+                    for local_idx, prompt_idx in enumerate(active_indices):
                         tok = (
-                            new_tokens[i][0]
-                            if isinstance(new_tokens[i], list)
-                            else new_tokens[i]
+                            new_tokens[local_idx][0]
+                            if isinstance(new_tokens[local_idx], list)
+                            else new_tokens[local_idx]
                         )
 
                         content, should_stop = self._ingest_token_with_stop(
-                            stop_states[i], tok
+                            stop_states[prompt_idx], tok
                         )
                         if content:
-                            text_buffers[i] += content
+                            text_buffers[prompt_idx] += content
 
                         if should_stop:
-                            finished[i] = True
                             flushed = self._flush_stop_state(
-                                stop_states[i], final=True
+                                stop_states[prompt_idx], final=True
                             )
                             if flushed:
-                                text_buffers[i] += flushed
-                            if text_buffers[i]:
-                                contents_to_send[i] += text_buffers[i]
-                                text_buffers[i] = ""
+                                text_buffers[prompt_idx] += flushed
+                            if text_buffers[prompt_idx]:
+                                contents_to_send[prompt_idx] = (
+                                    contents_to_send.get(prompt_idx, "")
+                                    + text_buffers[prompt_idx]
+                                )
+                                text_buffers[prompt_idx] = ""
                             continue
 
-                        chunk_token_counts[i] += 1
-                        if chunk_token_counts[i] >= chunk_size and text_buffers[i]:
-                            contents_to_send[i] += text_buffers[i]
-                            text_buffers[i] = ""
-                            chunk_token_counts[i] = 0
+                        surviving_local.append(local_idx)
+                        surviving_indices.append(prompt_idx)
+                        chunk_token_counts[prompt_idx] += 1
+                        if (
+                            chunk_token_counts[prompt_idx] >= chunk_size
+                            and text_buffers[prompt_idx]
+                        ):
+                            contents_to_send[prompt_idx] = (
+                                contents_to_send.get(prompt_idx, "")
+                                + text_buffers[prompt_idx]
+                            )
+                            text_buffers[prompt_idx] = ""
+                            chunk_token_counts[prompt_idx] = 0
 
-                    if any(contents_to_send):
+                    if contents_to_send:
                         chunk = {
                             "object": "chat.completion.chunk",
                             "choices": [
-                                {"index": i, "delta": {"content": contents_to_send[i]}}
-                                for i in range(batch_size)
-                                if contents_to_send[i]
+                                {"index": i, "delta": {"content": content}}
+                                for i, content in sorted(contents_to_send.items())
+                                if content
                             ],
                         }
                         if chunk["choices"]:
@@ -2370,11 +2665,22 @@ class InferenceEngine:
                                 f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
                             )
 
+                    if not surviving_indices:
+                        break
+
+                    if len(surviving_indices) != batch_size:
+                        state = self._select_state_rows(state, surviving_local)
+                        out = self._select_rows(out, surviving_local)
+                        batch_size = len(surviving_indices)
+                        batch_graph = None
+
+                    active_indices = surviving_indices
+
                     new_tokens = None
                     await asyncio.sleep(0)
 
-                remaining_contents = [""] * batch_size
-                for i in range(batch_size):
+                remaining_contents = [""] * total_batch_size
+                for i in range(total_batch_size):
                     flushed = self._flush_stop_state(
                         stop_states[i], final=True
                     )
@@ -2403,8 +2709,14 @@ class InferenceEngine:
                 del state
             if encoded_prompts is not None:
                 del encoded_prompts
-            if finished is not None:
-                del finished
+            if active_indices is not None:
+                del active_indices
+            if stop_states is not None:
+                del stop_states
+            if chunk_token_counts is not None:
+                del chunk_token_counts
+            if text_buffers is not None:
+                del text_buffers
             if generated_tokens is not None:
                 del generated_tokens
             if token_buffers is not None:
@@ -2422,11 +2734,12 @@ class InferenceEngine:
         temperature=1.0,
         stop_tokens=("\nUser:",),
     ):
-        batch_size = len(prompts)
+        total_batch_size = len(prompts)
+        batch_size = total_batch_size
         state = None
         encoded_prompts = None
         out = None
-        finished = None
+        active_indices = None
         text_buffers = None
         stop_states = None
         new_tokens_tensor = None
@@ -2439,11 +2752,11 @@ class InferenceEngine:
                 encoded_prompts = [self.tokenizer.encode(p) for p in prompts]
                 out = self.model.forward_batch(encoded_prompts, state)
 
-                finished = [False] * batch_size
-                stop_states = [self._create_stop_state(stop_tokens) for _ in range(batch_size)]
-                text_buffers = [""] * batch_size
+                active_indices = list(range(total_batch_size))
+                stop_states = [self._create_stop_state(stop_tokens) for _ in range(total_batch_size)]
+                text_buffers = [""] * total_batch_size
 
-                while not all(finished) and max_length > 0:
+                while active_indices and max_length > 0:
                     new_tokens_tensor = self._sample_throughput_tokens(out, temperature)
                     new_tokens = new_tokens_tensor.tolist()
 
@@ -2466,25 +2779,38 @@ class InferenceEngine:
 
                     max_length -= 1
 
-                    for i in range(batch_size):
-                        if finished[i]:
-                            continue
-
+                    surviving_local = []
+                    surviving_indices = []
+                    for local_idx, prompt_idx in enumerate(active_indices):
                         tok = (
-                            new_tokens[i][0]
-                            if isinstance(new_tokens[i], list)
-                            else new_tokens[i]
+                            new_tokens[local_idx][0]
+                            if isinstance(new_tokens[local_idx], list)
+                            else new_tokens[local_idx]
                         )
                         content, should_stop = self._ingest_token_with_stop(
-                            stop_states[i], tok
+                            stop_states[prompt_idx], tok
                         )
                         if content:
-                            text_buffers[i] += content
+                            text_buffers[prompt_idx] += content
 
                         if should_stop:
-                            finished[i] = True
+                            continue
 
-                for i in range(batch_size):
+                        surviving_local.append(local_idx)
+                        surviving_indices.append(prompt_idx)
+
+                    if not surviving_indices:
+                        break
+
+                    if len(surviving_indices) != batch_size:
+                        state = self._select_state_rows(state, surviving_local)
+                        out = self._select_rows(out, surviving_local)
+                        batch_size = len(surviving_indices)
+                        batch_graph = None
+
+                    active_indices = surviving_indices
+
+                for i in range(total_batch_size):
                     text_buffers[i] += self._flush_stop_state(stop_states[i], final=True)
 
                 return text_buffers
@@ -2497,8 +2823,8 @@ class InferenceEngine:
                 del state
             if encoded_prompts is not None:
                 del encoded_prompts
-            if finished is not None:
-                del finished
+            if active_indices is not None:
+                del active_indices
             if text_buffers is not None:
                 del text_buffers
             if stop_states is not None:

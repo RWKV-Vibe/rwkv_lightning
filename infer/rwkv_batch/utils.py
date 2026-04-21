@@ -5,7 +5,7 @@
 ########################################################################################################
 
 import torch
-from torch.nn import functional as F
+import random
 
 MyModule = torch.jit.ScriptModule
 MyFunction = torch.jit.script_method
@@ -15,30 +15,34 @@ MyStatic = torch.jit.script
 # MyFunction = __nop
 # MyStatic = __nop
 
-@MyStatic
 def sample_logits(logits, temperature:float=1.0, top_p:float=1.0, top_k:int=0):
-    probs = F.softmax(logits.float(), dim=-1)
-    sorted_probs, sorted_ids = torch.sort(probs, descending=True)
-    
-    if top_k > 0:
-        probs[sorted_ids[top_k:]] = 0
+    from infer.rwkv_batch.sampler import sample
 
-    if top_p < 1:
-        cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
-        cutoff_index = torch.searchsorted(cumulative_probs, top_p)
-        cutoff = sorted_probs[cutoff_index]
-        probs[probs < cutoff] = 0
+    logits_reshaped = logits.unsqueeze(0).float()
+    contiguous = getattr(logits_reshaped, "contiguous", None)
+    if callable(contiguous):
+        logits_reshaped = contiguous()
+    if temperature <= 0:
+        temperature = 1.0
+        top_k = 1
+        top_p = 1.0
 
-        if top_p > 0:
-            idx = torch.where(probs == cutoff)[0]
-            if len(idx) > 0:
-                probs[idx] = cutoff + (top_p - torch.sum(probs).item()) / len(idx)
-                # assert abs(torch.sum(probs).item() - top_p) < 1e-6
-    
-    if temperature != 1.0:
-        probs = probs ** (1.0 / temperature)
-
-    return torch.multinomial(probs, num_samples=1).item()
+    rand_states = sample.setup_rand(random.randint(0, 2**63 - 1), 1)
+    sampled = sample.batch_sampling_temperature_topk_topp(
+        logits_reshaped,
+        rand_states,
+        temperature,
+        top_k,
+        top_p,
+    )
+    if hasattr(sampled, "view"):
+        return sampled.view(-1)[0].item()
+    if hasattr(sampled, "tolist"):
+        values = sampled.tolist()
+        return values[0] if isinstance(values, (list, tuple)) else values
+    if hasattr(sampled, "item"):
+        return sampled.item()
+    return sampled
 
 @torch.no_grad() # !!! will modify logits inplace !!!
 @MyStatic

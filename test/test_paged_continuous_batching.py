@@ -13,7 +13,8 @@ sys.path.insert(0, str(REPO_ROOT))
 sampler_stub = ModuleType("infer.rwkv_batch.sampler")
 sampler_stub.sample = SimpleNamespace(
     setup_rand=lambda seed, batch_size: None,
-    batch_sampling_repetition_temperature_topk_topp=lambda *args, **kwargs: None,
+    batch_sampling_repetition_temperature_topk_topp=lambda *args, **kwargs: torch.tensor([0], dtype=torch.long),
+    batch_sampling_temperature_topk_topp=lambda *args, **kwargs: torch.tensor([0], dtype=torch.long),
 )
 sys.modules.setdefault("infer.rwkv_batch.sampler", sampler_stub)
 
@@ -72,7 +73,7 @@ def main():
         torch.tensor([0], dtype=torch.long),
     ])
 
-    engine._sample_top_k_top_p = lambda logits, top_k, top_p, temperature=1.0: next(samples)
+    engine._sample_top_k_top_p = lambda *args, **kwargs: next(samples)
 
     results = engine._continuous_batching_sync(
         inputs=["prompt-a", "prompt-b", "prompt-c"],
