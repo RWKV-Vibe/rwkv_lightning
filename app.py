@@ -8,7 +8,6 @@ from infer.inference import InferenceEngine
 from model_load.model_loader import load_model_and_tokenizer
 from state_manager.state_pool import shutdown_state_manager
 
-
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model-path", type=str, required=True, help="RWKV model path")
