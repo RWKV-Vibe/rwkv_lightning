@@ -139,13 +139,6 @@ times = np.percentile(times, SHOW_SPEED_PERCENTILE)
 all_times = np.percentile(all_times, SHOW_SPEED_PERCENTILE)
 print(f'\n\nToken/s = {round(1/times,2)} (forward), {round(1/all_times,2)} (full) || Bandwidth = {round(active_GB/times,2)} GB/s || {round(time.perf_counter()-t000,3)}s')
 
-# exit(0)
-
-# #######################################################################################################
-
-# xprint("Decode (CUDAGraph)")
-
-
 # prompt = "User: simulate SpaceX mars landing using python\n\nAssistant: <think"
 # LENGTH_PER_TRIAL = 256
 # TEMPERATURE = 1.0
