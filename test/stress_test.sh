@@ -11,7 +11,7 @@ while true; do
           "English: That night, a bolt of lightning splits the same chestnut tree under which Rochester and Jane had been sitting that evening.\n\nChinese:"
         ],
         "max_tokens": 1024,
-        "stop_tokens": [0, 261, 24281],
+        "stop_tokens": ["\nUser:"],
         "temperature": 0.8,
         "top_k": 50,
         "top_p": 0.6,

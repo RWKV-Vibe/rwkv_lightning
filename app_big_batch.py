@@ -1,10 +1,14 @@
 import argparse
+import asyncio
 import atexit
 import gc
 import json
 import os
+import queue
 import signal
 import sys
+import threading
+from concurrent.futures import ThreadPoolExecutor
 
 import torch
 from pydantic import BaseModel, Field
@@ -46,7 +50,7 @@ class BigBatchEngine:
             except Exception:
                 pass
 
-    async def batch_stream(
+    def batch_stream_sync(
         self,
         prompts: list[str],
         max_length: int,
@@ -257,6 +261,52 @@ class BigBatchEngine:
             self.cleanup()
 
 
+class RequestQueueManager:
+    def __init__(self, max_workers: int = 1):
+        self.executor = ThreadPoolExecutor(max_workers=max_workers)
+        self._lock = threading.Lock()
+        self._next_ticket = 0
+        self._current_ticket = 0
+        self._skipped_tickets = set()
+
+    def acquire_ticket(self) -> int:
+        with self._lock:
+            ticket = self._next_ticket
+            self._next_ticket += 1
+            return ticket
+
+    def get_status(self, ticket: int) -> dict:
+        with self._lock:
+            ahead = max(ticket - self._current_ticket, 0)
+            waiting = max(self._next_ticket - self._current_ticket - 1, 0)
+            return {
+                "ticket": ticket,
+                "ahead": ahead,
+                "waiting": waiting,
+                "current_ticket": self._current_ticket,
+                "status": "processing" if ahead == 0 else "queued",
+            }
+
+    def is_turn(self, ticket: int) -> bool:
+        with self._lock:
+            return ticket == self._current_ticket
+
+    def finish(self, ticket: int):
+        with self._lock:
+            if ticket == self._current_ticket:
+                self._current_ticket += 1
+                while self._current_ticket in self._skipped_tickets:
+                    self._skipped_tickets.remove(self._current_ticket)
+                    self._current_ticket += 1
+                return
+
+            if ticket > self._current_ticket:
+                self._skipped_tickets.add(ticket)
+
+    def shutdown(self):
+        self.executor.shutdown(wait=False, cancel_futures=False)
+
+
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model-path", type=str, required=True, help="RWKV model path")
@@ -265,7 +315,12 @@ def parse_args():
     return parser.parse_args()
 
 
-def create_app(engine: BigBatchEngine, model_name: str, password: str | None):
+def create_app(
+    engine: BigBatchEngine,
+    model_name: str,
+    password: str | None,
+    queue_manager: RequestQueueManager,
+):
     app = Robyn(__file__)
 
     def json_response(status_code: int, payload: dict):
@@ -274,6 +329,9 @@ def create_app(engine: BigBatchEngine, model_name: str, password: str | None):
             description=json.dumps(payload, ensure_ascii=False),
             headers={"Content-Type": "application/json"},
         )
+
+    def sse_payload(payload: dict):
+        return "data: " + json.dumps(payload, ensure_ascii=False) + "\n\n"
 
     @app.after_request()
     def after_request(response):
@@ -313,24 +371,88 @@ def create_app(engine: BigBatchEngine, model_name: str, password: str | None):
         if not req.contents:
             return json_response(400, {"error": "contents is empty"})
 
+        ticket = queue_manager.acquire_ticket()
+
         if req.stream:
+            async def queued_stream():
+                try:
+                    while not queue_manager.is_turn(ticket):
+                        status = queue_manager.get_status(ticket)
+                        yield sse_payload(
+                            {
+                                "object": "queue.status",
+                                "status": status["status"],
+                                "ticket": status["ticket"],
+                                "queue_position": status["ahead"] + 1,
+                                "requests_ahead": status["ahead"],
+                                "waiting_requests": status["waiting"],
+                            }
+                        )
+                        await asyncio.sleep(1)
+
+                    status = queue_manager.get_status(ticket)
+                    yield sse_payload(
+                        {
+                            "object": "queue.status",
+                            "status": "processing",
+                            "ticket": ticket,
+                            "queue_position": 1,
+                            "requests_ahead": 0,
+                            "waiting_requests": status["waiting"],
+                        }
+                    )
+
+                    chunk_queue = queue.Queue()
+
+                    def produce_stream():
+                        try:
+                            for chunk in engine.batch_stream_sync(
+                                prompts=req.contents,
+                                max_length=max(1, req.max_tokens),
+                                temperature=max(req.temperature, 1e-5),
+                                stop_tokens=tuple(req.stop_tokens or [0, 261, 24281]),
+                                chunk_size=max(1, req.chunk_size),
+                            ):
+                                chunk_queue.put(("chunk", chunk))
+                        except Exception as exc:
+                            chunk_queue.put(("error", str(exc)))
+                        finally:
+                            chunk_queue.put(("done", None))
+
+                    queue_manager.executor.submit(produce_stream)
+
+                    while True:
+                        kind, payload = await asyncio.to_thread(chunk_queue.get)
+                        if kind == "chunk":
+                            yield payload
+                            continue
+                        if kind == "error":
+                            yield sse_payload({"object": "error", "message": payload})
+                        break
+                finally:
+                    queue_manager.finish(ticket)
+
             return StreamingResponse(
-                engine.batch_stream(
-                    prompts=req.contents,
-                    max_length=max(1, req.max_tokens),
-                    temperature=max(req.temperature, 1e-5),
-                    stop_tokens=tuple(req.stop_tokens or [0, 261, 24281]),
-                    chunk_size=max(1, req.chunk_size),
-                ),
+                queued_stream(),
                 media_type="text/event-stream",
             )
 
-        results = engine.batch_generate(
-            prompts=req.contents,
-            max_length=max(1, req.max_tokens),
-            temperature=max(req.temperature, 1e-5),
-            stop_tokens=tuple(req.stop_tokens or [0, 261, 24281]),
-        )
+        try:
+            while not queue_manager.is_turn(ticket):
+                await asyncio.sleep(1)
+
+            loop = asyncio.get_running_loop()
+            results = await loop.run_in_executor(
+                queue_manager.executor,
+                engine.batch_generate,
+                req.contents,
+                max(1, req.max_tokens),
+                max(req.temperature, 1e-5),
+                tuple(req.stop_tokens or [0, 261, 24281]),
+            )
+        finally:
+            queue_manager.finish(ticket)
+
         return json_response(
             200,
             {
@@ -354,15 +476,18 @@ def main():
     cli_args = parse_args()
     model, tokenizer, args, _ = load_model_and_tokenizer(cli_args.model_path)
     engine = BigBatchEngine(model=model, tokenizer=tokenizer)
+    queue_manager = RequestQueueManager(max_workers=1)
     model_name = os.path.basename(f"{args.MODEL_NAME}")
-    app = create_app(engine, model_name, cli_args.password)
+    app = create_app(engine, model_name, cli_args.password, queue_manager)
 
     def cleanup_handler(signum=None, frame=None):
+        queue_manager.shutdown()
         engine.cleanup()
         sys.exit(0)
 
     signal.signal(signal.SIGINT, cleanup_handler)
     signal.signal(signal.SIGTERM, cleanup_handler)
+    atexit.register(queue_manager.shutdown)
     atexit.register(engine.cleanup)
     app.start(host="0.0.0.0", port=cli_args.port)
 
