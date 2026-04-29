@@ -440,6 +440,8 @@ class InferenceEngine:
 
         tokens = encoded_prompts[0]
         out = self.model.forward(tokens, state).float()
+        sample_rand_states = sample.setup_rand(random.randint(0, 2**63 - 1), 1)
+        penalties = torch.zeros(1, 65536, device=out.device)
 
         stop_state = self._create_stop_state(stop_tokens)
         generated_text = ""
@@ -447,8 +449,6 @@ class InferenceEngine:
             if out.dim() == 1:
                 out = out.unsqueeze(0)
 
-            sample_rand_states = sample.setup_rand(random.randint(0, 2**63 - 1), 1)
-            penalties = torch.zeros(1, 65536).to(out.device)
             new_tokens = sample.batch_sampling_repetition_temperature_topk_topp(
                 out,
                 penalties,
@@ -499,12 +499,12 @@ class InferenceEngine:
             _, state, out, _, _ = self._prefill_prompt_with_prefix_cache(
                 prompt, prefix_cache_manager=prefix_cache_manager
             )
+            sample_rand_states = sample.setup_rand(random.randint(0, 2**63 - 1), 1)
+            penalties = torch.zeros(1, 65536, device=out.device)
 
             while max_length > 0:
                 max_length -= 1
                 logits_reshaped = out.unsqueeze(0) if out.dim() == 1 else out
-                sample_rand_states = sample.setup_rand(random.randint(0, 2**63 - 1), 1)
-                penalties = torch.zeros(1, 65536).to(logits_reshaped.device)
                 new_tokens = sample.batch_sampling_repetition_temperature_topk_topp(
                     logits_reshaped,
                     penalties,
@@ -559,12 +559,12 @@ class InferenceEngine:
             stop_state = self._create_stop_state(stop_tokens)
             buffered_tokens = 0
             text_buffer = ""
+            sample_rand_states = sample.setup_rand(random.randint(0, 2**63 - 1), 1)
+            penalties = torch.zeros(1, 65536, device=out.device)
 
             while max_length > 0:
                 max_length -= 1
                 logits_reshaped = out.unsqueeze(0) if out.dim() == 1 else out
-                sample_rand_states = sample.setup_rand(random.randint(0, 2**63 - 1), 1)
-                penalties = torch.zeros(1, 65536).to(logits_reshaped.device)
                 new_tokens = sample.batch_sampling_repetition_temperature_topk_topp(
                     logits_reshaped,
                     penalties,
@@ -653,6 +653,8 @@ class InferenceEngine:
         try:
             tokens = encoded_prompts[0]
             out = self.model.forward(tokens, state).float()
+            sample_rand_states = sample.setup_rand(random.randint(0, 2**63 - 1), 1)
+            penalties = torch.zeros(1, 65536, device=out.device)
 
             stop_state = self._create_stop_state(stop_tokens)
             buffered_tokens = 0
@@ -663,8 +665,6 @@ class InferenceEngine:
                 if out.dim() == 1:
                     out = out.unsqueeze(0)
 
-                sample_rand_states = sample.setup_rand(random.randint(0, 2**63 - 1), 1)
-                penalties = torch.zeros(1, 65536).to(out.device)
                 new_tokens = sample.batch_sampling_repetition_temperature_topk_topp(
                     out,
                     penalties,

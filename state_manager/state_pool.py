@@ -395,6 +395,20 @@ class StateCacheManager:
 
         return None
 
+    def has_state(self, session_id: str) -> bool:
+        if session_id is None:
+            return False
+
+        with self.cache_lock:
+            if session_id in self.l1_cache or session_id in self.l2_cache:
+                return True
+
+        with self.db_lock:
+            self.db_cursor.execute(
+                "SELECT 1 FROM sessions WHERE session_id = ? LIMIT 1", (session_id,)
+            )
+            return self.db_cursor.fetchone() is not None
+
     def put_prefix_state(
         self,
         prefix_tokens: List[int] | Tuple[int, ...],
