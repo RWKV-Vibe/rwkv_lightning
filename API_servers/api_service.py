@@ -134,6 +134,7 @@ def create_app(engine, password=None):
     @app.options("/state/chat/completions")
     @app.options("/multi_state/chat/completions")
     @app.options("/big_batch/completions")
+    @app.options("/openai/v1/models")
     @app.options("/openai/v1/chat/completions")
     async def handle_options():
         return Response(

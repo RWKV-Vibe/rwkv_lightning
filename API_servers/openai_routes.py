@@ -303,6 +303,25 @@ async def _stream_openai_chunks(
 
 
 def register_openai_routes(app, engine, password, chat_request_model):
+    @app.get("/openai/v1/models")
+    async def openai_list_models(request):
+        auth_error = _check_openai_auth(request, {}, password)
+        if auth_error is not None:
+            return auth_error
+
+        model_name = os.path.basename(f"{engine.args.MODEL_NAME}")
+        response = {
+            "object": "list",
+            "data": [
+                {
+                    "id": model_name,
+                    "object": "model",
+                    "owned_by": "rwkv_lightning",
+                }
+            ],
+        }
+        return _json_response(200, response)
+
     @app.post("/openai/v1/chat/completions")
     async def openai_chat_completions(request):
         try:
