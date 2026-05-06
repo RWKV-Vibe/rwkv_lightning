@@ -3,10 +3,10 @@ import time
 import sys
 import os
 
-current_path = os.path.dirname(__file__)
-sys.path.insert(0, current_path)
+project_root = os.path.dirname(os.path.dirname(__file__)) 
+sys.path.insert(0, project_root)
 
-from rwkv_mm_op_triton import rwkv_mm_sparsity
+from infer.rwkv_batch.rwkv_mm_op_triton import rwkv_mm_sparsity
 
 
 def test_performance():

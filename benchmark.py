@@ -29,7 +29,7 @@ args.head_size = 64
 # args.MODEL_NAME = "/mnt/e/RWKV-Runner/models/rwkv7-g1a-0.4b-20250905-ctx4096"
 # args.MODEL_NAME = "/mnt/e/RWKV-Runner/models/rwkv7-g1-1.5b-20250429-ctx4096"
 # args.MODEL_NAME = "/mnt/e/RWKV-Runner/models/rwkv7-g1-2.9b-20250519-ctx4096"
-args.MODEL_NAME = "/mnt/pc411_data/rwkv_translate/rwkv7-g1d-2.9b-20260131-ctx8192"
+args.MODEL_NAME = "/mnt/sda1/rwkv_weights/rwkv7-g1e-13.3b-20260309-ctx8192"
 
 print(f'\nUsing CUDA fp16. Loading {args.MODEL_NAME} ...\n')
 
