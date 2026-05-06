@@ -4,7 +4,7 @@ from threading import Lock
 from typing import Optional
 
 from pydantic import BaseModel
-from robyn import Robyn, Response, StreamingResponse
+from robyn import Robyn, Response, StreamingResponse, Headers
 
 from API_servers.openai_routes import register_openai_routes
 from state_manager.state_pool import get_state_manager, remove_session_from_any_level
@@ -35,6 +35,11 @@ class ChatRequest(BaseModel):
     dialogue_idx: Optional[int] = 0
     use_prefix_cache: bool = True
 
+cors_headers = Headers({
+"Access-Control-Allow-Origin": "*",
+"Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
+"Access-Control-Allow-Headers": "Content-Type, Authorization",
+})
 
 class TranslateRequest(BaseModel):
     source_lang: str = "auto"
@@ -198,6 +203,7 @@ def create_app(engine, password=None):
                     chunk_size=req.chunk_size,
                 ),
                 media_type="text/event-stream",
+                headers=cors_headers,
             )
 
         results = engine.batch_generate(
@@ -274,6 +280,7 @@ def create_app(engine, password=None):
                         chunk_size=req.chunk_size,
                     ),
                     media_type="text/event-stream",
+                headers=cors_headers,
                 )
 
             results = engine.continuous_batching(
@@ -422,6 +429,7 @@ def create_app(engine, password=None):
                     chunk_size=req.chunk_size,
                 ),
                 media_type="text/event-stream",
+                headers=cors_headers,
             )
         results = engine.batch_generate(
             prompts=prompts,
@@ -525,6 +533,7 @@ def create_app(engine, password=None):
                     state_manager=state_manager,
                 ),
                 media_type="text/event-stream",
+                headers=cors_headers,
             )
 
         results = engine.batch_generate_state(
@@ -679,6 +688,7 @@ def create_app(engine, password=None):
             return StreamingResponse(
                 stream_with_dialogue_idx(),
                 media_type="text/event-stream",
+                headers=cors_headers,
             )
 
         results = engine.batch_generate_state(
@@ -909,6 +919,7 @@ def create_app(engine, password=None):
         return StreamingResponse(
             stream_big_batch(),
             media_type="text/event-stream",
+            headers=cors_headers,
         )
 
     register_openai_routes(
