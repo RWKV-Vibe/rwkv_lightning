@@ -20,6 +20,11 @@ pip install robyn pydantic ninja numpy
 
 ## Usage
 ```bash
+export EMB_DEVICE=gpu # Offload embedding to GPU
+python app.py --model-path <your model path> --port <your port number> --password rwkv7_7.2b
+```
+```bash
+export EMB_DEVICE=cpu # Offload embedding to CPU to save GPU memory
 python app.py --model-path <your model path> --port <your port number> --password rwkv7_7.2b
 ```
 - if no password, you can do not add ```--password``` flag

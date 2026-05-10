@@ -2,7 +2,7 @@ import re
 import types
 import torch
 
-from infer.rwkv_batch.rwkv7 import RWKV_x070
+from infer.rwkv_batch.rwkv7_fast_v3 import RWKV_x070
 from infer.rwkv_batch.utils import TRIE_TOKENIZER
 
 
