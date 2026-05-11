@@ -19,6 +19,7 @@ HEAD_SIZE = 64
 DTYPE = torch.float16
 THIS_DIR = Path(__file__).resolve().parent
 CUDA_DIR = THIS_DIR / "cuda"
+HIP_DIR = THIS_DIR / "hip"
 
 CMIX_B1T1_SPARSE = "b1t1_sparse"
 CMIX_ROWS2_SPARSE = "rows2_sparse"
@@ -92,23 +93,24 @@ def load_extensions_rocm() -> None:
         return
 
     fast_cuda_flags = [
-        "-O3",
-        "--use_fast_math",
-        "--extra-device-vectorization",
-    ] + ([] if os.name == "nt" else ["-Xptxas", "-O3"])
+        '-fopenmp', 
+        '-ffast-math', 
+        '-O3', 
+        '-munsafe-fp-atomics',
+    ]
     state_cuda_flags = [
-        "-res-usage",
-        "--use_fast_math",
-        "-O3",
-        "--extra-device-vectorization",
+        '-fopenmp', 
+        '-ffast-math', 
+        '-O3', 
+        '-munsafe-fp-atomics',
         f"-D_N_={HEAD_SIZE}",
-    ] + ([] if os.name == "nt" else ["-Xptxas", "-O3"])
+    ]
 
     load(
         name="rwkv7_fast_ops_fp16",
         sources=[
-            str(CUDA_DIR / "rwkv7_fast_ops_fp16.cpp"),
-            str(CUDA_DIR / "rwkv7_fast_ops_fp16.cu"),
+            str(HIP_DIR / "rwkv7_fast_ops_fp16_op.hip"),
+            str(HIP_DIR / "rwkv7_fast_ops_fp16.hip"),
         ],
         is_python_module=False,
         verbose=False,
@@ -118,8 +120,8 @@ def load_extensions_rocm() -> None:
     load(
         name="rwkv7_state_fwd_fp16",
         sources=[
-            str(CUDA_DIR / "rwkv7_state_fwd_fp16.cpp"),
-            str(CUDA_DIR / "rwkv7_state_fwd_fp16.cu"),
+            str(HIP_DIR / "rwkv7_state_fwd_fp16_op.hip"),
+            str(HIP_DIR / "rwkv7_state_fwd_fp16.hip"),
         ],
         is_python_module=False,
         verbose=False,
