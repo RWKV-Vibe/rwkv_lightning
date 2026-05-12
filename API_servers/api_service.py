@@ -1,6 +1,6 @@
 import json
 import os
-from threading import Lock
+from threading import Event, Lock
 from typing import Optional
 
 from pydantic import BaseModel
@@ -75,6 +75,19 @@ def create_app(engine, password=None):
     app = Robyn(__file__)
     dialogue_idx_lock = Lock()
     dialogue_idx_counters: dict[str, int] = {}
+    big_batch_request_lock = Lock()
+    big_batch_status_lock = Lock()
+    big_batch_cancel_event = Event()
+    big_batch_generating = False
+
+    def _set_big_batch_generating(value: bool):
+        nonlocal big_batch_generating
+        with big_batch_status_lock:
+            big_batch_generating = value
+
+    def _is_big_batch_generating() -> bool:
+        with big_batch_status_lock:
+            return big_batch_generating
 
     def _json_response(status_code: int, payload: dict):
         return Response(
@@ -139,6 +152,8 @@ def create_app(engine, password=None):
     @app.options("/state/chat/completions")
     @app.options("/multi_state/chat/completions")
     @app.options("/big_batch/completions")
+    @app.options("/big_batch/completions-status")
+    @app.options("/big_batch/clean")
     @app.options("/openai/v1/models")
     @app.options("/openai/v1/chat/completions")
     async def handle_options():
@@ -902,6 +917,15 @@ def create_app(engine, password=None):
 
         prompts = req.contents
 
+        if not big_batch_request_lock.acquire(blocking=False):
+            return _json_response(
+                409,
+                {"error": "Another big_batch request is already running"},
+            )
+
+        _set_big_batch_generating(True)
+        big_batch_cancel_event.clear()
+
         async def stream_big_batch():
             stream = engine.big_batch_stream(
                 prompts=prompts,
@@ -909,17 +933,58 @@ def create_app(engine, password=None):
                 temperature=req.temperature,
                 stop_tokens=req.stop_tokens,
                 chunk_size=req.chunk_size,
+                cancel_event=big_batch_cancel_event,
             )
             try:
                 async for chunk in stream:
                     yield chunk
             finally:
-                await stream.aclose()
+                try:
+                    await stream.aclose()
+                finally:
+                    _set_big_batch_generating(False)
+                    big_batch_cancel_event.clear()
+                    big_batch_request_lock.release()
 
         return StreamingResponse(
             stream_big_batch(),
             media_type="text/event-stream",
             headers=cors_headers,
+        )
+
+    @app.get("/big_batch/completions-status")
+    async def big_batch_completions_status():
+        return _json_response(
+            200,
+            {"generating": _is_big_batch_generating()},
+        )
+
+    @app.post("/big_batch/clean")
+    async def big_batch_clean(request):
+        body = json.loads(request.body) if request.body else {}
+        req = ChatRequest(**body)
+
+        if password and req.password != password:
+            return Response(
+                status_code=401,
+                description=json.dumps(
+                    {"error": "Unauthorized: invalid or missing password"}
+                ),
+                headers={"Content-Type": "application/json"},
+            )
+
+        was_generating = _is_big_batch_generating()
+        if was_generating:
+            big_batch_cancel_event.set()
+            return _json_response(
+                200,
+                {"generating": True, "cleaned": True},
+            )
+
+        engine._cleanup_cuda_memory()
+        return _json_response(
+            200,
+            {"generating": False, "cleaned": True},
         )
 
     register_openai_routes(

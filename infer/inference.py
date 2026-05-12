@@ -1306,6 +1306,7 @@ class InferenceEngine:
         temperature=1.0,
         stop_tokens=("\nUser:",),
         chunk_size=32,
+        cancel_event=None,
     ):
         batch_size = len(prompts)
         state = None
@@ -1332,6 +1333,9 @@ class InferenceEngine:
                 cleanup_interval = 100
 
                 while not all(finished) and max_length > 0:
+                    if cancel_event is not None and cancel_event.is_set():
+                        break
+
                     new_tokens_tensor = sampler_gumbel_batch(
                         logits=out, temp=temperature
                     )
