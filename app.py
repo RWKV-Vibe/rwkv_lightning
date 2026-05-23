@@ -14,12 +14,40 @@ def parse_args():
     parser.add_argument("--model-path", type=str, required=True, help="RWKV model path")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--password", type=str, default=None, help="API password for authentication")
+    parser.add_argument(
+        "--wkv",
+        choices=("fp16", "fp32", "fp32io16"),
+        default="fp16",
+        help="WKV state precision. fp32 is an alias for fp32io16.",
+    )
+    parser.add_argument(
+        "--emb",
+        choices=("cpu", "gpu"),
+        default="cpu",
+        help="Keep preprocessed embedding on CPU or GPU.",
+    )
+    parser.add_argument(
+        "--pp-devices",
+        default="",
+        help="Comma-separated pipeline-parallel CUDA devices, e.g. 0,1. Empty disables PP.",
+    )
+    parser.add_argument(
+        "--no-cuda-graph",
+        action="store_true",
+        help="Disable adapter decode CUDA Graph.",
+    )
     return parser.parse_args()
 
 
 def main():
     args_cli = parse_args()
-    model, tokenizer, args, rocm_flag = load_model_and_tokenizer(args_cli.model_path)
+    model, tokenizer, args, rocm_flag = load_model_and_tokenizer(
+        args_cli.model_path,
+        wkv_mode=args_cli.wkv,
+        emb_device=args_cli.emb,
+        pp_devices=args_cli.pp_devices,
+        use_cuda_graph=not args_cli.no_cuda_graph,
+    )
     engine = InferenceEngine(model=model, tokenizer=tokenizer, args=args, rocm_flag=rocm_flag)
     app = create_app(engine, password=args_cli.password)
 

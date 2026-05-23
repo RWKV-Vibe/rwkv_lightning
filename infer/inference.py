@@ -92,6 +92,10 @@ class InferenceEngine:
         return decoded
 
     def _init_cuda_graph_state(self, token, state, out):
+        if isinstance(state[0], list):
+            raise RuntimeError(
+                "PP state uses nested tensors; use rwkv7_v3a adapter decode graph instead."
+            )
         x_emb = self.model.z["emb.weight"][token]
 
         static_input = torch.empty_like(x_emb, device="cuda")
@@ -114,6 +118,19 @@ class InferenceEngine:
         static_output.copy_(out)
 
         return static_input, static_state, static_output, g
+
+    @staticmethod
+    def _state_pos_for_log(state):
+        elapsed = state[2]
+        if isinstance(elapsed, list):
+            return [x.detach().cpu().tolist() for x in elapsed]
+        return elapsed
+
+    def _prepare_model_state(self, state):
+        prepare = getattr(self.model, "prepare_state", None)
+        if prepare is None:
+            return state
+        return prepare(state)
 
     def _sample_next_token(
         self,
@@ -187,6 +204,61 @@ class InferenceEngine:
 
         return sampled_tokens
 
+    def _sample_flashinfer_or_torch(self, logits, temperature, top_k, top_p):
+        if temperature <= 0 or top_p <= 0.0 or top_k == 1:
+            return torch.argmax(logits, dim=-1)
+
+        sample_logits = logits
+        if temperature != 1.0:
+            sample_logits = logits / float(temperature)
+        effective_top_k = (
+            min(int(top_k), sample_logits.size(-1))
+            if top_k and top_k > 0
+            else sample_logits.size(-1)
+        )
+
+        if self.rocm_flag:
+            return self._torch_top_k_top_p(sample_logits, effective_top_k, top_p)
+
+        try:
+            import flashinfer  # type: ignore
+
+            return flashinfer.sampling.top_k_top_p_sampling_from_logits(
+                sample_logits, effective_top_k, top_p
+            )
+        except Exception:
+            return self._torch_top_k_top_p(sample_logits, effective_top_k, top_p)
+
+    def _apply_v2_repetition_penalty(
+        self,
+        logits,
+        occurrence,
+        alpha_presence_vector,
+        alpha_presence,
+        alpha_frequency,
+        alpha_decay,
+    ):
+        if alpha_presence != 0 or alpha_frequency != 0:
+            mask = (occurrence > 0).float()
+            logits -= mask * alpha_presence + occurrence * alpha_frequency
+
+        occurrence *= alpha_decay
+        logits -= alpha_presence_vector + occurrence * alpha_frequency
+        return logits
+
+    @staticmethod
+    def _update_v2_occurrence(
+        occurrence,
+        alpha_presence_vector,
+        row,
+        token,
+        alpha_presence_val,
+    ):
+        no_penalty_token_ids = {33, 10, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58}
+        weight = 0.0 if token in no_penalty_token_ids else 1.0
+        occurrence[row, token] += weight
+        alpha_presence_vector[row, token] = alpha_presence_val
+
     def _prefill_prompt_with_prefix_cache(self, prompt, prefix_cache_manager=None):
         encoded_prompt = self.tokenizer.encode(prompt)
         if not encoded_prompt:
@@ -200,7 +272,7 @@ class InferenceEngine:
         if prefix_cache_manager is not None:
             cache_match = prefix_cache_manager.match_prefix_state(encoded_prompt, device="cuda")
             if cache_match is not None:
-                state = cache_match["state"]
+                state = self._prepare_model_state(cache_match["state"])
                 out = cache_match["logits"]
                 matched_tokens = int(cache_match["matched_tokens"])
                 cache_source = cache_match["cache_source"]
@@ -436,6 +508,7 @@ class InferenceEngine:
         alpha_decay=0.996,
         stop_tokens=("\nUser:",),
     ):
+        state = self._prepare_model_state(state)
         encoded_prompts = [self.tokenizer.encode(p) for p in prompts]
 
         tokens = encoded_prompts[0]
@@ -647,6 +720,7 @@ class InferenceEngine:
         session_id=None,
         state_manager=None,
     ):
+        state = self._prepare_model_state(state)
         encoded_prompts = [self.tokenizer.encode(p) for p in prompts]
         chunk_size = max(1, int(chunk_size))
 
@@ -723,7 +797,11 @@ class InferenceEngine:
         finally:
             if state_manager and session_id:
                 state_manager.put_state(session_id, state)
-                print("[RESPONSE] /state/chat/completions state[2]: ", state[2], "\n")
+                print(
+                    "[RESPONSE] /state/chat/completions state[2]: ",
+                    self._state_pos_for_log(state),
+                    "\n",
+                )
 
             del state
             torch.cuda.empty_cache()
@@ -747,157 +825,96 @@ class InferenceEngine:
         alpha_decay=0.996,
         chunk_size=32,
     ):
-        max_generate_tokens = max_generate_tokens
-        batch_size = batch_size
-        pad_zero = pad_zero
-        chunk_size = chunk_size
-
         device = self.model.z["head.weight"].device
         alpha_presence_val = torch.tensor(
             alpha_presence, dtype=torch.float32, device=device
         )
 
-        if temperature == 0:
-            temperature = 1.0
-            top_k = 1
-
-        encoded_inputs = []
+        encoded_prompts = []
         for prompt in inputs:
-            input_token = self.tokenizer.encode(prompt)
+            ids = self.tokenizer.encode(prompt)
             if pad_zero:
-                input_token = [0] + input_token
-            encoded_inputs.append((prompt, input_token))
-        input_queue = deque(encoded_inputs)
+                ids = [0] + ids
+            if not ids:
+                ids = [0]
+            encoded_prompts.append(ids)
 
-        states = self.model.generate_zero_state(batch_size)
-        task_pool = []
-        stop_states = {}
-        chunk_token_counts = {}
-        text_buffers = {}
-
-        prompt_idx = 0
-        for i in range(batch_size):
-            prompt, input_token = input_queue.popleft()
-            task_pool.append(
-                {
-                    "prompt_idx": prompt_idx,
-                    "prompt": prompt,
-                    "input_token": input_token,
-                    "state_pos": i,
-                    "generated_tokens": [],
-                    "new_token": None,
-                }
-            )
-            stop_states[prompt_idx] = self._create_stop_state(stop_tokens)
-            chunk_token_counts[prompt_idx] = 0
-            text_buffers[prompt_idx] = ""
-            prompt_idx += 1
-
+        actual_batch_size = len(encoded_prompts)
+        states = self.model.generate_zero_state(actual_batch_size)
         occurrence = torch.zeros(
-            (batch_size, self.args.vocab_size), dtype=torch.float32, device=device
+            (actual_batch_size, self.args.vocab_size),
+            dtype=torch.float32,
+            device=device,
         )
-        no_penalty_token_ids = set([33, 10, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58])
         alpha_presence_vector = torch.zeros(
-            (batch_size, self.args.vocab_size), dtype=torch.float32, device=device
+            (actual_batch_size, self.args.vocab_size),
+            dtype=torch.float32,
+            device=device,
         )
+        finished = [False] * actual_batch_size
+        stop_states = [self._create_stop_state(stop_tokens) for _ in range(actual_batch_size)]
+        chunk_token_counts = [0] * actual_batch_size
+        text_buffers = [""] * actual_batch_size
 
         try:
-            while True:
-                contents_to_send = {}
-                accomplished_task_indices = []
-                state_slots_to_remove = set()
+            out = self.model.forward_batch(encoded_prompts, states).float()
 
-                for task_idx, task in enumerate(task_pool):
-                    if len(task["input_token"]) == 0:
-                        if task["new_token"] is None:
-                            continue
+            for _ in range(max_generate_tokens):
+                sample_logits = self._apply_v2_repetition_penalty(
+                    out,
+                    occurrence,
+                    alpha_presence_vector,
+                    alpha_presence,
+                    alpha_frequency,
+                    alpha_decay,
+                )
+                new_tokens = self._sample_flashinfer_or_torch(
+                    sample_logits, temperature, top_k, top_p
+                ).tolist()
 
-                        new_token = task["new_token"]
-                        prompt_id = task["prompt_idx"]
+                next_tokens = [[token] for token in new_tokens]
+                out = self.model.forward_batch(next_tokens, states).float()
 
-                        content, should_stop = self._ingest_token_with_stop(
-                            stop_states[prompt_id], new_token
-                        )
+                contents_to_send = [""] * actual_batch_size
+                for i, token in enumerate(new_tokens):
+                    if finished[i]:
+                        continue
 
-                        if content:
-                            text_buffers[prompt_id] += content
+                    content, should_stop = self._ingest_token_with_stop(
+                        stop_states[i], token
+                    )
+                    if content:
+                        text_buffers[i] += content
 
-                        is_finished = should_stop or (
-                            len(task["generated_tokens"]) >= max_generate_tokens
-                        )
+                    if should_stop:
+                        finished[i] = True
+                        flushed = self._flush_stop_state(stop_states[i], final=True)
+                        if flushed:
+                            text_buffers[i] += flushed
+                        if text_buffers[i]:
+                            contents_to_send[i] += text_buffers[i]
+                            text_buffers[i] = ""
+                        continue
 
-                        if not is_finished:
-                            task["generated_tokens"].append(new_token)
-                            chunk_token_counts[prompt_id] += 1
+                    self._update_v2_occurrence(
+                        occurrence,
+                        alpha_presence_vector,
+                        i,
+                        token,
+                        alpha_presence_val,
+                    )
+                    chunk_token_counts[i] += 1
+                    if chunk_token_counts[i] >= chunk_size and text_buffers[i]:
+                        contents_to_send[i] += text_buffers[i]
+                        text_buffers[i] = ""
+                        chunk_token_counts[i] = 0
 
-                            if (
-                                chunk_token_counts[prompt_id] >= chunk_size
-                                and text_buffers[prompt_id]
-                            ):
-                                contents_to_send[prompt_id] = (
-                                    contents_to_send.get(prompt_id, "")
-                                    + text_buffers[prompt_id]
-                                )
-                                text_buffers[prompt_id] = ""
-                                chunk_token_counts[prompt_id] = 0
-
-                        if is_finished:
-                            text_chunk = self._flush_stop_state(
-                                stop_states[prompt_id], final=True
-                            )
-                            if text_chunk:
-                                text_buffers[prompt_id] += text_chunk
-                            if text_buffers[prompt_id]:
-                                contents_to_send[prompt_id] = (
-                                    contents_to_send.get(prompt_id, "")
-                                    + text_buffers[prompt_id]
-                                )
-                                text_buffers[prompt_id] = ""
-
-                            del stop_states[prompt_id]
-                            del chunk_token_counts[prompt_id]
-                            del text_buffers[prompt_id]
-
-                            if len(input_queue) > 0:
-                                prompt, input_token = input_queue.popleft()
-                                new_prompt_idx = prompt_idx
-                                task_pool[task_idx] = {
-                                    "prompt_idx": new_prompt_idx,
-                                    "prompt": prompt,
-                                    "input_token": input_token,
-                                    "state_pos": task["state_pos"],
-                                    "generated_tokens": [],
-                                    "new_token": None,
-                                }
-                                stop_states[new_prompt_idx] = self._create_stop_state(
-                                    stop_tokens
-                                )
-                                chunk_token_counts[new_prompt_idx] = 0
-                                text_buffers[new_prompt_idx] = ""
-                                prompt_idx += 1
-
-                                state_pos = task["state_pos"]
-                                states[0][:, :, state_pos, :] = 0
-                                states[1][:, state_pos, :, :] = 0
-                                occurrence[state_pos, :] = 0
-                                alpha_presence_vector[state_pos, :] = 0
-                            else:
-                                accomplished_task_indices.append(task_idx)
-                                state_slots_to_remove.add(task["state_pos"])
-                        else:
-                            task["input_token"].append(new_token)
-                            www = 0.0 if new_token in no_penalty_token_ids else 1.0
-                            occurrence[task["state_pos"], new_token] += www
-                            alpha_presence_vector[task["state_pos"], new_token] = (
-                                alpha_presence_val
-                            )
-
-                if contents_to_send:
+                if any(contents_to_send):
                     chunk = {
                         "object": "chat.completion.chunk",
                         "choices": [
-                            {"index": pid, "delta": {"content": content}}
-                            for pid, content in contents_to_send.items()
+                            {"index": i, "delta": {"content": content}}
+                            for i, content in enumerate(contents_to_send)
                             if content
                         ],
                     }
@@ -906,79 +923,29 @@ class InferenceEngine:
                             f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
                         )
 
-                if accomplished_task_indices:
-                    sorted_slots = sorted(list(state_slots_to_remove), reverse=True)
-
-                    for slot in sorted_slots:
-                        states[0] = torch.cat(
-                            [states[0][:, :, :slot, :], states[0][:, :, slot + 1 :, :]],
-                            dim=2,
-                        )
-                        states[1] = torch.cat(
-                            [states[1][:, :slot, :, :], states[1][:, slot + 1 :, :, :]],
-                            dim=1,
-                        )
-                        occurrence = torch.cat(
-                            [occurrence[:slot, :], occurrence[slot + 1 :, :]], dim=0
-                        )
-                        alpha_presence_vector = torch.cat(
-                            [
-                                alpha_presence_vector[:slot, :],
-                                alpha_presence_vector[slot + 1 :, :],
-                            ],
-                            dim=0,
-                        )
-
-                    for task_idx in sorted(accomplished_task_indices, reverse=True):
-                        del task_pool[task_idx]
-
-                    remaining_slots = sorted([t["state_pos"] for t in task_pool])
-                    pos_map = {
-                        old_pos: new_pos
-                        for new_pos, old_pos in enumerate(remaining_slots)
-                    }
-                    for task in task_pool:
-                        task["state_pos"] = pos_map[task["state_pos"]]
-
-                if len(task_pool) == 0:
+                if all(finished):
                     break
 
-                current_batch_size = len(task_pool)
-                next_tokens = [None] * current_batch_size
-                for task in task_pool:
-                    next_tokens[task["state_pos"]] = [task["input_token"].pop(0)]
+            remaining_contents = [""] * actual_batch_size
+            for i in range(actual_batch_size):
+                flushed = self._flush_stop_state(stop_states[i], final=True)
+                if flushed:
+                    text_buffers[i] += flushed
+                remaining_contents[i] = text_buffers[i]
 
-                out = self.model.forward_batch(next_tokens, states)
-
-                if alpha_presence != 0 or alpha_frequency != 0:
-                    mask = (occurrence > 0).float()
-                    out -= mask * alpha_presence + occurrence * alpha_frequency
-
-                occurrence *= alpha_decay
-                out -= alpha_presence_vector + occurrence * alpha_frequency
-
-                if temperature != 1.0:
-                    out /= temperature
-
-                if self.rocm_flag:
-                    new_tokens = self._torch_top_k_top_p(out, top_k, top_p)
-                else:
-                    try:
-                        import flashinfer  # type: ignore
-
-                        new_tokens = (
-                            flashinfer.sampling.top_k_top_p_sampling_from_logits(
-                                out, top_k, top_p
-                            )
-                        )
-                    except Exception:
-                        new_tokens = self._torch_top_k_top_p(out, top_k, top_p)
-
-                new_tokens = new_tokens.tolist()
-
-                for task in task_pool:
-                    state_pos = task["state_pos"]
-                    task["new_token"] = new_tokens[state_pos]
+            if any(remaining_contents):
+                chunk = {
+                    "object": "chat.completion.chunk",
+                    "choices": [
+                        {"index": i, "delta": {"content": content}}
+                        for i, content in enumerate(remaining_contents)
+                        if content
+                    ],
+                }
+                if chunk["choices"]:
+                    output_queue.put(
+                        f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+                    )
 
         finally:
             del states
@@ -1002,199 +969,88 @@ class InferenceEngine:
         alpha_frequency=0.5,
         alpha_decay=0.996,
     ):
-        max_generate_tokens = max_generate_tokens
-        batch_size = batch_size
-        pad_zero = pad_zero
-
         device = self.model.z["head.weight"].device
         alpha_presence_val = torch.tensor(
             alpha_presence, dtype=torch.float32, device=device
         )
 
-        if temperature == 0:
-            temperature = 1.0
-            top_k = 1
-
-        encoded_inputs = []
+        encoded_prompts = []
         for prompt in inputs:
-            input_token = self.tokenizer.encode(prompt)
+            ids = self.tokenizer.encode(prompt)
             if pad_zero:
-                input_token = [0] + input_token
-            encoded_inputs.append((prompt, input_token))
-        input_queue = deque(encoded_inputs)
+                ids = [0] + ids
+            if not ids:
+                ids = [0]
+            encoded_prompts.append(ids)
 
-        states = self.model.generate_zero_state(batch_size)
-        task_pool = []
-        results = {}
-        stop_states = {}
-        result_parts = {}
-
-        prompt_idx = 0
-        for i in range(batch_size):
-            prompt, input_token = input_queue.popleft()
-            task_pool.append(
-                {
-                    "prompt_idx": prompt_idx,
-                    "prompt": prompt,
-                    "input_token": input_token,
-                    "state_pos": i,
-                    "generated_tokens": [],
-                    "new_token": None,
-                }
-            )
-            stop_states[prompt_idx] = self._create_stop_state(stop_tokens)
-            result_parts[prompt_idx] = []
-            prompt_idx += 1
-
+        actual_batch_size = len(encoded_prompts)
+        states = self.model.generate_zero_state(actual_batch_size)
         occurrence = torch.zeros(
-            (batch_size, self.args.vocab_size), dtype=torch.float32, device=device
+            (actual_batch_size, self.args.vocab_size),
+            dtype=torch.float32,
+            device=device,
         )
-        no_penalty_token_ids = set([33, 10, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58])
         alpha_presence_vector = torch.zeros(
-            (batch_size, self.args.vocab_size), dtype=torch.float32, device=device
+            (actual_batch_size, self.args.vocab_size),
+            dtype=torch.float32,
+            device=device,
         )
+        finished = [False] * actual_batch_size
+        stop_states = [self._create_stop_state(stop_tokens) for _ in range(actual_batch_size)]
+        result_parts = [[] for _ in range(actual_batch_size)]
 
         try:
-            while True:
-                accomplished_task_indices = []
-                state_slots_to_remove = set()
+            out = self.model.forward_batch(encoded_prompts, states).float()
 
-                for task_idx, task in enumerate(task_pool):
-                    if len(task["input_token"]) == 0:
-                        if task["new_token"] is None:
-                            continue
+            for _ in range(max_generate_tokens):
+                sample_logits = self._apply_v2_repetition_penalty(
+                    out,
+                    occurrence,
+                    alpha_presence_vector,
+                    alpha_presence,
+                    alpha_frequency,
+                    alpha_decay,
+                )
+                new_tokens = self._sample_flashinfer_or_torch(
+                    sample_logits, temperature, top_k, top_p
+                ).tolist()
 
-                        new_token = task["new_token"]
-                        prompt_id = task["prompt_idx"]
+                next_tokens = [[token] for token in new_tokens]
+                out = self.model.forward_batch(next_tokens, states).float()
 
-                        content, should_stop = self._ingest_token_with_stop(
-                            stop_states[prompt_id], new_token
+                for i, token in enumerate(new_tokens):
+                    if finished[i]:
+                        continue
+
+                    content, should_stop = self._ingest_token_with_stop(
+                        stop_states[i], token
+                    )
+                    if content:
+                        result_parts[i].append(content)
+
+                    if should_stop:
+                        result_parts[i].append(
+                            self._flush_stop_state(stop_states[i], final=True)
                         )
-                        if content:
-                            result_parts[prompt_id].append(content)
-                        is_finished = should_stop or (
-                            len(task["generated_tokens"]) >= max_generate_tokens
-                        )
+                        finished[i] = True
+                        continue
 
-                        if not is_finished:
-                            task["generated_tokens"].append(new_token)
+                    self._update_v2_occurrence(
+                        occurrence,
+                        alpha_presence_vector,
+                        i,
+                        token,
+                        alpha_presence_val,
+                    )
 
-                        if is_finished:
-                            result_parts[prompt_id].append(
-                                self._flush_stop_state(
-                                    stop_states[prompt_id], final=True
-                                )
-                            )
-                            results[prompt_id] = "".join(result_parts[prompt_id])
-                            del stop_states[prompt_id]
-                            del result_parts[prompt_id]
-
-                            if len(input_queue) > 0:
-                                prompt, input_token = input_queue.popleft()
-                                new_prompt_idx = prompt_idx
-                                task_pool[task_idx] = {
-                                    "prompt_idx": new_prompt_idx,
-                                    "prompt": prompt,
-                                    "input_token": input_token,
-                                    "state_pos": task["state_pos"],
-                                    "generated_tokens": [],
-                                    "new_token": None,
-                                }
-                                stop_states[new_prompt_idx] = self._create_stop_state(
-                                    stop_tokens
-                                )
-                                result_parts[new_prompt_idx] = []
-                                prompt_idx += 1
-
-                                state_pos = task["state_pos"]
-                                states[0][:, :, state_pos, :] = 0
-                                states[1][:, state_pos, :, :] = 0
-                                occurrence[state_pos, :] = 0
-                                alpha_presence_vector[state_pos, :] = 0
-                            else:
-                                accomplished_task_indices.append(task_idx)
-                                state_slots_to_remove.add(task["state_pos"])
-                        else:
-                            task["input_token"].append(new_token)
-                            www = 0.0 if new_token in no_penalty_token_ids else 1.0
-                            occurrence[task["state_pos"], new_token] += www
-                            alpha_presence_vector[task["state_pos"], new_token] = (
-                                alpha_presence_val
-                            )
-
-                if accomplished_task_indices:
-                    sorted_slots = sorted(list(state_slots_to_remove), reverse=True)
-
-                    for slot in sorted_slots:
-                        states[0] = torch.cat(
-                            [states[0][:, :, :slot, :], states[0][:, :, slot + 1 :, :]],
-                            dim=2,
-                        )
-                        states[1] = torch.cat(
-                            [states[1][:, :slot, :, :], states[1][:, slot + 1 :, :, :]],
-                            dim=1,
-                        )
-                        occurrence = torch.cat(
-                            [occurrence[:slot, :], occurrence[slot + 1 :, :]], dim=0
-                        )
-                        alpha_presence_vector = torch.cat(
-                            [
-                                alpha_presence_vector[:slot, :],
-                                alpha_presence_vector[slot + 1 :, :],
-                            ],
-                            dim=0,
-                        )
-
-                    for task_idx in sorted(accomplished_task_indices, reverse=True):
-                        del task_pool[task_idx]
-
-                    remaining_slots = sorted([t["state_pos"] for t in task_pool])
-                    pos_map = {
-                        old_pos: new_pos
-                        for new_pos, old_pos in enumerate(remaining_slots)
-                    }
-                    for task in task_pool:
-                        task["state_pos"] = pos_map[task["state_pos"]]
-
-                if len(task_pool) == 0:
+                if all(finished):
                     break
 
-                current_batch_size = len(task_pool)
-                next_tokens = [None] * current_batch_size
-                for task in task_pool:
-                    next_tokens[task["state_pos"]] = [task["input_token"].pop(0)]
-
-                out = self.model.forward_batch(next_tokens, states)
-
-                if alpha_presence != 0 or alpha_frequency != 0:
-                    mask = (occurrence > 0).float()
-                    out -= mask * alpha_presence + occurrence * alpha_frequency
-
-                occurrence *= alpha_decay
-                out -= alpha_presence_vector + occurrence * alpha_frequency
-
-                if temperature != 1.0:
-                    out /= temperature
-
-                if self.rocm_flag:
-                    new_tokens = self._torch_top_k_top_p(out, top_k, top_p)
-                else:
-                    try:
-                        import flashinfer  # type: ignore
-
-                        new_tokens = (
-                            flashinfer.sampling.top_k_top_p_sampling_from_logits(
-                                out, top_k, top_p
-                            )
-                        )
-                    except Exception:
-                        new_tokens = self._torch_top_k_top_p(out, top_k, top_p)
-
-                new_tokens = new_tokens.tolist()
-
-                for task in task_pool:
-                    state_pos = task["state_pos"]
-                    task["new_token"] = new_tokens[state_pos]
+            for i in range(actual_batch_size):
+                if not finished[i]:
+                    result_parts[i].append(
+                        self._flush_stop_state(stop_states[i], final=True)
+                    )
 
         finally:
             del states
@@ -1203,7 +1059,7 @@ class InferenceEngine:
             gc.collect()
             torch.cuda.empty_cache()
 
-        return [results.get(i, "") for i in range(len(inputs))]
+        return ["".join(parts) for parts in result_parts]
 
     async def continuous_batching_stream(
         self,

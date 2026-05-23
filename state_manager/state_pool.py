@@ -174,6 +174,7 @@ class StateCacheManager:
         self._init_db()
         
         self.io_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="db_writer")
+        self._closed = False
         
         self._initialized = True
         print(
@@ -226,15 +227,48 @@ class StateCacheManager:
         buffer = io.BytesIO(blob)
         return torch.load(buffer, map_location="cpu", weights_only=True)
 
+    def _clone_state_item(self, item):
+        if isinstance(item, list):
+            return [self._clone_state_item(x) for x in item]
+        return item.clone()
+
+    def _clone_to_device_item(self, item, device: str):
+        if isinstance(item, list):
+            return [self._clone_to_device_item(x, device) for x in item]
+        return item.detach().to(device, non_blocking=device == "cuda").clone()
+
+    def _move_to_device_item(self, item, device: str):
+        if isinstance(item, list):
+            return [self._move_to_device_item(x, device) for x in item]
+        return item.to(device, non_blocking=device == "cuda")
+
+    def _state_token_pos(self, state) -> object:
+        if len(state) <= 2:
+            return "unknown"
+        elapsed = state[2]
+        if isinstance(elapsed, list):
+            return [x.detach().cpu().tolist() for x in elapsed]
+        return elapsed.item() if hasattr(elapsed, "item") else "unknown"
+
+    @staticmethod
+    def _is_pp_state(state) -> bool:
+        return isinstance(state, list) and bool(state) and isinstance(state[0], list)
+
+    def _restore_device_for_state(self, state, requested_device: str) -> str:
+        if requested_device == "cuda" and self._is_pp_state(state):
+            return "cpu"
+        return requested_device
+
     def _clone_state(self, state: List[torch.Tensor]) -> List[torch.Tensor]:
         """深拷贝状态，避免多线程共享导致污染"""
-        return [t.clone() for t in state]
+        return [self._clone_state_item(t) for t in state]
 
     def _clone_to_cpu_state(self, state: List[torch.Tensor]) -> List[torch.Tensor]:
-        return [t.detach().to("cpu").clone() for t in state]
+        return [self._clone_to_device_item(t, "cpu") for t in state]
 
     def _clone_to_device_state(self, state: List[torch.Tensor], device: str) -> List[torch.Tensor]:
-        return [t.detach().to(device, non_blocking=device == "cuda").clone() for t in state]
+        target_device = self._restore_device_for_state(state, device)
+        return [self._clone_to_device_item(t, target_device) for t in state]
 
     def _clone_optional_tensor(self, tensor: Optional[torch.Tensor], device: str) -> Optional[torch.Tensor]:
         if tensor is None:
@@ -291,6 +325,8 @@ class StateCacheManager:
         self.prefix_trie = trie
 
     def _store_prefix_entry_locked(self, entry: PrefixCacheEntry, persist: bool):
+        if self._closed:
+            return
         bucket_cache = self.prefix_l2_cache[entry.bucket_len]
         if entry.state_id in bucket_cache:
             del bucket_cache[entry.state_id]
@@ -321,6 +357,8 @@ class StateCacheManager:
             return
 
         with self.cache_lock:
+            if self._closed:
+                return
             if session_id in self.l1_cache:
                 del self.l1_cache[session_id]
             if session_id in self.l2_cache:
@@ -332,7 +370,9 @@ class StateCacheManager:
                 # popitem(last=False) 弹出最早插入的元素 (FIFO/LRU Oldest)
                 evicted_id, evicted_state_gpu = self.l1_cache.popitem(last=False)
                 
-                evicted_state_cpu = [t.to('cpu', non_blocking=True) for t in evicted_state_gpu]
+                evicted_state_cpu = [
+                    self._move_to_device_item(t, "cpu") for t in evicted_state_gpu
+                ]
                 
                 self.l2_cache[evicted_id] = evicted_state_cpu
                 
@@ -351,7 +391,7 @@ class StateCacheManager:
             if session_id in self.l1_cache:
                 self.l1_cache.move_to_end(session_id) # 标记为最近使用
                 state = self.l1_cache[session_id]
-                token_pos = state[2].item() if len(state) > 2 and hasattr(state[2], "item") else "unknown"
+                token_pos = self._state_token_pos(state)
                 print(
                     f"[StatePool][SESSION HIT][L1] session_id={session_id} "
                     f"token_pos={token_pos}"
@@ -360,13 +400,23 @@ class StateCacheManager:
             
             # Case 2: L2 Hit (RAM)
             if session_id in self.l2_cache:
+                state_cpu = self.l2_cache[session_id]
+                token_pos = self._state_token_pos(state_cpu)
+                if self._is_pp_state(state_cpu):
+                    self.l2_cache.move_to_end(session_id)
+                    print(
+                        f"[StatePool][SESSION HIT][L2] session_id={session_id} "
+                        f"token_pos={token_pos} -> return_cpu_for_pp_prepare"
+                    )
+                    return self._clone_to_cpu_state(state_cpu)
                 state_cpu = self.l2_cache.pop(session_id)
-                token_pos = state_cpu[2].item() if len(state_cpu) > 2 and hasattr(state_cpu[2], "item") else "unknown"
                 print(
                     f"[StatePool][SESSION HIT][L2] session_id={session_id} "
                     f"token_pos={token_pos} -> promote_to_l1"
                 )
-                state_gpu = [t.to('cuda', non_blocking=True) for t in state_cpu]
+                state_gpu = [
+                    self._move_to_device_item(t, "cuda") for t in state_cpu
+                ]
                 
                 self.put_state(session_id, state_gpu)
                 return self._clone_state(state_gpu)
@@ -381,12 +431,20 @@ class StateCacheManager:
         if blob:
             try:
                 state_cpu = self._deserialize(blob)
-                token_pos = state_cpu[2].item() if len(state_cpu) > 2 and hasattr(state_cpu[2], "item") else "unknown"
+                token_pos = self._state_token_pos(state_cpu)
+                if self._is_pp_state(state_cpu):
+                    print(
+                        f"[StatePool][SESSION HIT][DISK] session_id={session_id} "
+                        f"token_pos={token_pos} -> return_cpu_for_pp_prepare"
+                    )
+                    return self._clone_to_cpu_state(state_cpu)
                 print(
                     f"[StatePool][SESSION HIT][DISK] session_id={session_id} "
                     f"token_pos={token_pos} -> load_to_l1"
                 )
-                state_gpu = [t.to('cuda') for t in state_cpu]
+                state_gpu = [
+                    self._move_to_device_item(t, "cuda") for t in state_cpu
+                ]
                 self.put_state(session_id, state_gpu)
                 return self._clone_state(state_gpu)
             except Exception as e:
@@ -545,8 +603,13 @@ class StateCacheManager:
         state_to_save = None
         
         with self.cache_lock:
+            if self._closed:
+                return
             if session_id in self.l1_cache:
-                state_to_save = [t.to('cpu') for t in self.l1_cache.pop(session_id)]
+                state_to_save = [
+                    self._move_to_device_item(t, "cpu")
+                    for t in self.l1_cache.pop(session_id)
+                ]
             elif session_id in self.l2_cache:
                 state_to_save = self.l2_cache.pop(session_id)
         
@@ -556,9 +619,14 @@ class StateCacheManager:
         print(f"[StatePool] Session {session_id} closed and persisted.")
 
     def flush_all(self):
+        with self.cache_lock:
+            if self._closed:
+                print("[StatePool] Flush skipped: already closed.")
+                return
+            self._closed = True
 
         print("[StatePool] Flushing all states to disk...")
-        
+
         self.io_executor.shutdown(wait=True)
         
         items_to_save = []
@@ -566,7 +634,9 @@ class StateCacheManager:
         with self.cache_lock:
             while self.l1_cache:
                 sid, state = self.l1_cache.popitem()
-                items_to_save.append((sid, [t.to('cpu') for t in state]))
+                items_to_save.append(
+                    (sid, [self._move_to_device_item(t, "cpu") for t in state])
+                )
             
             while self.l2_cache:
                 sid, state = self.l2_cache.popitem()

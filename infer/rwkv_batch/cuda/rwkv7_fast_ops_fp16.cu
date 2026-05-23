@@ -12,7 +12,8 @@ namespace {
 
 constexpr int HEAD_SIZE = 64;
 constexpr int WARPS_PER_BLOCK = 4;
-constexpr float NORM_EPS = 1.0e-12f;
+constexpr float KK_NORMALIZE_EPS = 1.0e-12f;
+constexpr float TMIX_LN_X_EPS = 64.0e-5f;
 constexpr int FFN_SPMV_THREADS = 128;
 constexpr int FFN_TILE = 128;
 
@@ -110,6 +111,65 @@ __global__ void tmix_mix6_kernel(
   }
 }
 
+template <bool HalfMath, int Vec>
+__global__ void tmix_mix6_t1_c4096_kernel(
+    const dtype* __restrict__ x,
+    dtype* __restrict__ shift_state,
+    const dtype* __restrict__ x_r,
+    const dtype* __restrict__ x_w,
+    const dtype* __restrict__ x_k,
+    const dtype* __restrict__ x_v,
+    const dtype* __restrict__ x_a,
+    const dtype* __restrict__ x_g,
+    dtype* __restrict__ out_r,
+    dtype* __restrict__ out_w,
+    dtype* __restrict__ out_k,
+    dtype* __restrict__ out_v,
+    dtype* __restrict__ out_a,
+    dtype* __restrict__ out_g,
+    int64_t total_pairs) {
+  const int64_t base_pair = (static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x) * Vec;
+#pragma unroll
+  for (int u = 0; u < Vec; ++u) {
+  const int64_t pair_idx = base_pair + u;
+  if (pair_idx >= total_pairs) {
+    return;
+  }
+  const int c = static_cast<int>(pair_idx & 2047) << 1;
+  const int64_t idx = pair_idx << 1;
+  const __half2 cur2 = load_h2(x + idx);
+  const __half2 prev2 = load_h2(shift_state + idx);
+  if constexpr (HalfMath) {
+    const __half2 dx = __hsub2(prev2, cur2);
+    *reinterpret_cast<__half2*>(out_r + idx) = __hfma2(dx, load_h2(x_r + c), cur2);
+    *reinterpret_cast<__half2*>(out_w + idx) = __hfma2(dx, load_h2(x_w + c), cur2);
+    *reinterpret_cast<__half2*>(out_k + idx) = __hfma2(dx, load_h2(x_k + c), cur2);
+    *reinterpret_cast<__half2*>(out_v + idx) = __hfma2(dx, load_h2(x_v + c), cur2);
+    *reinterpret_cast<__half2*>(out_a + idx) = __hfma2(dx, load_h2(x_a + c), cur2);
+    *reinterpret_cast<__half2*>(out_g + idx) = __hfma2(dx, load_h2(x_g + c), cur2);
+  } else {
+    const float2 cur = __half22float2(cur2);
+    const float2 prev = __half22float2(prev2);
+    const float dx0 = prev.x - cur.x;
+    const float dx1 = prev.y - cur.y;
+    const float2 xr = __half22float2(load_h2(x_r + c));
+    const float2 xw = __half22float2(load_h2(x_w + c));
+    const float2 xk = __half22float2(load_h2(x_k + c));
+    const float2 xv = __half22float2(load_h2(x_v + c));
+    const float2 xa = __half22float2(load_h2(x_a + c));
+    const float2 xg = __half22float2(load_h2(x_g + c));
+    store_h2(out_r + idx, cur.x + dx0 * xr.x, cur.y + dx1 * xr.y);
+    store_h2(out_w + idx, cur.x + dx0 * xw.x, cur.y + dx1 * xw.y);
+    store_h2(out_k + idx, cur.x + dx0 * xk.x, cur.y + dx1 * xk.y);
+    store_h2(out_v + idx, cur.x + dx0 * xv.x, cur.y + dx1 * xv.y);
+    store_h2(out_a + idx, cur.x + dx0 * xa.x, cur.y + dx1 * xa.y);
+    store_h2(out_g + idx, cur.x + dx0 * xg.x, cur.y + dx1 * xg.y);
+  }
+  *reinterpret_cast<__half2*>(shift_state + idx) = cur2;
+  }
+}
+
+template <bool UpdateShift>
 __global__ void tmix_kk_a_gate_kernel(
     int H,
     const dtype* __restrict__ k,
@@ -117,6 +177,8 @@ __global__ void tmix_kk_a_gate_kernel(
     const dtype* __restrict__ a0,
     const dtype* __restrict__ a12,
     const dtype* __restrict__ k_a,
+    const dtype* __restrict__ x,
+    dtype* __restrict__ shift_state,
     dtype* __restrict__ new_k,
     dtype* __restrict__ neg_kk,
     dtype* __restrict__ kka,
@@ -141,7 +203,7 @@ __global__ void tmix_kk_a_gate_kernel(
   float sum_sq = u0 * u0 + u1 * u1;
   sum_sq = warp_sum(sum_sq);
   const float total = __shfl_sync(0xffffffffu, sum_sq, 0);
-  const float inv_d = 1.0f / fmaxf(sqrtf(total), NORM_EPS);
+  const float inv_d = 1.0f / fmaxf(sqrtf(total), KK_NORMALIZE_EPS);
   const float kk0 = u0 * inv_d;
   const float kk1 = u1 * inv_d;
 
@@ -153,6 +215,9 @@ __global__ void tmix_kk_a_gate_kernel(
   store_h2(new_k + idx, kv.x * fmaf(av0, ka.x, 1.0f - ka.x), kv.y * fmaf(av1, ka.y, 1.0f - ka.y));
   store_h2(neg_kk + idx, -kk0, -kk1);
   store_h2(kka + idx, kk0 * av0, kk1 * av1);
+  if constexpr (UpdateShift) {
+    *reinterpret_cast<__half2*>(shift_state + idx) = load_h2(x + idx);
+  }
 }
 
 __global__ void tmix_lnx_rkvres_xg_kernel(
@@ -200,7 +265,7 @@ __global__ void tmix_lnx_rkvres_xg_kernel(
   }
   __syncthreads();
   const float var = (partial[0] + partial[1]) * (1.0f / 64.0f);
-  const float rstd = rsqrtf(var + 64.0e-5f);
+  const float rstd = rsqrtf(var + TMIX_LN_X_EPS);
   __syncthreads();
 
   const float rv = load_h1(r + idx);
@@ -232,7 +297,7 @@ __global__ void tmix_vres_gate_kernel(
   if (idx >= total) {
     return;
   }
-  const int c = static_cast<int>(idx & (static_cast<int64_t>(C) - 1));
+  const int c = static_cast<int>(idx % static_cast<int64_t>(C));
   const float vv = load_h1(v + idx);
   const float gate = sigmoid_fast(load_h1(v0 + c) + load_h1(v12 + idx));
   store_h1(out + idx, fmaf(load_h1(v_first + idx) - vv, gate, vv));
@@ -727,6 +792,86 @@ __global__ __launch_bounds__(FFN_SPMV_THREADS, 4) void cmix_sparse_spmv_relu_row
       acc);
 }
 
+__global__ __launch_bounds__(256, 2) void cmix_sparse_spmv_relu_rows_t512_kernel(
+    int C,
+    int F,
+    const dtype* __restrict__ preact,
+    const dtype* __restrict__ value_fc,
+    dtype* __restrict__ out) {
+  constexpr int TILE = 512;
+  constexpr int THREADS = 256;
+  __shared__ __align__(256) __half vec_slice[TILE];
+  __shared__ __align__(256) int nnz_ids[TILE];
+  __shared__ int nnz_count;
+  __shared__ int warp_counts[TILE / 32];
+  __shared__ int warp_prefix[TILE / 32];
+
+  const int f_block = blockIdx.x;
+  const int c_block = blockIdx.y;
+  const int row = blockIdx.z;
+  const int tid = threadIdx.x;
+  const int lane = tid & 31;
+  const int warp_id = tid >> 5;
+  const int start_f = f_block * TILE;
+  const dtype* pre_row = preact + static_cast<int64_t>(row) * F;
+
+#pragma unroll
+  for (int u = 0; u < 2; ++u) {
+    const int local_f = tid + u * THREADS;
+    const float v = fmaxf(load_h1(pre_row + start_f + local_f), 0.0f);
+    vec_slice[local_f] = __float2half_rn(v * v);
+  }
+  __syncthreads();
+
+#pragma unroll
+  for (int u = 0; u < 2; ++u) {
+    const int local_f = tid + u * THREADS;
+    const bool nonzero = bool(__half_as_ushort(vec_slice[local_f]) << 1);
+    const unsigned mask = __ballot_sync(0xffffffffu, nonzero);
+    if (lane == 0) {
+      warp_counts[warp_id + u * (THREADS / 32)] = __popc(mask);
+    }
+  }
+  __syncthreads();
+
+  if (tid == 0) {
+    int s = 0;
+#pragma unroll
+    for (int w = 0; w < TILE / 32; ++w) {
+      warp_prefix[w] = s;
+      s += warp_counts[w];
+    }
+    nnz_count = s;
+  }
+  __syncthreads();
+
+#pragma unroll
+  for (int u = 0; u < 2; ++u) {
+    const int local_f = tid + u * THREADS;
+    const bool nonzero = bool(__half_as_ushort(vec_slice[local_f]) << 1);
+    const unsigned mask = __ballot_sync(0xffffffffu, nonzero);
+    const int local_pos = __popc(mask & ((1u << lane) - 1u));
+    const int group = warp_id + u * (THREADS / 32);
+    if (nonzero) {
+      nnz_ids[warp_prefix[group] + local_pos] = local_f;
+    }
+  }
+  __syncthreads();
+
+  __half2 acc;
+  *reinterpret_cast<int*>(&acc) = 0;
+  for (int i = 0; i < nnz_count; ++i) {
+    const int local_f = nnz_ids[i];
+    const int actual_f = start_f + local_f;
+    const __half2 mat = *reinterpret_cast<const __half2*>(
+        value_fc + static_cast<int64_t>(actual_f) * C + c_block * (2 * THREADS) + tid * 2);
+    acc = __hfma2(__half2half2(vec_slice[local_f]), mat, acc);
+  }
+  atomicAdd(
+      reinterpret_cast<__half2*>(out + static_cast<int64_t>(row) * C + c_block * (2 * THREADS) + tid * 2),
+      acc);
+}
+
 }  // namespace
 
 std::vector<at::Tensor> tmix_mix6_cuda(
@@ -771,6 +916,112 @@ std::vector<at::Tensor> tmix_mix6_cuda(
   return {out_r, out_w, out_k, out_v, out_a, out_g};
 }
 
+std::vector<at::Tensor> tmix_mix6_cfg_cuda(
+    int B,
+    int T,
+    int C,
+    at::Tensor x,
+    at::Tensor shift_state,
+    at::Tensor x_r,
+    at::Tensor x_w,
+    at::Tensor x_k,
+    at::Tensor x_v,
+    at::Tensor x_a,
+    at::Tensor x_g,
+    int threads) {
+  auto out_r = at::empty_like(x);
+  auto out_w = at::empty_like(x);
+  auto out_k = at::empty_like(x);
+  auto out_v = at::empty_like(x);
+  auto out_a = at::empty_like(x);
+  auto out_g = at::empty_like(x);
+  const int64_t total_pairs = static_cast<int64_t>(B) * T * (C / 2);
+  auto stream = at::cuda::getCurrentCUDAStream();
+  tmix_mix6_kernel<<<static_cast<int>(ceil_div(total_pairs, threads)), threads, 0, stream>>>(
+      T, C,
+      x.data_ptr<dtype>(),
+      shift_state.data_ptr<dtype>(),
+      x_r.data_ptr<dtype>(),
+      x_w.data_ptr<dtype>(),
+      x_k.data_ptr<dtype>(),
+      x_v.data_ptr<dtype>(),
+      x_a.data_ptr<dtype>(),
+      x_g.data_ptr<dtype>(),
+      out_r.data_ptr<dtype>(),
+      out_w.data_ptr<dtype>(),
+      out_k.data_ptr<dtype>(),
+      out_v.data_ptr<dtype>(),
+      out_a.data_ptr<dtype>(),
+      out_g.data_ptr<dtype>(),
+      total_pairs);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return {out_r, out_w, out_k, out_v, out_a, out_g};
+}
+
+template <int Vec>
+std::vector<at::Tensor> tmix_mix6_t1_c4096_cuda_impl(
+    int B,
+    at::Tensor x,
+    at::Tensor shift_state,
+    at::Tensor x_r,
+    at::Tensor x_w,
+    at::Tensor x_k,
+    at::Tensor x_v,
+    at::Tensor x_a,
+    at::Tensor x_g,
+    int threads,
+    bool half_math) {
+  auto out_r = at::empty_like(x);
+  auto out_w = at::empty_like(x);
+  auto out_k = at::empty_like(x);
+  auto out_v = at::empty_like(x);
+  auto out_a = at::empty_like(x);
+  auto out_g = at::empty_like(x);
+  const int64_t total_pairs = static_cast<int64_t>(B) * (4096 / 2);
+  auto stream = at::cuda::getCurrentCUDAStream();
+  const int blocks = static_cast<int>(ceil_div(total_pairs, static_cast<int64_t>(threads) * Vec));
+  if (half_math) {
+    tmix_mix6_t1_c4096_kernel<true, Vec><<<blocks, threads, 0, stream>>>(
+        x.data_ptr<dtype>(), shift_state.data_ptr<dtype>(),
+        x_r.data_ptr<dtype>(), x_w.data_ptr<dtype>(), x_k.data_ptr<dtype>(), x_v.data_ptr<dtype>(), x_a.data_ptr<dtype>(), x_g.data_ptr<dtype>(),
+        out_r.data_ptr<dtype>(), out_w.data_ptr<dtype>(), out_k.data_ptr<dtype>(), out_v.data_ptr<dtype>(), out_a.data_ptr<dtype>(), out_g.data_ptr<dtype>(),
+        total_pairs);
+  } else {
+    tmix_mix6_t1_c4096_kernel<false, Vec><<<blocks, threads, 0, stream>>>(
+        x.data_ptr<dtype>(), shift_state.data_ptr<dtype>(),
+        x_r.data_ptr<dtype>(), x_w.data_ptr<dtype>(), x_k.data_ptr<dtype>(), x_v.data_ptr<dtype>(), x_a.data_ptr<dtype>(), x_g.data_ptr<dtype>(),
+        out_r.data_ptr<dtype>(), out_w.data_ptr<dtype>(), out_k.data_ptr<dtype>(), out_v.data_ptr<dtype>(), out_a.data_ptr<dtype>(), out_g.data_ptr<dtype>(),
+        total_pairs);
+  }
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return {out_r, out_w, out_k, out_v, out_a, out_g};
+}
+
+std::vector<at::Tensor> tmix_mix6_t1_c4096_cuda(
+    int B,
+    at::Tensor x,
+    at::Tensor shift_state,
+    at::Tensor x_r,
+    at::Tensor x_w,
+    at::Tensor x_k,
+    at::Tensor x_v,
+    at::Tensor x_a,
+    at::Tensor x_g,
+    int threads,
+    int vec,
+    bool half_math) {
+  if (vec == 2) {
+    return tmix_mix6_t1_c4096_cuda_impl<2>(B, x, shift_state, x_r, x_w, x_k, x_v, x_a, x_g, threads, half_math);
+  }
+  if (vec == 4) {
+    return tmix_mix6_t1_c4096_cuda_impl<4>(B, x, shift_state, x_r, x_w, x_k, x_v, x_a, x_g, threads, half_math);
+  }
+  if (vec == 8) {
+    return tmix_mix6_t1_c4096_cuda_impl<8>(B, x, shift_state, x_r, x_w, x_k, x_v, x_a, x_g, threads, half_math);
+  }
+  return tmix_mix6_t1_c4096_cuda_impl<1>(B, x, shift_state, x_r, x_w, x_k, x_v, x_a, x_g, threads, half_math);
+}
+
 std::vector<at::Tensor> tmix_kk_a_gate_cuda(
     int B,
     int T,
@@ -780,26 +1031,29 @@ std::vector<at::Tensor> tmix_kk_a_gate_cuda(
     at::Tensor k_k,
     at::Tensor a0,
     at::Tensor a12,
-    at::Tensor k_a) {
+    at::Tensor k_a,
+    at::Tensor x,
+    at::Tensor shift_state,
+    bool update_shift) {
   (void)C;
   assert(C == H * HEAD_SIZE);
   auto new_k = at::empty_like(k);
   auto neg_kk = at::empty_like(k);
   auto kka = at::empty_like(k);
   const int64_t bth_size = static_cast<int64_t>(B) * T * H;
-  const int blocks = static_cast<int>(ceil_div(bth_size, static_cast<int64_t>(WARPS_PER_BLOCK)));
   auto stream = at::cuda::getCurrentCUDAStream();
-  tmix_kk_a_gate_kernel<<<blocks, WARPS_PER_BLOCK * 32, 0, stream>>>(
-      H,
-      k.data_ptr<dtype>(),
-      k_k.data_ptr<dtype>(),
-      a0.data_ptr<dtype>(),
-      a12.data_ptr<dtype>(),
-      k_a.data_ptr<dtype>(),
-      new_k.data_ptr<dtype>(),
-      neg_kk.data_ptr<dtype>(),
-      kka.data_ptr<dtype>(),
-      bth_size);
+  const int blocks = static_cast<int>(ceil_div(bth_size, static_cast<int64_t>(WARPS_PER_BLOCK)));
+  if (update_shift) {
+    tmix_kk_a_gate_kernel<true><<<blocks, WARPS_PER_BLOCK * 32, 0, stream>>>(
+        H, k.data_ptr<dtype>(), k_k.data_ptr<dtype>(), a0.data_ptr<dtype>(), a12.data_ptr<dtype>(),
+        k_a.data_ptr<dtype>(), x.data_ptr<dtype>(), shift_state.data_ptr<dtype>(),
+        new_k.data_ptr<dtype>(), neg_kk.data_ptr<dtype>(), kka.data_ptr<dtype>(), bth_size);
+  } else {
+    tmix_kk_a_gate_kernel<false><<<blocks, WARPS_PER_BLOCK * 32, 0, stream>>>(
+        H, k.data_ptr<dtype>(), k_k.data_ptr<dtype>(), a0.data_ptr<dtype>(), a12.data_ptr<dtype>(),
+        k_a.data_ptr<dtype>(), nullptr, nullptr,
+        new_k.data_ptr<dtype>(), neg_kk.data_ptr<dtype>(), kka.data_ptr<dtype>(), bth_size);
+  }
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return {new_k, neg_kk, kka};
 }
@@ -1011,6 +1265,28 @@ at::Tensor cmix_sparse_down_relu_rows_cuda(
   return out;
 }
 
+at::Tensor cmix_sparse_down_relu_rows_t512_cuda(
+    int B,
+    int T,
+    int C,
+    int F,
+    at::Tensor preact,
+    at::Tensor value_fc) {
+  const int rows = B * T;
+  auto out = at::empty({B, T, C}, preact.options());
+  auto stream = at::cuda::getCurrentCUDAStream();
+  const int64_t out_vec4 = static_cast<int64_t>(rows) * (C / 8);
+  zero_vec4_kernel<<<static_cast<int>(ceil_div(out_vec4, 128)), 128, 0, stream>>>(out.data_ptr<dtype>(), out_vec4);
+  cmix_sparse_spmv_relu_rows_t512_kernel<<<dim3(F / 512, C / 512, rows), 256, 0, stream>>>(
+      C,
+      F,
+      preact.data_ptr<dtype>(),
+      value_fc.data_ptr<dtype>(),
+      out.data_ptr<dtype>());
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return out;
+}
+
 at::Tensor cmix_mix_cuda(
     int B,
     int T,
@@ -1020,6 +1296,29 @@ at::Tensor cmix_mix_cuda(
     at::Tensor x_k) {
   auto out = at::empty_like(x);
   constexpr int threads = 256;
+  const int64_t total_pairs = static_cast<int64_t>(B) * T * (C / 2);
+  auto stream = at::cuda::getCurrentCUDAStream();
+  cmix_mix_kernel<<<static_cast<int>(ceil_div(total_pairs, threads)), threads, 0, stream>>>(
+      T,
+      C,
+      x.data_ptr<dtype>(),
+      shift_state.data_ptr<dtype>(),
+      x_k.data_ptr<dtype>(),
+      out.data_ptr<dtype>(),
+      total_pairs);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return out;
+}
+
+at::Tensor cmix_mix_cfg_cuda(
+    int B,
+    int T,
+    int C,
+    at::Tensor x,
+    at::Tensor shift_state,
+    at::Tensor x_k,
+    int threads) {
+  auto out = at::empty_like(x);
   const int64_t total_pairs = static_cast<int64_t>(B) * T * (C / 2);
   auto stream = at::cuda::getCurrentCUDAStream();
   cmix_mix_kernel<<<static_cast<int>(ceil_div(total_pairs, threads)), threads, 0, stream>>>(
