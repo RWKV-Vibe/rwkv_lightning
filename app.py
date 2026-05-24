@@ -32,9 +32,9 @@ def parse_args():
         help="Comma-separated pipeline-parallel CUDA devices, e.g. 0,1. Empty disables PP.",
     )
     parser.add_argument(
-        "--no-cuda-graph",
+        "--enable-cuda-graph",
         action="store_true",
-        help="Disable adapter decode CUDA Graph.",
+        help="Enable adapter decode CUDA Graph.",
     )
     return parser.parse_args()
 
@@ -46,7 +46,7 @@ def main():
         wkv_mode=args_cli.wkv,
         emb_device=args_cli.emb,
         pp_devices=args_cli.pp_devices,
-        use_cuda_graph=not args_cli.no_cuda_graph,
+        use_cuda_graph=args_cli.enable_cuda_graph,
     )
     engine = InferenceEngine(model=model, tokenizer=tokenizer, args=args, rocm_flag=rocm_flag)
     app = create_app(engine, password=args_cli.password)

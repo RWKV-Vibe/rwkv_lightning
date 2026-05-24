@@ -413,7 +413,7 @@ class InferenceEngine:
         for i in range(batch_size):
             generated_text[i] += self._flush_stop_state(stop_states[i], final=True)
             decoded.append(generated_text[i])
-        torch.cuda.empty_cache()
+        self._cleanup_cuda_memory()
         return decoded
 
     async def batch_infer_stream(
@@ -524,8 +524,7 @@ class InferenceEngine:
                     yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
         finally:
             del state
-            torch.cuda.empty_cache()
-            gc.collect()
+            self._cleanup_cuda_memory()
 
         yield "data: [DONE]\n\n"
 
@@ -584,8 +583,7 @@ class InferenceEngine:
             return generated_text, finish_reason
         finally:
             del state
-            torch.cuda.empty_cache()
-            gc.collect()
+            self._cleanup_cuda_memory()
 
     async def singe_infer_stream(
         self,
@@ -677,8 +675,7 @@ class InferenceEngine:
             yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
         finally:
             del state
-            torch.cuda.empty_cache()
-            gc.collect()
+            self._cleanup_cuda_memory()
 
         yield "data: [DONE]\n\n"
 
@@ -782,8 +779,7 @@ class InferenceEngine:
                 )
 
             del state
-            torch.cuda.empty_cache()
-            gc.collect()
+            self._cleanup_cuda_memory()
 
         yield "data: [DONE]\n\n"
 
@@ -840,7 +836,7 @@ class InferenceEngine:
         decoded = [generated_text]
 
         gc.collect()
-        torch.cuda.empty_cache()
+        self._cleanup_cuda_memory()
         return decoded
 
     def _continuous_batching_stream_sync(
@@ -985,8 +981,7 @@ class InferenceEngine:
             del states
             del occurrence
             del alpha_presence_vector
-            gc.collect()
-            torch.cuda.empty_cache()
+            self._cleanup_cuda_memory()
             output_queue.put("EOF")
 
     def _continuous_batching_sync(
@@ -1090,8 +1085,7 @@ class InferenceEngine:
             del states
             del occurrence
             del alpha_presence_vector
-            gc.collect()
-            torch.cuda.empty_cache()
+            self._cleanup_cuda_memory()
 
         return ["".join(parts) for parts in result_parts]
 

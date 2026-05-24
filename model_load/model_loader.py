@@ -11,7 +11,7 @@ def load_model_and_tokenizer(
     wkv_mode: str = "fp16",
     emb_device: str = "cpu",
     pp_devices=None,
-    use_cuda_graph: bool = True,
+    use_cuda_graph: bool = False,
 ):
     rocm_flag = torch.version.hip is not None
 
