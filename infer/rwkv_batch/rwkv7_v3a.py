@@ -129,10 +129,6 @@ class _DecodeGraph:
     x: torch.Tensor
     output: torch.Tensor
     graph: torch.cuda.CUDAGraph | None = None
-    stage_inputs: list[torch.Tensor] | None = None
-    stage_vfirst: list[torch.Tensor | None] | None = None
-    stage_outputs: list[tuple[torch.Tensor, torch.Tensor | None, bool]] | None = None
-    stage_graphs: list[torch.cuda.CUDAGraph] | None = None
 
 
 class RWKV_x070:
@@ -178,6 +174,11 @@ class RWKV_x070:
             use_cuda_graph = bool(getattr(args, "USE_CUDA_GRAPH", True))
         self.use_cuda_graph = use_cuda_graph
         self.decode_graphs: dict[int, _DecodeGraph] = {}
+        if self.use_cuda_graph and len(self.pp_devices) > 1:
+            print(
+                "[rwkv7_v3a] PP decode runs in eager mode; single-GPU decode graph remains enabled.",
+                flush=True,
+            )
 
         v3a.MODEL_PATH = model_path
         v3a.WKV_MODE = self.wkv_mode
@@ -356,6 +357,7 @@ class RWKV_x070:
     def _can_use_decode_graph(self, tokens, state, full_output: bool) -> bool:
         return (
             self.use_cuda_graph
+            and not v3a.pp_enabled()
             and not full_output
             and torch.cuda.is_available()
             and isinstance(tokens, torch.Tensor)
@@ -367,6 +369,7 @@ class RWKV_x070:
     def _can_use_x_decode_graph(self, x, state, full_output: bool) -> bool:
         return (
             self.use_cuda_graph
+            and not v3a.pp_enabled()
             and not full_output
             and torch.cuda.is_available()
             and isinstance(x, torch.Tensor)
@@ -384,10 +387,7 @@ class RWKV_x070:
         graph = self._get_decode_graph(bsz)
         _copy_state(graph.state, state)
         graph.x.copy_(x.to(graph.x.device), non_blocking=True)
-        if graph.graph is not None:
-            graph.graph.replay()
-        else:
-            self._replay_pp_decode_graph(graph)
+        graph.graph.replay()
         _copy_state(state, graph.state)
         return graph.output
 
@@ -395,10 +395,7 @@ class RWKV_x070:
         cached = self.decode_graphs.get(bsz)
         if cached is not None:
             return cached
-        if v3a.pp_enabled():
-            cached = self._build_pp_decode_graph(bsz)
-        else:
-            cached = self._build_single_gpu_decode_graph(bsz)
+        cached = self._build_single_gpu_decode_graph(bsz)
         self.decode_graphs[bsz] = cached
         return cached
 
@@ -416,97 +413,6 @@ class RWKV_x070:
             output = self.inner.forward_from_x(x, state, path)
         v3a.sync_all()
         return _DecodeGraph(state=state, x=x, output=output, graph=graph)
-
-    def _build_pp_decode_graph(self, bsz: int) -> _DecodeGraph:
-        state = self.inner.zero_state(bsz)
-        path = v3a.select_path(bsz, 1)
-        x = torch.empty((bsz, 1, v3a.C), dtype=v3a.DTYPE, device=v3a.first_device())
-        segments = v3a.pp_segments()
-        stage_inputs = []
-        stage_vfirst = []
-        stage_outputs = []
-        stage_graphs = []
-        v_first_out = None
-        prev = x
-
-        for stage, (start, end) in enumerate(segments):
-            dev = v3a.layer_device(start)
-            with torch.cuda.device(dev):
-                inp = torch.empty((bsz, 1, v3a.C), dtype=v3a.DTYPE, device=dev)
-                inp.copy_(prev.to(dev), non_blocking=True)
-                vin = None
-                if start > 0:
-                    vin = torch.empty((bsz, 1, v3a.C), dtype=v3a.DTYPE, device=dev)
-                    vin.copy_(v_first_out.to(dev), non_blocking=True)
-
-                stream = torch.cuda.Stream(device=dev)
-                stream.wait_stream(torch.cuda.current_stream(dev))
-                with torch.cuda.stream(stream):
-                    warm_out, warm_vf = self.inner.forward_pp_segment(
-                        inp, state, path, start, end, vin
-                    )
-                    if end == v3a.L:
-                        self.inner.forward_pp_tail(warm_out, state, 1, advance=False)
-                torch.cuda.current_stream(dev).wait_stream(stream)
-
-                graph = torch.cuda.CUDAGraph()
-                with torch.cuda.graph(graph, stream=stream):
-                    seg_out, vf = self.inner.forward_pp_segment(
-                        inp, state, path, start, end, vin
-                    )
-                    out = (
-                        self.inner.forward_pp_tail(seg_out, state, 1, advance=False)
-                        if end == v3a.L
-                        else seg_out
-                    )
-
-                stage_inputs.append(inp)
-                stage_vfirst.append(vin)
-                stage_outputs.append((out, vf, end == v3a.L))
-                stage_graphs.append(graph)
-                prev = seg_out
-                if vf is not None:
-                    v_first_out = vf
-
-        v3a.sync_all()
-        output = stage_outputs[-1][0]
-        return _DecodeGraph(
-            state=state,
-            x=x,
-            output=output,
-            stage_inputs=stage_inputs,
-            stage_vfirst=stage_vfirst,
-            stage_outputs=stage_outputs,
-            stage_graphs=stage_graphs,
-        )
-
-    def _replay_pp_decode_graph(self, graph: _DecodeGraph) -> None:
-        assert graph.stage_inputs is not None
-        assert graph.stage_outputs is not None
-        assert graph.stage_graphs is not None
-        assert graph.stage_vfirst is not None
-
-        segments = v3a.pp_segments()
-        with torch.cuda.device(v3a.layer_device(segments[0][0])):
-            graph.stage_inputs[0].copy_(graph.x, non_blocking=True)
-
-        v_first_out = None
-        for stage, stage_graph in enumerate(graph.stage_graphs):
-            dev = v3a.layer_device(segments[stage][0])
-            with torch.cuda.device(dev):
-                stage_graph.replay()
-            out, vf, final_stage = graph.stage_outputs[stage]
-            if vf is not None:
-                v_first_out = vf
-            if not final_stage:
-                next_start = segments[stage + 1][0]
-                next_dev = v3a.layer_device(next_start)
-                with torch.cuda.device(next_dev):
-                    graph.stage_inputs[stage + 1].copy_(out, non_blocking=True)
-                    next_vfirst = graph.stage_vfirst[stage + 1]
-                    if next_vfirst is not None:
-                        next_vfirst.copy_(v_first_out, non_blocking=True)
-        self.inner.advance_pp_elapsed(graph.state, 1)
 
 
 RWKV7 = RWKV_x070

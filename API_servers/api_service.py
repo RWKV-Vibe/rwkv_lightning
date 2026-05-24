@@ -551,7 +551,7 @@ def create_app(engine, password=None):
                 headers=cors_headers,
             )
 
-        results = engine.batch_generate_state(
+        results = engine.batch_infer_state(
             prompts=prompts,
             state=state,
             max_length=req.max_tokens,
@@ -706,7 +706,7 @@ def create_app(engine, password=None):
                 headers=cors_headers,
             )
 
-        results = engine.batch_generate_state(
+        results = engine.batch_infer_state(
             prompts=prompts,
             state=state,
             max_length=req.max_tokens,

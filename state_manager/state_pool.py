@@ -21,6 +21,14 @@ PREFIX_CACHE_BUCKET_CAPACITY = 16
 PREFIX_HASH_COLUMNS = tuple(f"prefix_hash_{bucket}" for bucket in PREFIX_CACHE_BUCKETS)
 
 
+def _normalize_device(device: str | torch.device) -> torch.device:
+    return device if isinstance(device, torch.device) else torch.device(device)
+
+
+def _is_cuda_device(device: str | torch.device) -> bool:
+    return _normalize_device(device).type == "cuda"
+
+
 def _serialize_token_ids(tokens: List[int] | Tuple[int, ...]) -> str:
     return " ".join(str(token) for token in tokens)
 
@@ -235,12 +243,16 @@ class StateCacheManager:
     def _clone_to_device_item(self, item, device: str):
         if isinstance(item, list):
             return [self._clone_to_device_item(x, device) for x in item]
-        return item.detach().to(device, non_blocking=device == "cuda").clone()
+        target_device = _normalize_device(device)
+        return item.detach().to(
+            target_device, non_blocking=_is_cuda_device(target_device)
+        ).clone()
 
     def _move_to_device_item(self, item, device: str):
         if isinstance(item, list):
             return [self._move_to_device_item(x, device) for x in item]
-        return item.to(device, non_blocking=device == "cuda")
+        target_device = _normalize_device(device)
+        return item.to(target_device, non_blocking=_is_cuda_device(target_device))
 
     def _state_token_pos(self, state) -> object:
         if len(state) <= 2:
@@ -254,10 +266,13 @@ class StateCacheManager:
     def _is_pp_state(state) -> bool:
         return isinstance(state, list) and bool(state) and isinstance(state[0], list)
 
-    def _restore_device_for_state(self, state, requested_device: str) -> str:
-        if requested_device == "cuda" and self._is_pp_state(state):
-            return "cpu"
-        return requested_device
+    def _restore_device_for_state(
+        self, state, requested_device: str | torch.device
+    ) -> str | torch.device:
+        target_device = _normalize_device(requested_device)
+        if target_device.type == "cuda" and self._is_pp_state(state):
+            return torch.device("cpu")
+        return target_device
 
     def _clone_state(self, state: List[torch.Tensor]) -> List[torch.Tensor]:
         """深拷贝状态，避免多线程共享导致污染"""
@@ -270,10 +285,15 @@ class StateCacheManager:
         target_device = self._restore_device_for_state(state, device)
         return [self._clone_to_device_item(t, target_device) for t in state]
 
-    def _clone_optional_tensor(self, tensor: Optional[torch.Tensor], device: str) -> Optional[torch.Tensor]:
+    def _clone_optional_tensor(
+        self, tensor: Optional[torch.Tensor], device: str | torch.device
+    ) -> Optional[torch.Tensor]:
         if tensor is None:
             return None
-        return tensor.detach().to(device, non_blocking=device == "cuda").clone()
+        target_device = _normalize_device(device)
+        return tensor.detach().to(
+            target_device, non_blocking=_is_cuda_device(target_device)
+        ).clone()
 
     def _persist_task(self, session_id: str, state_cpu: List[torch.Tensor]):
         """异步任务：序列化并写入数据库"""
