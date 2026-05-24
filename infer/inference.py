@@ -188,20 +188,26 @@ class InferenceEngine:
         gc.collect()
         torch.cuda.empty_cache()
 
+    def _sync_cuda_devices(self):
+        if not torch.cuda.is_available():
+            return
+        sync_devices = getattr(self.model, "sync_devices", None)
+        if callable(sync_devices):
+            sync_devices()
+            return
+        torch.cuda.synchronize()
+
     def _cleanup_cuda_memory(self):
-        gc.collect()
+        self._sync_cuda_devices()
         clear_decode_graphs = getattr(self.model, "clear_decode_graphs", None)
         if callable(clear_decode_graphs):
             try:
                 clear_decode_graphs()
             except Exception:
                 pass
+        gc.collect()
         if not torch.cuda.is_available():
             return
-        try:
-            torch.cuda.synchronize()
-        except Exception:
-            pass
         torch.cuda.empty_cache()
 
     @staticmethod
@@ -361,60 +367,80 @@ class InferenceEngine:
         stop_tokens=("\nUser:",),
     ):
         batch_size = len(prompts)
-        state = self.model.generate_zero_state(batch_size)
-        encoded_prompts = [self.tokenizer.encode(p) for p in prompts]
-        out = self.model.forward_batch(encoded_prompts, state).float()
+        state = None
+        encoded_prompts = None
+        out = None
+        sample_rand_states = None
+        penalties = None
 
-        finished = [False] * batch_size
-        stop_states = [self._create_stop_state(stop_tokens) for _ in range(batch_size)]
-        generated_text = [""] * batch_size
-        sample_rand_states = self._setup_sample_rand_states(batch_size, out.device)
-        penalties = torch.zeros(batch_size, self.args.vocab_size, device=out.device)
+        try:
+            state = self.model.generate_zero_state(batch_size)
+            encoded_prompts = [self.tokenizer.encode(p) for p in prompts]
+            out = self.model.forward_batch(encoded_prompts, state).float()
 
-        for _ in range(max_length):
-            new_tokens = self._sample_repetition_temperature_topk_topp(
-                out,
-                penalties,
-                sample_rand_states,
-                alpha_presence,
-                alpha_frequency,
-                alpha_decay,
-                temperature,
-                top_k,
-                top_p,
-            ).tolist()
-            new_tokens = [[token] for token in new_tokens]
-            out = self.model.forward_batch(new_tokens, state).float()
+            finished = [False] * batch_size
+            stop_states = [self._create_stop_state(stop_tokens) for _ in range(batch_size)]
+            generated_text = [""] * batch_size
+            sample_rand_states = self._setup_sample_rand_states(batch_size, out.device)
+            penalties = torch.zeros(
+                batch_size, self.args.vocab_size, device=out.device
+            )
 
+            for _ in range(max_length):
+                new_tokens = self._sample_repetition_temperature_topk_topp(
+                    out,
+                    penalties,
+                    sample_rand_states,
+                    alpha_presence,
+                    alpha_frequency,
+                    alpha_decay,
+                    temperature,
+                    top_k,
+                    top_p,
+                ).tolist()
+                new_tokens = [[token] for token in new_tokens]
+                out = self.model.forward_batch(new_tokens, state).float()
+
+                for i in range(batch_size):
+                    tok = (
+                        new_tokens[i][0]
+                        if isinstance(new_tokens[i], list)
+                        else new_tokens[i]
+                    )
+                    if finished[i]:
+                        continue
+
+                    content, should_stop = self._ingest_token_with_stop(stop_states[i], tok)
+                    if content:
+                        generated_text[i] += content
+
+                    if should_stop:
+                        finished[i] = True
+                        continue
+
+                if all(finished):
+                    break
+
+            decoded = []
             for i in range(batch_size):
-                tok = (
-                    new_tokens[i][0]
-                    if isinstance(new_tokens[i], list)
-                    else new_tokens[i]
-                )
-                if finished[i]:
-                    continue
-
-                content, should_stop = self._ingest_token_with_stop(stop_states[i], tok)
-                if content:
-                    generated_text[i] += content
-
-                if should_stop:
-                    finished[i] = True
-                    continue
-
-            if all(finished):
-                break
-
-        del state
-        gc.collect()
-
-        decoded = []
-        for i in range(batch_size):
-            generated_text[i] += self._flush_stop_state(stop_states[i], final=True)
-            decoded.append(generated_text[i])
-        self._cleanup_cuda_memory()
-        return decoded
+                generated_text[i] += self._flush_stop_state(stop_states[i], final=True)
+                decoded.append(generated_text[i])
+            return decoded
+        finally:
+            self._sync_cuda_devices()
+            if penalties is not None:
+                del penalties
+            if sample_rand_states is not None:
+                del sample_rand_states
+            if out is not None:
+                del out
+            if encoded_prompts is not None:
+                del encoded_prompts
+            if state is not None:
+                del state
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
     async def batch_infer_stream(
         self,
@@ -430,18 +456,25 @@ class InferenceEngine:
         chunk_size=32,
     ):
         batch_size = len(prompts)
-        state = self.model.generate_zero_state(batch_size)
-        encoded_prompts = [self.tokenizer.encode(p) for p in prompts]
-        out = self.model.forward_batch(encoded_prompts, state).float()
-
-        finished = [False] * batch_size
-        stop_states = [self._create_stop_state(stop_tokens) for _ in range(batch_size)]
-        chunk_token_counts = [0] * batch_size
-        text_buffers = [""] * batch_size
-        sample_rand_states = self._setup_sample_rand_states(batch_size, out.device)
-        penalties = torch.zeros(batch_size, self.args.vocab_size, device=out.device)
-
+        state = None
+        encoded_prompts = None
+        out = None
+        sample_rand_states = None
+        penalties = None
         try:
+            state = self.model.generate_zero_state(batch_size)
+            encoded_prompts = [self.tokenizer.encode(p) for p in prompts]
+            out = self.model.forward_batch(encoded_prompts, state).float()
+
+            finished = [False] * batch_size
+            stop_states = [self._create_stop_state(stop_tokens) for _ in range(batch_size)]
+            chunk_token_counts = [0] * batch_size
+            text_buffers = [""] * batch_size
+            sample_rand_states = self._setup_sample_rand_states(batch_size, out.device)
+            penalties = torch.zeros(
+                batch_size, self.args.vocab_size, device=out.device
+            )
+
             while not all(finished) and max_length > 0:
                 new_tokens = self._sample_repetition_temperature_topk_topp(
                     out,
@@ -523,8 +556,20 @@ class InferenceEngine:
                 if chunk["choices"]:
                     yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
         finally:
-            del state
-            self._cleanup_cuda_memory()
+            self._sync_cuda_devices()
+            if penalties is not None:
+                del penalties
+            if sample_rand_states is not None:
+                del sample_rand_states
+            if out is not None:
+                del out
+            if encoded_prompts is not None:
+                del encoded_prompts
+            if state is not None:
+                del state
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
         yield "data: [DONE]\n\n"
 
@@ -582,6 +627,7 @@ class InferenceEngine:
             generated_text += self._flush_stop_state(stop_state, final=True)
             return generated_text, finish_reason
         finally:
+            self._sync_cuda_devices()
             del state
             self._cleanup_cuda_memory()
 
@@ -674,6 +720,7 @@ class InferenceEngine:
             }
             yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
         finally:
+            self._sync_cuda_devices()
             del state
             self._cleanup_cuda_memory()
 
@@ -778,6 +825,7 @@ class InferenceEngine:
                     "\n",
                 )
 
+            self._sync_cuda_devices()
             del state
             self._cleanup_cuda_memory()
 
@@ -835,6 +883,8 @@ class InferenceEngine:
         generated_text += self._flush_stop_state(stop_state, final=True)
         decoded = [generated_text]
 
+        self._sync_cuda_devices()
+        del state
         gc.collect()
         self._cleanup_cuda_memory()
         return decoded
@@ -978,6 +1028,7 @@ class InferenceEngine:
                     )
 
         finally:
+            self._sync_cuda_devices()
             del states
             del occurrence
             del alpha_presence_vector
@@ -1082,6 +1133,7 @@ class InferenceEngine:
                     )
 
         finally:
+            self._sync_cuda_devices()
             del states
             del occurrence
             del alpha_presence_vector
@@ -1265,6 +1317,7 @@ class InferenceEngine:
                     new_tokens = None
 
         finally:
+            self._sync_cuda_devices()
             if new_tokens_tensor is not None:
                 del new_tokens_tensor
             if out is not None:

@@ -328,14 +328,19 @@ class RWKV_x070:
         token_rows = [[int(x)] if isinstance(x, int) else list(x) for x in tokens]
         lengths = [len(x) for x in token_rows]
         pos = [0] * bsz
+        output_device = v3a.last_device()
 
         if full_output:
             out = [
-                torch.empty((0, self.args.vocab_size), dtype=v3a.DTYPE, device="cuda")
+                torch.empty(
+                    (0, self.args.vocab_size), dtype=v3a.DTYPE, device=output_device
+                )
                 for _ in range(bsz)
             ]
         else:
-            out = torch.empty((bsz, self.args.vocab_size), dtype=v3a.DTYPE, device="cuda")
+            out = torch.empty(
+                (bsz, self.args.vocab_size), dtype=v3a.DTYPE, device=output_device
+            )
 
         while True:
             active = [i for i in range(bsz) if pos[i] < lengths[i]]
@@ -345,6 +350,8 @@ class RWKV_x070:
             batch_tokens = [token_rows[i][pos[i] : pos[i] + step] for i in active]
             batch_state = _slice_state_rows(state, active)
             new_out = self.forward_batch_same_length(batch_tokens, batch_state, full_output)
+            if v3a.pp_enabled():
+                v3a.sync_all()
             for row, original in enumerate(active):
                 if full_output:
                     out[original] = torch.cat([out[original], new_out[row]], dim=0)
@@ -352,6 +359,8 @@ class RWKV_x070:
                     out[original] = new_out[row]
                 pos[original] += step
             _copy_state_rows_back(state, active, batch_state)
+            if v3a.pp_enabled():
+                v3a.sync_all()
         return out
 
     def _can_use_decode_graph(self, tokens, state, full_output: bool) -> bool:
@@ -424,6 +433,9 @@ class RWKV_x070:
             del graph.state
             del graph.graph
         self.decode_graphs.clear()
+
+    def sync_devices(self) -> None:
+        v3a.sync_all()
 
 
 RWKV7 = RWKV_x070
