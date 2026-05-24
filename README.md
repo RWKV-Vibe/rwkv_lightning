@@ -14,18 +14,13 @@ pip install robyn pydantic ninja numpy
 
 **No problem! This could work too. It's not that it can't be used 🫣**
 ```bash
-pip install torch torchvision --index-url https://download.pytorch.org/whl/rocm6.4
+pip install torch torchvision --index-url https://download.pytorch.org/whl/rocm7.2
 pip install robyn pydantic ninja numpy 
 ```
 
 ## Usage
 ```bash
-export EMB_DEVICE=gpu # Offload embedding to GPU
-python app.py --model-path <your model path> --port <your port number> --password rwkv7_7.2b
-```
-```bash
-export EMB_DEVICE=cpu # Offload embedding to CPU to save GPU memory
-python app.py --model-path <your model path> --port <your port number> --password rwkv7_7.2b
+python app.py --model-path <your model path> --port <your port number> --wkv <fp16/fp32> --pp-devices <1,2,3,4> --emb <cpu/gpu>
 ```
 - if no password, you can do not add ```--password``` flag
 
@@ -82,7 +77,7 @@ ___
 <summary><strong><em>curl examples</em></strong></summary>
 
 **--- Very stable 🚀 ---** 
-- Streaming synchronous batch processing 
+- Streaming synchronous batch processing with CUDA rapid sampling
 ```bash
 curl -X POST http://localhost:8000/v1/chat/completions \
   -H "Content-Type: application/json" \
@@ -103,7 +98,7 @@ curl -X POST http://localhost:8000/v1/chat/completions \
     "password": "rwkv7_7.2b"
   }'
 ```
-- Non-streaming synchronous batch processing
+- Non-streaming synchronous batch processing with CUDA rapid sampling
 ```bash
 curl -X POST http://localhost:8000/v1/chat/completions \
   -H "Content-Type: application/json" \
@@ -134,7 +129,7 @@ ___
 <summary><strong><em>curl examples</em></strong></summary>
 
 **--- Very stable 🚀 ---** 
-- Streaming synchronous continuous batching processing 
+- Streaming synchronous batching processing with Flashinfer/Torch sampler
 ```bash
 curl -X POST http://localhost:8000/v2/chat/completions \
   -H "Content-Type: application/json" \
@@ -158,7 +153,7 @@ curl -X POST http://localhost:8000/v2/chat/completions \
     "password": "rwkv7_7.2b"
   }'
 ```
-- Non-streaming synchronous continuous batching processing
+- Non-streaming synchronous batching processing with Flashinfer/Torch sampler
 ```bash
 curl -X POST http://localhost:8000/v2/chat/completions \
   -H "Content-Type: application/json" \
