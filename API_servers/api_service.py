@@ -940,11 +940,12 @@ def create_app(engine, password=None):
                     yield chunk
             finally:
                 try:
-                    await stream.aclose()
-                finally:
                     _set_big_batch_generating(False)
                     big_batch_cancel_event.clear()
-                    big_batch_request_lock.release()
+                    if big_batch_request_lock.locked():
+                        big_batch_request_lock.release()
+                finally:
+                    await stream.aclose()
 
         return StreamingResponse(
             stream_big_batch(),
