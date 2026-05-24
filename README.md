@@ -23,7 +23,7 @@ pip install robyn pydantic ninja numpy
 python app.py --model-path <your model path> --port <your port number> --wkv <fp16/fp32> --pp-devices <1,2,3,4> --emb <cpu/gpu>
 ```
 - if no password, you can do not add ```--password``` flag
-
+- if want to disable the cuda graph, you can add ```--no-cuda-graph``` flag
 
 ## Test API quickly
 ```bash

@@ -200,6 +200,10 @@ class InferenceEngine:
         torch.cuda.empty_cache()
 
     @staticmethod
+    def _should_continue_generation(cancel_event=None) -> bool:
+        return cancel_event is None or not cancel_event.is_set()
+
+    @staticmethod
     def _torch_top_k_top_p(logits, top_k, top_p):
         if top_k > 0:
             top_k = min(top_k, logits.size(-1))
@@ -1208,6 +1212,8 @@ class InferenceEngine:
             with torch.inference_mode():
                 state = self.model.generate_zero_state(batch_size)
                 encoded_prompts = [self.tokenizer.encode(p) for p in prompts]
+                if not self._should_continue_generation(cancel_event):
+                    return
                 out = self.model.forward_batch(encoded_prompts, state)
 
                 finished = [False] * batch_size
@@ -1219,7 +1225,7 @@ class InferenceEngine:
                 cleanup_interval = 100
 
                 while not all(finished) and max_length > 0:
-                    if cancel_event is not None and cancel_event.is_set():
+                    if not self._should_continue_generation(cancel_event):
                         break
 
                     new_tokens_tensor = sampler_gumbel_batch(
@@ -1229,9 +1235,15 @@ class InferenceEngine:
                     del new_tokens_tensor
                     new_tokens_tensor = None
 
+                    if not self._should_continue_generation(cancel_event):
+                        break
+
                     prev_out = out
                     out = self.model.forward_batch(new_tokens, state)
                     del prev_out
+
+                    if not self._should_continue_generation(cancel_event):
+                        break
 
                     max_length -= 1
                     step_count += 1
