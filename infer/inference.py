@@ -268,12 +268,13 @@ class InferenceEngine:
         alpha_frequency,
         alpha_decay,
     ):
-        if alpha_presence != 0 or alpha_frequency != 0:
-            mask = (occurrence > 0).float()
-            logits -= mask * alpha_presence + occurrence * alpha_frequency
+        if alpha_decay != 1.0:
+            occurrence.mul_(alpha_decay)
 
-        occurrence *= alpha_decay
-        logits -= alpha_presence_vector + occurrence * alpha_frequency
+        if alpha_presence != 0:
+            logits -= alpha_presence_vector
+        if alpha_frequency != 0:
+            logits -= occurrence * alpha_frequency
         return logits
 
     @staticmethod
@@ -362,12 +363,10 @@ class InferenceEngine:
         finished = [False] * batch_size
         stop_states = [self._create_stop_state(stop_tokens) for _ in range(batch_size)]
         generated_text = [""] * batch_size
+        sample_rand_states = self._setup_sample_rand_states(batch_size, out.device)
+        penalties = torch.zeros(batch_size, self.args.vocab_size, device=out.device)
 
         for _ in range(max_length):
-            sample_rand_states = self._setup_sample_rand_states(batch_size, out.device)
-            penalties = torch.zeros(
-                batch_size, self.args.vocab_size, device=out.device
-            )
             new_tokens = self._sample_repetition_temperature_topk_topp(
                 out,
                 penalties,
@@ -434,15 +433,11 @@ class InferenceEngine:
         stop_states = [self._create_stop_state(stop_tokens) for _ in range(batch_size)]
         chunk_token_counts = [0] * batch_size
         text_buffers = [""] * batch_size
+        sample_rand_states = self._setup_sample_rand_states(batch_size, out.device)
+        penalties = torch.zeros(batch_size, self.args.vocab_size, device=out.device)
 
         try:
             while not all(finished) and max_length > 0:
-                sample_rand_states = self._setup_sample_rand_states(
-                    batch_size, out.device
-                )
-                penalties = torch.zeros(
-                    batch_size, self.args.vocab_size, device=out.device
-                )
                 new_tokens = self._sample_repetition_temperature_topk_topp(
                     out,
                     penalties,
