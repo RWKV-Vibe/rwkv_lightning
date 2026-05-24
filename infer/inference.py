@@ -188,9 +188,14 @@ class InferenceEngine:
         gc.collect()
         torch.cuda.empty_cache()
 
-    @staticmethod
-    def _cleanup_cuda_memory():
+    def _cleanup_cuda_memory(self):
         gc.collect()
+        clear_decode_graphs = getattr(self.model, "clear_decode_graphs", None)
+        if callable(clear_decode_graphs):
+            try:
+                clear_decode_graphs()
+            except Exception:
+                pass
         if not torch.cuda.is_available():
             return
         try:

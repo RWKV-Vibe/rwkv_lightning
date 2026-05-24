@@ -414,5 +414,16 @@ class RWKV_x070:
         v3a.sync_all()
         return _DecodeGraph(state=state, x=x, output=output, graph=graph)
 
+    def clear_decode_graphs(self) -> None:
+        if not self.decode_graphs:
+            return
+
+        for graph in self.decode_graphs.values():
+            del graph.output
+            del graph.x
+            del graph.state
+            del graph.graph
+        self.decode_graphs.clear()
+
 
 RWKV7 = RWKV_x070
