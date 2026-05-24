@@ -118,6 +118,41 @@ class InferenceEngine:
         with torch.cuda.device(target_device):
             return sample.setup_rand(random.randint(0, 2**63 - 1), batch_size)
 
+    @staticmethod
+    def _run_on_tensor_device(tensor: torch.Tensor, fn):
+        device = tensor.device
+        if device.type != "cuda":
+            return fn()
+        with torch.cuda.device(device):
+            return fn()
+
+    def _sample_repetition_temperature_topk_topp(
+        self,
+        logits: torch.Tensor,
+        penalties: torch.Tensor,
+        sample_rand_states: torch.Tensor,
+        alpha_presence,
+        alpha_frequency,
+        alpha_decay,
+        temperature,
+        top_k,
+        top_p,
+    ) -> torch.Tensor:
+        return self._run_on_tensor_device(
+            logits,
+            lambda: sample.batch_sampling_repetition_temperature_topk_topp(
+                logits,
+                penalties,
+                sample_rand_states,
+                alpha_presence,
+                alpha_frequency,
+                alpha_decay,
+                temperature,
+                top_k,
+                top_p,
+            ),
+        )
+
     def _sample_next_token(
         self,
         static_output,
@@ -134,7 +169,7 @@ class InferenceEngine:
         penalties = torch.zeros(
             1, self.args.vocab_size, device=logits_reshaped.device
         )
-        new_tokens = sample.batch_sampling_repetition_temperature_topk_topp(
+        new_tokens = self._sample_repetition_temperature_topk_topp(
             logits_reshaped,
             penalties,
             sample_rand_states,
@@ -211,8 +246,11 @@ class InferenceEngine:
         try:
             import flashinfer  # type: ignore
 
-            return flashinfer.sampling.top_k_top_p_sampling_from_logits(
-                sample_logits, effective_top_k, top_p
+            return self._run_on_tensor_device(
+                sample_logits,
+                lambda: flashinfer.sampling.top_k_top_p_sampling_from_logits(
+                    sample_logits, effective_top_k, top_p
+                ),
             )
         except Exception:
             return self._torch_top_k_top_p(sample_logits, effective_top_k, top_p)
@@ -326,7 +364,7 @@ class InferenceEngine:
             penalties = torch.zeros(
                 batch_size, self.args.vocab_size, device=out.device
             )
-            new_tokens = sample.batch_sampling_repetition_temperature_topk_topp(
+            new_tokens = self._sample_repetition_temperature_topk_topp(
                 out,
                 penalties,
                 sample_rand_states,
@@ -401,7 +439,7 @@ class InferenceEngine:
                 penalties = torch.zeros(
                     batch_size, self.args.vocab_size, device=out.device
                 )
-                new_tokens = sample.batch_sampling_repetition_temperature_topk_topp(
+                new_tokens = self._sample_repetition_temperature_topk_topp(
                     out,
                     penalties,
                     sample_rand_states,
@@ -514,7 +552,7 @@ class InferenceEngine:
             while max_length > 0:
                 max_length -= 1
                 logits_reshaped = out.unsqueeze(0) if out.dim() == 1 else out
-                new_tokens = sample.batch_sampling_repetition_temperature_topk_topp(
+                new_tokens = self._sample_repetition_temperature_topk_topp(
                     logits_reshaped,
                     penalties,
                     sample_rand_states,
@@ -574,7 +612,7 @@ class InferenceEngine:
             while max_length > 0:
                 max_length -= 1
                 logits_reshaped = out.unsqueeze(0) if out.dim() == 1 else out
-                new_tokens = sample.batch_sampling_repetition_temperature_topk_topp(
+                new_tokens = self._sample_repetition_temperature_topk_topp(
                     logits_reshaped,
                     penalties,
                     sample_rand_states,
@@ -675,7 +713,7 @@ class InferenceEngine:
                 if out.dim() == 1:
                     out = out.unsqueeze(0)
 
-                new_tokens = sample.batch_sampling_repetition_temperature_topk_topp(
+                new_tokens = self._sample_repetition_temperature_topk_topp(
                     out,
                     penalties,
                     sample_rand_states,
@@ -772,7 +810,7 @@ class InferenceEngine:
             if out.dim() == 1:
                 out = out.unsqueeze(0)
 
-            new_tokens = sample.batch_sampling_repetition_temperature_topk_topp(
+            new_tokens = self._sample_repetition_temperature_topk_topp(
                 out,
                 penalties,
                 sample_rand_states,
