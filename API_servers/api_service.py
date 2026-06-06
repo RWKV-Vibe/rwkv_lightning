@@ -133,7 +133,6 @@ def create_app(engine, password=None):
     @app.options("/")
     @app.options("/v1/models")
     @app.options("/v1/chat/completions")
-    @app.options("/v2/chat/completions")
     @app.options("/translate/v1/batch-translate")
     @app.options("/FIM/v1/batch-FIM")
     @app.options("/state/chat/completions")
@@ -239,99 +238,6 @@ def create_app(engine, password=None):
             headers={"Content-Type": "application/json"},
         )
 
-    @app.post("/v2/chat/completions")
-    async def continuous_batching(request):
-        try:
-            body = json.loads(request.body)
-            req = ChatRequest(**body)
-
-            if password and req.password != password:
-                return Response(
-                    status_code=401,
-                    description=json.dumps(
-                        {"error": "Unauthorized: invalid or missing password"}
-                    ),
-                    headers={"Content-Type": "application/json"},
-                )
-
-            prompts = req.contents
-
-            if not prompts:
-                return Response(
-                    status_code=400,
-                    description=json.dumps({"error": "Empty prompts list"}),
-                    headers={"Content-Type": "application/json"},
-                )
-
-            if req.stream:
-                return StreamingResponse(
-                    engine.continuous_batching_stream(
-                        inputs=prompts,
-                        stop_tokens=req.stop_tokens,
-                        max_generate_tokens=req.max_tokens,
-                        batch_size=len(prompts),
-                        pad_zero=req.pad_zero,
-                        temperature=req.temperature,
-                        top_k=req.top_k,
-                        top_p=req.top_p,
-                        alpha_presence=req.alpha_presence,
-                        alpha_frequency=req.alpha_frequency,
-                        alpha_decay=req.alpha_decay,
-                        chunk_size=req.chunk_size,
-                    ),
-                    media_type="text/event-stream",
-                headers=cors_headers,
-                )
-
-            results = engine.continuous_batching(
-                inputs=prompts,
-                stop_tokens=req.stop_tokens,
-                max_generate_tokens=req.max_tokens,
-                batch_size=len(prompts),
-                pad_zero=req.pad_zero,
-                temperature=req.temperature,
-                top_k=req.top_k,
-                top_p=req.top_p,
-                alpha_presence=req.alpha_presence,
-                alpha_frequency=req.alpha_frequency,
-                alpha_decay=req.alpha_decay,
-            )
-            choices = []
-            for i, text in enumerate(results):
-                choices.append(
-                    {
-                        "index": i,
-                        "message": {"role": "assistant", "content": text},
-                        "finish_reason": "stop",
-                    }
-                )
-
-            response = {
-                "id": "rwkv7-batch",
-                "object": "chat.completion",
-                "model": req.model,
-                "choices": choices,
-            }
-            return Response(
-                status_code=200,
-                description=json.dumps(response, ensure_ascii=False),
-                headers={"Content-Type": "application/json"},
-            )
-        except json.JSONDecodeError as exc:
-            return Response(
-                status_code=400,
-                description=json.dumps({"error": f"Invalid JSON: {str(exc)}"}),
-                headers={"Content-Type": "application/json"},
-            )
-        except Exception as exc:
-            import traceback
-
-            print(f"[ERROR] /v2/chat/completions: {traceback.format_exc()}")
-            return Response(
-                status_code=500,
-                description=json.dumps({"error": str(exc)}),
-                headers={"Content-Type": "application/json"},
-            )
 
     @app.post("/translate/v1/batch-translate")
     async def batch_translate(request):

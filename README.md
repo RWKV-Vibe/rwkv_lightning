@@ -122,65 +122,9 @@ curl -X POST http://localhost:8000/v1/chat/completions \
 
 </details>
 
-___
-### **3. ```v2/chat/completions``` [Support all decode parameters]**
-
-<details>
-<summary><strong><em>curl examples</em></strong></summary>
-
-**--- Very stable 🚀 ---** 
-- Streaming synchronous continuous batching processing 
-```bash
-curl -X POST http://localhost:8000/v2/chat/completions \
-  -H "Content-Type: application/json" \
-  -N \
-  -d '{
-    "contents": [
-      "English: After a blissful two weeks, Jane encounters Rochester in the gardens. He invites her to walk with him, and Jane, caught off guard, accepts. Rochester confides that he has finally decided to marry Blanche Ingram and tells Jane that he knows of an available governess position in Ireland that she could take.\n\nChinese:",
-      "English: That night, a bolt of lightning splits the same chestnut tree under which Rochester and Jane had been sitting that evening.\n\nChinese:"
-    ],
-    "max_tokens": 1024,
-    "stop_tokens": ["\nUser:"],
-    "temperature": 1.0,
-    "top_k": 1,
-    "top_p": 0.3,
-    "pad_zero": true,
-    "alpha_presence": 0.8,
-    "alpha_frequency": 0.8,
-    "alpha_decay": 0.996,
-    "chunk_size": 128,
-    "stream": true,
-    "password": "rwkv7_7.2b"
-  }'
-```
-- Non-streaming synchronous continuous batching processing
-```bash
-curl -X POST http://localhost:8000/v2/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{
-    "contents": [
-      "English: After a blissful two weeks, Jane encounters Rochester in the gardens. He invites her to walk with him, and Jane, caught off guard, accepts. Rochester confides that he has finally decided to marry Blanche Ingram and tells Jane that he knows of an available governess position in Ireland that she could take.\n\nChinese:",
-      "English: That night, a bolt of lightning splits the same chestnut tree under which Rochester and Jane had been sitting that evening.\n\nChinese:"
-    ],
-    "max_tokens": 1024,
-    "stop_tokens": ["\nUser:"],
-    "temperature": 1.0,
-    "top_k": 1,
-    "top_p": 0.3,
-    "pad_zero": true,
-    "alpha_presence": 0.8,
-    "alpha_frequency": 0.8,
-    "alpha_decay": 0.996,
-    "chunk_size": 32,
-    "stream": false,
-    "password": "rwkv7_7.2b"
-  }'
-```
-
-</details>
 
 ___
-### **4. ```state/chat/completions``` [Support state cache manager] 😜**
+### **3. ```state/chat/completions``` [Support state cache manager] 😜**
 
 #### Have 3 Levels Cache design 🤓
 - **L1 cache(VRAM) 16**
@@ -244,7 +188,7 @@ curl -X POST http://localhost:8000/state/chat/completions \
 </details>
 
 ___
-### **5. State Management API [Support state cache manager] 😜**
+### **4. State Management API [Support state cache manager] 😜**
 
 #### Use ```state/status```  Interface to check the state pool status of a session
 
@@ -279,7 +223,7 @@ curl -X POST http://localhost:8000/state/delete \
 </details>
 
 ___
-### **6. ```/openai/v1/chat/completions``` [Open AI format support]**
+### **5. ```/openai/v1/chat/completions``` [Open AI format support]**
 
 <details>
 <summary><strong><em>curl examples</em></strong></summary>
@@ -344,7 +288,7 @@ python test/test_openai_routes.py
 </details>
 
 ___
-### **7. ```/big_batch/completions```  [Only Support noise & temperature decode parameters]**
+### **6. ```/big_batch/completions```  [Only Support noise & temperature decode parameters]**
 
 <details>
 <summary><strong><em>curl examples</em></strong></summary>
@@ -370,7 +314,7 @@ curl -X POST 'http://localhost:8000/big_batch/completions' \
 </details>
 
 ___
-### **8. FIM ( For RWKV7_G1c series model )**
+### **7. FIM ( For RWKV7_G1c series model )**
 
 <details>
 <summary><strong><em>curl examples</em></strong></summary>
