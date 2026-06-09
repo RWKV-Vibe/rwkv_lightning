@@ -1,3 +1,5 @@
+import asyncio
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from threading import Lock
 
@@ -21,6 +23,88 @@ class InferenceEngine(
         self.executor = ThreadPoolExecutor(
             max_workers=128, thread_name_prefix="model_inference"
         )
+        self._prefill_queue = deque()
+        self._prefill_reserved_bsz = 0
+        self._prefill_next_ticket = 0
+        self._prefill_condition = None
+
+    def _get_prefill_condition(self):
+        if self._prefill_condition is None:
+            self._prefill_condition = asyncio.Condition()
+        return self._prefill_condition
+
+    async def acquire_prefill_permit(self, request_bsz: int, request_label: str = ""):
+        request_bsz = max(1, int(request_bsz))
+        condition = self._get_prefill_condition()
+
+        async with condition:
+            ticket = self._prefill_next_ticket
+            self._prefill_next_ticket += 1
+            self._prefill_queue.append(ticket)
+            queued_logged = False
+
+            try:
+                while True:
+                    is_turn = self._prefill_queue and self._prefill_queue[0] == ticket
+                    if is_turn and hasattr(self.model, "refresh_max_prefill_bsz"):
+                        current_limit = self.model.refresh_max_prefill_bsz()
+                    else:
+                        current_limit = getattr(self.model, "max_prefill_bsz", request_bsz)
+                    available_bsz = max(0, int(current_limit) - self._prefill_reserved_bsz)
+
+                    if is_turn and request_bsz <= available_bsz:
+                        self._prefill_reserved_bsz += request_bsz
+                        self._prefill_queue.popleft()
+                        condition.notify_all()
+                        print(
+                            f"[PrefillQueue] admitted ticket={ticket} path={request_label} "
+                            f"request_bsz={request_bsz} reserved_bsz={self._prefill_reserved_bsz} "
+                            f"max_prefill_bsz={current_limit}"
+                        )
+                        return {
+                            "ticket": ticket,
+                            "request_bsz": request_bsz,
+                            "max_prefill_bsz": int(current_limit),
+                        }
+
+                    if not queued_logged:
+                        ahead = sum(1 for queued_ticket in self._prefill_queue if queued_ticket < ticket)
+                        print(
+                            f"[PrefillQueue] queued ticket={ticket} path={request_label} "
+                            f"request_bsz={request_bsz} requests_ahead={ahead} "
+                            f"reserved_bsz={self._prefill_reserved_bsz} max_prefill_bsz={current_limit}"
+                        )
+                        queued_logged = True
+
+                    try:
+                        await asyncio.wait_for(condition.wait(), timeout=0.1)
+                    except asyncio.TimeoutError:
+                        pass
+            except Exception:
+                if ticket in self._prefill_queue:
+                    self._prefill_queue.remove(ticket)
+                    condition.notify_all()
+                raise
+
+    async def release_prefill_permit(
+        self, request_bsz: int, request_label: str = "", ticket: int | None = None
+    ):
+        request_bsz = max(1, int(request_bsz))
+        condition = self._get_prefill_condition()
+
+        async with condition:
+            self._prefill_reserved_bsz = max(0, self._prefill_reserved_bsz - request_bsz)
+            current_limit = (
+                self.model.refresh_max_prefill_bsz()
+                if hasattr(self.model, "refresh_max_prefill_bsz")
+                else request_bsz
+            )
+            print(
+                f"[PrefillQueue] released ticket={ticket} path={request_label} "
+                f"request_bsz={request_bsz} reserved_bsz={self._prefill_reserved_bsz} "
+                f"max_prefill_bsz={current_limit}"
+            )
+            condition.notify_all()
 
     def shutdown(self):
         self.executor.shutdown(wait=False)

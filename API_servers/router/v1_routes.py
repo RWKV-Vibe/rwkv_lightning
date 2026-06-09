@@ -6,8 +6,9 @@ from infer.cancellation import CancellationToken, InferenceCancelled
 from API_servers.router.common import (
     check_password,
     client_closed_response,
+    reserve_prefill_capacity,
     run_sync_with_disconnect_watch,
-    stream_with_disconnect_watch,
+    stream_with_prefill_queue,
 )
 from API_servers.router.schemas import ChatRequest, TranslateRequest, TranslateResponse
 
@@ -69,24 +70,25 @@ async def chat_completions(request: Request):
             cancel_token=cancel_token,
         )
         return StreamingResponse(
-            stream_with_disconnect_watch(request, stream, cancel_token),
+            stream_with_prefill_queue(request, stream, cancel_token, len(req.contents)),
             media_type="text/event-stream",
         )
 
     try:
-        results = await run_sync_with_disconnect_watch(
-            request,
-            engine.batch_generate,
-            prompts=req.contents,
-            max_length=req.max_tokens,
-            temperature=req.temperature,
-            top_k=req.top_k,
-            top_p=req.top_p,
-            alpha_presence=req.alpha_presence,
-            alpha_frequency=req.alpha_frequency,
-            alpha_decay=req.alpha_decay,
-            stop_tokens=req.stop_tokens,
-        )
+        async with reserve_prefill_capacity(request, len(req.contents)):
+            results = await run_sync_with_disconnect_watch(
+                request,
+                engine.batch_generate,
+                prompts=req.contents,
+                max_length=req.max_tokens,
+                temperature=req.temperature,
+                top_k=req.top_k,
+                top_p=req.top_p,
+                alpha_presence=req.alpha_presence,
+                alpha_frequency=req.alpha_frequency,
+                alpha_decay=req.alpha_decay,
+                stop_tokens=req.stop_tokens,
+            )
     except InferenceCancelled:
         return client_closed_response()
 
@@ -120,19 +122,20 @@ async def batch_translate(request: Request):
     ]
 
     try:
-        translated_texts = await run_sync_with_disconnect_watch(
-            request,
-            engine.batch_generate,
-            prompts=prompts,
-            max_length=2048,
-            temperature=1.0,
-            top_k=1,
-            top_p=0,
-            alpha_presence=0,
-            alpha_frequency=0,
-            alpha_decay=0.996,
-            stop_tokens=[],
-        )
+        async with reserve_prefill_capacity(request, len(prompts)):
+            translated_texts = await run_sync_with_disconnect_watch(
+                request,
+                engine.batch_generate,
+                prompts=prompts,
+                max_length=2048,
+                temperature=1.0,
+                top_k=1,
+                top_p=0,
+                alpha_presence=0,
+                alpha_frequency=0,
+                alpha_decay=0.996,
+                stop_tokens=[],
+            )
     except InferenceCancelled:
         return client_closed_response()
     except Exception:
@@ -184,24 +187,25 @@ async def fim_completions(request: Request):
             cancel_token=cancel_token,
         )
         return StreamingResponse(
-            stream_with_disconnect_watch(request, stream, cancel_token),
+            stream_with_prefill_queue(request, stream, cancel_token, len(prompts)),
             media_type="text/event-stream",
         )
 
     try:
-        results = await run_sync_with_disconnect_watch(
-            request,
-            engine.batch_generate,
-            prompts=prompts,
-            max_length=req.max_tokens,
-            temperature=req.temperature,
-            top_k=req.top_k,
-            top_p=req.top_p,
-            alpha_presence=req.alpha_presence,
-            alpha_frequency=req.alpha_frequency,
-            alpha_decay=req.alpha_decay,
-            stop_tokens=[],
-        )
+        async with reserve_prefill_capacity(request, len(prompts)):
+            results = await run_sync_with_disconnect_watch(
+                request,
+                engine.batch_generate,
+                prompts=prompts,
+                max_length=req.max_tokens,
+                temperature=req.temperature,
+                top_k=req.top_k,
+                top_p=req.top_p,
+                alpha_presence=req.alpha_presence,
+                alpha_frequency=req.alpha_frequency,
+                alpha_decay=req.alpha_decay,
+                stop_tokens=[],
+            )
     except InferenceCancelled:
         return client_closed_response()
 
@@ -244,6 +248,6 @@ async def big_batch_completions(request: Request):
         cancel_token=cancel_token,
     )
     return StreamingResponse(
-        stream_with_disconnect_watch(request, stream, cancel_token),
+        stream_with_prefill_queue(request, stream, cancel_token, len(req.contents)),
         media_type="text/event-stream",
     )

@@ -13,8 +13,9 @@ from API_servers.router.common import (
     client_closed_response,
     json_response,
     normalize_state_prompts,
+    reserve_prefill_capacity,
     run_sync_with_disconnect_watch,
-    stream_with_disconnect_watch,
+    stream_with_prefill_queue,
 )
 from API_servers.router.schemas import ChatRequest
 
@@ -70,25 +71,26 @@ async def state_chat_completions(request: Request):
             cancel_token=cancel_token,
         )
         return StreamingResponse(
-            stream_with_disconnect_watch(request, stream, cancel_token),
+            stream_with_prefill_queue(request, stream, cancel_token, 1),
             media_type="text/event-stream",
         )
 
     try:
-        results = await run_sync_with_disconnect_watch(
-            request,
-            engine.batch_generate_state,
-            prompts=prompts,
-            state=state,
-            max_length=req.max_tokens,
-            temperature=req.temperature,
-            top_k=req.top_k,
-            top_p=req.top_p,
-            alpha_presence=req.alpha_presence,
-            alpha_frequency=req.alpha_frequency,
-            alpha_decay=req.alpha_decay,
-            stop_tokens=req.stop_tokens,
-        )
+        async with reserve_prefill_capacity(request, 1):
+            results = await run_sync_with_disconnect_watch(
+                request,
+                engine.batch_generate_state,
+                prompts=prompts,
+                state=state,
+                max_length=req.max_tokens,
+                temperature=req.temperature,
+                top_k=req.top_k,
+                top_p=req.top_p,
+                alpha_presence=req.alpha_presence,
+                alpha_frequency=req.alpha_frequency,
+                alpha_decay=req.alpha_decay,
+                stop_tokens=req.stop_tokens,
+            )
     except InferenceCancelled:
         del state
         return client_closed_response()
@@ -206,25 +208,26 @@ async def multi_state_chat_completions(request: Request):
                     )
 
         return StreamingResponse(
-            stream_with_disconnect_watch(request, stream_with_dialogue_idx(), cancel_token),
+            stream_with_prefill_queue(request, stream_with_dialogue_idx(), cancel_token, 1),
             media_type="text/event-stream",
         )
 
     try:
-        results = await run_sync_with_disconnect_watch(
-            request,
-            engine.batch_generate_state,
-            prompts=prompts,
-            state=state,
-            max_length=req.max_tokens,
-            temperature=req.temperature,
-            top_k=req.top_k,
-            top_p=req.top_p,
-            alpha_presence=req.alpha_presence,
-            alpha_frequency=req.alpha_frequency,
-            alpha_decay=req.alpha_decay,
-            stop_tokens=req.stop_tokens,
-        )
+        async with reserve_prefill_capacity(request, 1):
+            results = await run_sync_with_disconnect_watch(
+                request,
+                engine.batch_generate_state,
+                prompts=prompts,
+                state=state,
+                max_length=req.max_tokens,
+                temperature=req.temperature,
+                top_k=req.top_k,
+                top_p=req.top_p,
+                alpha_presence=req.alpha_presence,
+                alpha_frequency=req.alpha_frequency,
+                alpha_decay=req.alpha_decay,
+                stop_tokens=req.stop_tokens,
+            )
     except InferenceCancelled:
         del state
         return client_closed_response()

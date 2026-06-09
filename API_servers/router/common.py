@@ -1,5 +1,6 @@
 import asyncio
 import json
+from contextlib import asynccontextmanager
 from contextlib import suppress
 
 from fastapi import Request
@@ -79,6 +80,23 @@ async def cleanup_disconnect_watcher(task):
         await task
 
 
+@asynccontextmanager
+async def reserve_prefill_capacity(request: Request, request_bsz: int):
+    engine = request.app.state.engine
+    permit = await engine.acquire_prefill_permit(
+        request_bsz=request_bsz,
+        request_label=str(request.url.path),
+    )
+    try:
+        yield permit
+    finally:
+        await engine.release_prefill_permit(
+            request_bsz=request_bsz,
+            request_label=str(request.url.path),
+            ticket=permit["ticket"],
+        )
+
+
 async def run_sync_with_disconnect_watch(request: Request, func, **kwargs):
     cancel_token = CancellationToken()
     watcher = asyncio.create_task(watch_disconnect(request, cancel_token))
@@ -103,6 +121,17 @@ async def stream_with_disconnect_watch(request: Request, stream, cancel_token: C
     finally:
         await stream.aclose()
         await cleanup_disconnect_watcher(watcher)
+
+
+async def stream_with_prefill_queue(
+    request: Request,
+    stream,
+    cancel_token: CancellationToken,
+    request_bsz: int,
+):
+    async with reserve_prefill_capacity(request, request_bsz):
+        async for chunk in stream_with_disconnect_watch(request, stream, cancel_token):
+            yield chunk
 
 
 def extract_sse_payload(item: str) -> str | None:

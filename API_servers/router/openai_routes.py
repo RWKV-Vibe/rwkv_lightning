@@ -16,7 +16,8 @@ from API_servers.router.common import (
     emit_finish_reason_chunk,
     extract_sse_payload,
     json_response,
-    stream_with_disconnect_watch,
+    reserve_prefill_capacity,
+    stream_with_prefill_queue,
     watch_disconnect,
 )
 from API_servers.router.schemas import ChatRequest
@@ -318,30 +319,31 @@ async def openai_chat_completions(request: Request):
                 prefix_cache_manager,
             )
             return StreamingResponse(
-                stream_with_disconnect_watch(request, stream, cancel_token),
+                stream_with_prefill_queue(request, stream, cancel_token, 1),
                 media_type="text/event-stream",
             )
 
-        cancel_token = CancellationToken()
-        watcher = asyncio.create_task(watch_disconnect(request, cancel_token))
-        try:
-            result_text, finish_reason = await engine.singe_infer(
-                prompt=prompt_formatted,
-                max_length=req.max_tokens,
-                temperature=req.temperature,
-                top_k=req.top_k,
-                top_p=req.top_p,
-                alpha_presence=req.alpha_presence,
-                alpha_frequency=req.alpha_frequency,
-                alpha_decay=req.alpha_decay,
-                stop_tokens=req.stop_tokens,
-                prefix_cache_manager=prefix_cache_manager,
-                cancel_token=cancel_token,
-            )
-            if cancel_token.is_cancelled():
-                raise InferenceCancelled("request disconnected")
-        finally:
-            await cleanup_disconnect_watcher(watcher)
+        async with reserve_prefill_capacity(request, 1):
+            cancel_token = CancellationToken()
+            watcher = asyncio.create_task(watch_disconnect(request, cancel_token))
+            try:
+                result_text, finish_reason = await engine.singe_infer(
+                    prompt=prompt_formatted,
+                    max_length=req.max_tokens,
+                    temperature=req.temperature,
+                    top_k=req.top_k,
+                    top_p=req.top_p,
+                    alpha_presence=req.alpha_presence,
+                    alpha_frequency=req.alpha_frequency,
+                    alpha_decay=req.alpha_decay,
+                    stop_tokens=req.stop_tokens,
+                    prefix_cache_manager=prefix_cache_manager,
+                    cancel_token=cancel_token,
+                )
+                if cancel_token.is_cancelled():
+                    raise InferenceCancelled("request disconnected")
+            finally:
+                await cleanup_disconnect_watcher(watcher)
 
         message, response_finish_reason = build_openai_message_response(
             result_text, finish_reason, body
