@@ -20,66 +20,73 @@ class BatchInferenceMixin:
         alpha_frequency=0.1,
         alpha_decay=0.996,
         stop_tokens=("\nUser:",),
+        cancel_token=None,
     ):
-        batch_size = len(prompts)
-        state = self.model.generate_zero_state(batch_size)
-        encoded_prompts = [self.tokenizer.encode(p) for p in prompts]
-        out = self.model.forward_batch(encoded_prompts, state).float()
+        state = None
+        try:
+            batch_size = len(prompts)
+            state = self.model.generate_zero_state(batch_size)
+            encoded_prompts = [self.tokenizer.encode(p) for p in prompts]
+            out = self._forward_batch_prompts_chunked(
+                encoded_prompts, state, cancel_token=cancel_token
+            ).float()
 
-        finished = [False] * batch_size
-        stop_states = [self._create_stop_state(stop_tokens) for _ in range(batch_size)]
-        generated_text = [""] * batch_size
-        sample_rand_states = inference_deps.get_sample().setup_rand(
-            random.randint(0, 2**63 - 1), batch_size
-        )
-        penalties = inference_deps.get_torch().zeros(
-            batch_size, out.size(-1), device=out.device
-        )
+            finished = [False] * batch_size
+            stop_states = [self._create_stop_state(stop_tokens) for _ in range(batch_size)]
+            generated_text = [""] * batch_size
+            sample_rand_states = inference_deps.get_sample().setup_rand(
+                random.randint(0, 2**63 - 1), batch_size
+            )
+            penalties = inference_deps.get_torch().zeros(
+                batch_size, out.size(-1), device=out.device
+            )
 
-        for _ in range(max_length):
-            new_tokens = inference_deps.get_sample().batch_sampling_repetition_temperature_topk_topp(
-                out,
-                penalties,
-                sample_rand_states,
-                alpha_presence,
-                alpha_frequency,
-                alpha_decay,
-                temperature,
-                top_k,
-                top_p,
-            ).tolist()
-            new_tokens = [[token] for token in new_tokens]
-            out = self.model.forward_batch(new_tokens, state).float()
+            for _ in range(max_length):
+                self._raise_if_cancelled(cancel_token)
+                new_tokens = inference_deps.get_sample().batch_sampling_repetition_temperature_topk_topp(
+                    out,
+                    penalties,
+                    sample_rand_states,
+                    alpha_presence,
+                    alpha_frequency,
+                    alpha_decay,
+                    temperature,
+                    top_k,
+                    top_p,
+                ).tolist()
+                new_tokens = [[token] for token in new_tokens]
+                out = self.model.forward_batch(new_tokens, state).float()
 
+                for i in range(batch_size):
+                    tok = (
+                        new_tokens[i][0]
+                        if isinstance(new_tokens[i], list)
+                        else new_tokens[i]
+                    )
+                    if finished[i]:
+                        continue
+
+                    content, should_stop = self._ingest_token_with_stop(stop_states[i], tok)
+                    if content:
+                        generated_text[i] += content
+
+                    if should_stop:
+                        finished[i] = True
+                        continue
+
+                if all(finished):
+                    break
+
+            decoded = []
             for i in range(batch_size):
-                tok = (
-                    new_tokens[i][0]
-                    if isinstance(new_tokens[i], list)
-                    else new_tokens[i]
-                )
-                if finished[i]:
-                    continue
-
-                content, should_stop = self._ingest_token_with_stop(stop_states[i], tok)
-                if content:
-                    generated_text[i] += content
-
-                if should_stop:
-                    finished[i] = True
-                    continue
-
-            if all(finished):
-                break
-
-        del state
-        gc.collect()
-
-        decoded = []
-        for i in range(batch_size):
-            generated_text[i] += self._flush_stop_state(stop_states[i], final=True)
-            decoded.append(generated_text[i])
-        inference_deps.get_torch().cuda.empty_cache()
-        return decoded
+                generated_text[i] += self._flush_stop_state(stop_states[i], final=True)
+                decoded.append(generated_text[i])
+            return decoded
+        finally:
+            if state is not None:
+                del state
+            gc.collect()
+            inference_deps.get_torch().cuda.empty_cache()
 
     async def batch_infer_stream(
         self,
@@ -93,25 +100,31 @@ class BatchInferenceMixin:
         alpha_decay=0.996,
         stop_tokens=("\nUser:",),
         chunk_size=32,
+        cancel_token=None,
     ):
-        batch_size = len(prompts)
-        state = self.model.generate_zero_state(batch_size)
-        encoded_prompts = [self.tokenizer.encode(p) for p in prompts]
-        out = self.model.forward_batch(encoded_prompts, state).float()
-
-        finished = [False] * batch_size
-        stop_states = [self._create_stop_state(stop_tokens) for _ in range(batch_size)]
-        chunk_token_counts = [0] * batch_size
-        text_buffers = [""] * batch_size
-        sample_rand_states = inference_deps.get_sample().setup_rand(
-            random.randint(0, 2**63 - 1), batch_size
-        )
-        penalties = inference_deps.get_torch().zeros(
-            batch_size, out.size(-1), device=out.device
-        )
+        state = None
 
         try:
+            batch_size = len(prompts)
+            state = self.model.generate_zero_state(batch_size)
+            encoded_prompts = [self.tokenizer.encode(p) for p in prompts]
+            out = self._forward_batch_prompts_chunked(
+                encoded_prompts, state, cancel_token=cancel_token
+            ).float()
+
+            finished = [False] * batch_size
+            stop_states = [self._create_stop_state(stop_tokens) for _ in range(batch_size)]
+            chunk_token_counts = [0] * batch_size
+            text_buffers = [""] * batch_size
+            sample_rand_states = inference_deps.get_sample().setup_rand(
+                random.randint(0, 2**63 - 1), batch_size
+            )
+            penalties = inference_deps.get_torch().zeros(
+                batch_size, out.size(-1), device=out.device
+            )
+
             while not all(finished) and max_length > 0:
+                self._raise_if_cancelled(cancel_token)
                 new_tokens = inference_deps.get_sample().batch_sampling_repetition_temperature_topk_topp(
                     out,
                     penalties,
@@ -192,7 +205,8 @@ class BatchInferenceMixin:
                 if chunk["choices"]:
                     yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
         finally:
-            del state
+            if state is not None:
+                del state
             inference_deps.get_torch().cuda.empty_cache()
             gc.collect()
 
@@ -212,48 +226,50 @@ class BatchInferenceMixin:
         alpha_frequency=0.1,
         alpha_decay=0.996,
         stop_tokens=("\nUser:",),
+        cancel_token=None,
     ):
-        encoded_prompts = [self.tokenizer.encode(p) for p in prompts]
+        try:
+            encoded_prompts = [self.tokenizer.encode(p) for p in prompts]
 
-        tokens = encoded_prompts[0]
-        out = self.model.forward(tokens, state).float()
-        sample_rand_states = inference_deps.get_sample().setup_rand(random.randint(0, 2**63 - 1), 1)
-        penalties = inference_deps.get_torch().zeros(1, out.size(-1), device=out.device)
+            tokens = encoded_prompts[0]
+            out = self._forward_tokens_chunked(tokens, state, cancel_token=cancel_token)
+            sample_rand_states = inference_deps.get_sample().setup_rand(random.randint(0, 2**63 - 1), 1)
+            penalties = inference_deps.get_torch().zeros(1, out.size(-1), device=out.device)
 
-        stop_state = self._create_stop_state(stop_tokens)
-        generated_text = ""
-        for _ in range(max_length):
-            if out.dim() == 1:
-                out = out.unsqueeze(0)
+            stop_state = self._create_stop_state(stop_tokens)
+            generated_text = ""
+            for _ in range(max_length):
+                self._raise_if_cancelled(cancel_token)
+                if out.dim() == 1:
+                    out = out.unsqueeze(0)
 
-            new_tokens = inference_deps.get_sample().batch_sampling_repetition_temperature_topk_topp(
-                out,
-                penalties,
-                sample_rand_states,
-                alpha_presence,
-                alpha_frequency,
-                alpha_decay,
-                temperature,
-                top_k,
-                top_p,
-            ).tolist()
+                new_tokens = inference_deps.get_sample().batch_sampling_repetition_temperature_topk_topp(
+                    out,
+                    penalties,
+                    sample_rand_states,
+                    alpha_presence,
+                    alpha_frequency,
+                    alpha_decay,
+                    temperature,
+                    top_k,
+                    top_p,
+                ).tolist()
 
-            tok = new_tokens[0]
+                tok = new_tokens[0]
 
-            content, should_stop = self._ingest_token_with_stop(stop_state, tok)
-            if content:
-                generated_text += content
+                content, should_stop = self._ingest_token_with_stop(stop_state, tok)
+                if content:
+                    generated_text += content
 
-            if should_stop:
-                break
+                if should_stop:
+                    break
 
-            out = self.model.forward(tok, state).float()
-        generated_text += self._flush_stop_state(stop_state, final=True)
-        decoded = [generated_text]
-
-        gc.collect()
-        inference_deps.get_torch().cuda.empty_cache()
-        return decoded
+                out = self._forward_tokens_chunked([tok], state, cancel_token=cancel_token)
+            generated_text += self._flush_stop_state(stop_state, final=True)
+            return [generated_text]
+        finally:
+            gc.collect()
+            inference_deps.get_torch().cuda.empty_cache()
 
     async def batch_infer_stream_state(
         self,
@@ -270,13 +286,15 @@ class BatchInferenceMixin:
         chunk_size=32,
         session_id=None,
         state_manager=None,
+        cancel_token=None,
     ):
         encoded_prompts = [self.tokenizer.encode(p) for p in prompts]
         chunk_size = max(1, int(chunk_size))
+        should_store_state = True
 
         try:
             tokens = encoded_prompts[0]
-            out = self.model.forward(tokens, state).float()
+            out = self._forward_tokens_chunked(tokens, state, cancel_token=cancel_token)
             sample_rand_states = inference_deps.get_sample().setup_rand(random.randint(0, 2**63 - 1), 1)
             penalties = inference_deps.get_torch().zeros(1, out.size(-1), device=out.device)
 
@@ -285,6 +303,7 @@ class BatchInferenceMixin:
             text_buffer = ""
 
             while max_length > 0:
+                self._raise_if_cancelled(cancel_token)
                 max_length -= 1
                 if out.dim() == 1:
                     out = out.unsqueeze(0)
@@ -330,7 +349,7 @@ class BatchInferenceMixin:
                     text_buffer = ""
                     buffered_tokens = 0
 
-                out = self.model.forward(tok, state).float()
+                out = self._forward_tokens_chunked([tok], state, cancel_token=cancel_token)
 
                 await asyncio.sleep(0)
 
@@ -345,7 +364,10 @@ class BatchInferenceMixin:
                 yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
 
         finally:
-            if state_manager and session_id:
+            if cancel_token is not None and cancel_token.is_cancelled():
+                should_store_state = False
+
+            if state_manager and session_id and should_store_state:
                 state_manager.put_state(session_id, state)
                 print("[RESPONSE] /state/chat/completions state[2]: ", state[2], "\n")
 
@@ -369,19 +391,24 @@ class BatchInferenceMixin:
         alpha_decay=0.996,
         stop_tokens=("\nUser:",),
         prefix_cache_manager=None,
+        cancel_token=None,
     ):
         stop_state = self._create_stop_state(stop_tokens)
         generated_text = ""
         finish_reason = "length"
+        state = None
 
         try:
             _, state, out, _, _ = self._prefill_prompt_with_prefix_cache(
-                prompt, prefix_cache_manager=prefix_cache_manager
+                prompt,
+                prefix_cache_manager=prefix_cache_manager,
+                cancel_token=cancel_token,
             )
             sample_rand_states = inference_deps.get_sample().setup_rand(random.randint(0, 2**63 - 1), 1)
             penalties = inference_deps.get_torch().zeros(1, out.size(-1), device=out.device)
 
             while max_length > 0:
+                self._raise_if_cancelled(cancel_token)
                 max_length -= 1
                 logits_reshaped = out.unsqueeze(0) if out.dim() == 1 else out
                 new_tokens = inference_deps.get_sample().batch_sampling_repetition_temperature_topk_topp(
@@ -405,13 +432,14 @@ class BatchInferenceMixin:
                     finish_reason = "stop"
                     break
 
-                out = self.model.forward(tok, state).float()
+                out = self._forward_tokens_chunked([tok], state, cancel_token=cancel_token)
                 await asyncio.sleep(0)
 
             generated_text += self._flush_stop_state(stop_state, final=True)
             return generated_text, finish_reason
         finally:
-            del state
+            if state is not None:
+                del state
             inference_deps.get_torch().cuda.empty_cache()
             gc.collect()
 
@@ -428,12 +456,16 @@ class BatchInferenceMixin:
         stop_tokens=("\nUser:",),
         chunk_size=32,
         prefix_cache_manager=None,
+        cancel_token=None,
     ):
         finish_reason = "length"
+        state = None
 
         try:
             _, state, out, _, _ = self._prefill_prompt_with_prefix_cache(
-                prompt, prefix_cache_manager=prefix_cache_manager
+                prompt,
+                prefix_cache_manager=prefix_cache_manager,
+                cancel_token=cancel_token,
             )
             stop_state = self._create_stop_state(stop_tokens)
             buffered_tokens = 0
@@ -442,6 +474,7 @@ class BatchInferenceMixin:
             penalties = inference_deps.get_torch().zeros(1, out.size(-1), device=out.device)
 
             while max_length > 0:
+                self._raise_if_cancelled(cancel_token)
                 max_length -= 1
                 logits_reshaped = out.unsqueeze(0) if out.dim() == 1 else out
                 new_tokens = inference_deps.get_sample().batch_sampling_repetition_temperature_topk_topp(
@@ -485,7 +518,7 @@ class BatchInferenceMixin:
                     text_buffer = ""
                     buffered_tokens = 0
 
-                out = self.model.forward(tok, state).float()
+                out = self._forward_tokens_chunked([tok], state, cancel_token=cancel_token)
                 await asyncio.sleep(0)
 
             flushed = self._flush_stop_state(stop_state, final=True)
@@ -504,7 +537,8 @@ class BatchInferenceMixin:
             }
             yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
         finally:
-            del state
+            if state is not None:
+                del state
             inference_deps.get_torch().cuda.empty_cache()
             gc.collect()
 

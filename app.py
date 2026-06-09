@@ -3,7 +3,9 @@ import atexit
 import signal
 import sys
 
-from API_servers.api_service import create_app
+import uvicorn
+
+from API_servers.fastapi_service import create_app
 from infer.inference import InferenceEngine
 from model_load.model_loader import load_model_and_tokenizer
 from state_manager.state_pool import shutdown_state_manager
@@ -24,12 +26,11 @@ def main():
     app = create_app(engine, password=args_cli.password)
 
     def cleanup_handler(signum, frame):
-        print("\nShutting down server and persisting all states to database...")
-        shutdown_state_manager()
-        engine.shutdown()
+        print("\nShutting down server...")
         sys.exit(0)
 
     def cleanup_at_exit():
+        print("Persisting all states to database...")
         shutdown_state_manager()
         engine.shutdown()
         print("All states persisted to database.")
@@ -38,7 +39,7 @@ def main():
     signal.signal(signal.SIGTERM, cleanup_handler)
     atexit.register(cleanup_at_exit)
 
-    app.start(host="0.0.0.0", port=args_cli.port)
+    uvicorn.run(app, host="0.0.0.0", port=args_cli.port)
 
 
 if __name__ == "__main__":

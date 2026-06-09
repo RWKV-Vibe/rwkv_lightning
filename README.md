@@ -1,21 +1,16 @@
 # rwkv_lightning 🕊️ ⚡
-RWKV Batch infer backend Base on [Albatross](https://github.com/BlinkDL/Albatross) 🕊️ and [Robyn](https://github.com/sparckles/Robyn) 🦀 
+RWKV Batch infer backend Base on [Albatross](https://github.com/BlinkDL/Albatross) 🕊️ and [fastapi](https://github.com/fastapi/fastapi)
 - Thanks to [Rapid-Sampling](https://github.com/Triang-jyed-driung/Rapid-Sampling) Kernel From [Triang-jyed-driung](https://github.com/Triang-jyed-driung), it also have native HIP kerel compatible with ROCm😎
 ## Install requirements
 **For Nvidia CUDA**
 ```bash
 pip install torch torchvision --index-url https://download.pytorch.org/whl/cu130
-pip install robyn pydantic ninja numpy 
-[optional] pip install flashinfer-python
+pip install fastapi pydantic ninja numpy 
 ```
 **For AMD ROCm**
-
-(The Flashinfer-python is not transfer to the AMD ROCm officially yet, please wait for the official compatibility. I actually tried to transfer it, but the Flash Infer library is a bit abstract and huge. I use the Pytorch base top_k top_p decode to implement the Flash infer CUDA GPU decode kernel)
-
-**No problem! This could work too. It's not that it can't be used 🫣**
 ```bash
 pip install torch torchvision --index-url https://download.pytorch.org/whl/rocm6.4
-pip install robyn pydantic ninja numpy 
+pip install fastapi pydantic ninja numpy 
 ```
 
 ## Usage
@@ -280,15 +275,10 @@ curl -X POST 'http://localhost:8000/openai/v1/chat/completions' \
   }'
 ```
 
-- Related focused test scripts
-```bash
-python test/test_openai_adapter.py
-python test/test_openai_routes.py
-```
 </details>
 
 ___
-### **6. ```/big_batch/completions```  [Only Support noise & temperature decode parameters]**
+### **6. ```/big_batch/completions```  [Only Support temperature decode parameters]**
 
 <details>
 <summary><strong><em>curl examples</em></strong></summary>

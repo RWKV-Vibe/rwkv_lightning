@@ -2,9 +2,15 @@ import gc
 from collections import deque
 
 from infer import inference_deps
+from infer.cancellation import InferenceCancelled
 
 
 class InferenceUtilsMixin:
+    @staticmethod
+    def _raise_if_cancelled(cancel_token=None):
+        if cancel_token is not None and cancel_token.is_cancelled():
+            raise InferenceCancelled("request disconnected")
+
     @staticmethod
     def _normalize_stop_strings(stop_tokens):
         if not stop_tokens:
@@ -137,7 +143,75 @@ class InferenceUtilsMixin:
 
         return sampled_tokens
 
-    def _prefill_prompt_with_prefix_cache(self, prompt, prefix_cache_manager=None):
+    def _forward_tokens_chunked(self, tokens, state, cancel_token=None):
+        if not isinstance(tokens, list):
+            self._raise_if_cancelled(cancel_token)
+            return self.model.forward(tokens, state).float()
+
+        if not tokens:
+            raise ValueError("Empty prompt")
+
+        chunk_size = max(1, int(getattr(self.model, "prefill_chunk_size", len(tokens))))
+        out = None
+        for start in range(0, len(tokens), chunk_size):
+            self._raise_if_cancelled(cancel_token)
+            chunk = tokens[start : start + chunk_size]
+            out = self.model.forward(chunk, state).float()
+
+        self._raise_if_cancelled(cancel_token)
+        return out
+
+    def _forward_batch_prompts_chunked(self, tokens, state, cancel_token=None, full_output=False):
+        assert type(tokens) is list
+        lengths = [len(x) for x in tokens]
+        bsz = len(tokens)
+        pos = [0] * bsz
+        out = None if not full_output else [None] * bsz
+
+        while True:
+            self._raise_if_cancelled(cancel_token)
+            active = [i for i in range(bsz) if pos[i] < lengths[i]]
+            if not active:
+                break
+
+            step = min(
+                getattr(self.model, "prefill_chunk_size", 256),
+                min(lengths[i] - pos[i] for i in active),
+            )
+            batch_tokens = [tokens[i][pos[i] : pos[i] + step] for i in active]
+            if len(active) == bsz:
+                batch_state = state
+            else:
+                batch_state = [state[0][:, :, active], state[1][:, active], state[2][active]]
+
+            new_out = self.model.forward_batch_same_length(batch_tokens, batch_state, full_output)
+
+            if not full_output and out is None:
+                out = inference_deps.get_torch().empty(
+                    (bsz, new_out.size(-1)),
+                    dtype=new_out.dtype,
+                    device=new_out.device,
+                )
+
+            for k, i in enumerate(active):
+                if not full_output:
+                    out[i] = new_out[k]
+                else:
+                    if out[i] is None:
+                        out[i] = new_out[k]
+                    else:
+                        out[i] = inference_deps.get_torch().cat([out[i], new_out[k]], dim=0)
+
+                if len(active) != bsz:
+                    state[0][:, :, i] = batch_state[0][:, :, k]
+                    state[1][:, i] = batch_state[1][:, k]
+                    state[2][i] = batch_state[2][k]
+                pos[i] += step
+
+        self._raise_if_cancelled(cancel_token)
+        return out
+
+    def _prefill_prompt_with_prefix_cache(self, prompt, prefix_cache_manager=None, cancel_token=None):
         encoded_prompt = self.tokenizer.encode(prompt)
         if not encoded_prompt:
             raise ValueError("Empty prompt")
@@ -169,20 +243,25 @@ class InferenceUtilsMixin:
 
         cursor = matched_tokens
         for checkpoint in bucket_checkpoints:
+            self._raise_if_cancelled(cancel_token)
             segment = encoded_prompt[cursor:checkpoint]
             if segment:
-                out = self.model.forward(segment, state).float()
+                out = self._forward_tokens_chunked(segment, state, cancel_token=cancel_token)
                 prefix_cache_manager.put_prefix_state(encoded_prompt[:checkpoint], state, out)
                 cursor = checkpoint
 
         remaining_tokens = encoded_prompt[cursor:]
         if remaining_tokens:
-            out = self.model.forward(remaining_tokens, state).float()
+            out = self._forward_tokens_chunked(
+                remaining_tokens, state, cancel_token=cancel_token
+            )
         elif out is None:
             # Older cache rows may exist without logits. Fall back to recomputing once.
             del state
             state = self.model.generate_zero_state(0)
-            out = self.model.forward(encoded_prompt, state).float()
+            out = self._forward_tokens_chunked(
+                encoded_prompt, state, cancel_token=cancel_token
+            )
             matched_tokens = 0
             cache_source = None
 

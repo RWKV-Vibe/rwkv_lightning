@@ -12,6 +12,7 @@ class BigBatchMixin:
         temperature=1.0,
         stop_tokens=("\nUser:",),
         chunk_size=32,
+        cancel_token=None,
     ):
         batch_size = len(prompts)
         state = None
@@ -27,7 +28,9 @@ class BigBatchMixin:
             with inference_deps.get_torch().inference_mode():
                 state = self.model.generate_zero_state(batch_size)
                 encoded_prompts = [self.tokenizer.encode(p) for p in prompts]
-                out = self.model.forward_batch(encoded_prompts, state)
+                out = self._forward_batch_prompts_chunked(
+                    encoded_prompts, state, cancel_token=cancel_token
+                )
 
                 finished = [False] * batch_size
                 stop_states = [self._create_stop_state(stop_tokens) for _ in range(batch_size)]
@@ -38,6 +41,7 @@ class BigBatchMixin:
                 cleanup_interval = 100
 
                 while not all(finished) and max_length > 0:
+                    self._raise_if_cancelled(cancel_token)
                     new_tokens_tensor = inference_deps.get_sampler_gumbel_batch()(
                         logits=out, temp=temperature
                     )
