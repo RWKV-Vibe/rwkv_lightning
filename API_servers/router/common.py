@@ -7,7 +7,7 @@ from fastapi import Request
 from fastapi.responses import JSONResponse, Response
 from starlette.concurrency import run_in_threadpool
 
-from infer.cancellation import CancellationToken, InferenceCancelled
+from infer.cancellation import CancellationToken, InferenceCancelled, PrefillBszLimitExceeded
 
 
 def json_response(status_code: int, payload: dict):
@@ -16,6 +16,18 @@ def json_response(status_code: int, payload: dict):
 
 def client_closed_response():
     return Response(status_code=499)
+
+
+def prefill_bsz_limit_payload(exc: PrefillBszLimitExceeded):
+    return {
+        "error": f"bsz overflow, Max bsz={exc.max_bsz}",
+        "request_bsz": exc.request_bsz,
+        "max_bsz": exc.max_bsz,
+    }
+
+
+def prefill_bsz_limit_response(exc: PrefillBszLimitExceeded):
+    return json_response(400, prefill_bsz_limit_payload(exc))
 
 
 def check_password(body_password, password):
@@ -129,9 +141,14 @@ async def stream_with_prefill_queue(
     cancel_token: CancellationToken,
     request_bsz: int,
 ):
-    async with reserve_prefill_capacity(request, request_bsz):
-        async for chunk in stream_with_disconnect_watch(request, stream, cancel_token):
-            yield chunk
+    try:
+        async with reserve_prefill_capacity(request, request_bsz):
+            async for chunk in stream_with_disconnect_watch(request, stream, cancel_token):
+                yield chunk
+    except PrefillBszLimitExceeded as exc:
+        cancel_token.cancel()
+        await stream.aclose()
+        yield f"data: {json.dumps(prefill_bsz_limit_payload(exc), ensure_ascii=False)}\n\n"
 
 
 def extract_sse_payload(item: str) -> str | None:

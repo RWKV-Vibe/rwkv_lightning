@@ -7,7 +7,7 @@ import asyncio
 from fastapi import APIRouter, Request
 from fastapi.responses import StreamingResponse
 
-from infer.cancellation import CancellationToken, InferenceCancelled
+from infer.cancellation import CancellationToken, InferenceCancelled, PrefillBszLimitExceeded
 from state_manager.state_pool import get_state_manager
 
 from API_servers.router.common import (
@@ -16,6 +16,7 @@ from API_servers.router.common import (
     emit_finish_reason_chunk,
     extract_sse_payload,
     json_response,
+    prefill_bsz_limit_response,
     reserve_prefill_capacity,
     stream_with_prefill_queue,
     watch_disconnect,
@@ -364,6 +365,8 @@ async def openai_chat_completions(request: Request):
         }
     except InferenceCancelled:
         return client_closed_response()
+    except PrefillBszLimitExceeded as exc:
+        return prefill_bsz_limit_response(exc)
     except json.JSONDecodeError as exc:
         return json_response(400, {"error": f"Invalid JSON: {str(exc)}"})
     except Exception as exc:

@@ -6,6 +6,7 @@ from threading import Lock
 from infer import inference_deps
 from infer.batch_inference import BatchInferenceMixin
 from infer.big_batch import BigBatchMixin
+from infer.cancellation import PrefillBszLimitExceeded
 from infer.inference_utils import InferenceUtilsMixin
 
 
@@ -35,6 +36,20 @@ class InferenceEngine(
 
     async def acquire_prefill_permit(self, request_bsz: int, request_label: str = ""):
         request_bsz = max(1, int(request_bsz))
+        max_prefill_bsz_limit = int(
+            getattr(
+                self.model,
+                "max_prefill_bsz_limit",
+                getattr(self.model, "max_prefill_bsz", request_bsz),
+            )
+        )
+        if request_bsz > max_prefill_bsz_limit:
+            print(
+                f"[PrefillQueue] rejected path={request_label} "
+                f"request_bsz={request_bsz} max_prefill_bsz_limit={max_prefill_bsz_limit}"
+            )
+            raise PrefillBszLimitExceeded(request_bsz, max_prefill_bsz_limit)
+
         condition = self._get_prefill_condition()
 
         async with condition:
@@ -50,6 +65,7 @@ class InferenceEngine(
                         current_limit = self.model.refresh_max_prefill_bsz()
                     else:
                         current_limit = getattr(self.model, "max_prefill_bsz", request_bsz)
+                    current_limit = min(int(current_limit), max_prefill_bsz_limit)
                     available_bsz = max(0, int(current_limit) - self._prefill_reserved_bsz)
 
                     if is_turn and request_bsz <= available_bsz:
@@ -99,6 +115,14 @@ class InferenceEngine(
                 if hasattr(self.model, "refresh_max_prefill_bsz")
                 else request_bsz
             )
+            max_prefill_bsz_limit = int(
+                getattr(
+                    self.model,
+                    "max_prefill_bsz_limit",
+                    getattr(self.model, "max_prefill_bsz", request_bsz),
+                )
+            )
+            current_limit = min(int(current_limit), max_prefill_bsz_limit)
             print(
                 f"[PrefillQueue] released ticket={ticket} path={request_label} "
                 f"request_bsz={request_bsz} reserved_bsz={self._prefill_reserved_bsz} "

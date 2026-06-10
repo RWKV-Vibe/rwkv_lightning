@@ -4,7 +4,7 @@ from datetime import datetime
 from fastapi import APIRouter, Request
 from fastapi.responses import StreamingResponse
 
-from infer.cancellation import CancellationToken, InferenceCancelled
+from infer.cancellation import CancellationToken, InferenceCancelled, PrefillBszLimitExceeded
 from state_manager.state_pool import get_state_manager, remove_session_from_any_level
 
 from API_servers.router.common import (
@@ -13,6 +13,7 @@ from API_servers.router.common import (
     client_closed_response,
     json_response,
     normalize_state_prompts,
+    prefill_bsz_limit_response,
     reserve_prefill_capacity,
     run_sync_with_disconnect_watch,
     stream_with_prefill_queue,
@@ -94,6 +95,9 @@ async def state_chat_completions(request: Request):
     except InferenceCancelled:
         del state
         return client_closed_response()
+    except PrefillBszLimitExceeded as exc:
+        del state
+        return prefill_bsz_limit_response(exc)
 
     state_manager.put_state(session_id, state)
     choices = []
@@ -231,6 +235,9 @@ async def multi_state_chat_completions(request: Request):
     except InferenceCancelled:
         del state
         return client_closed_response()
+    except PrefillBszLimitExceeded as exc:
+        del state
+        return prefill_bsz_limit_response(exc)
 
     new_dialogue_idx = allocate_next_dialogue_idx(app_state, state_manager, session_index)
     new_session_id = f"{session_index}:{new_dialogue_idx}"

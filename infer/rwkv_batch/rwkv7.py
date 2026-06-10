@@ -15,25 +15,13 @@ torch.set_grad_enabled(False)
 torch.backends.cudnn.benchmark = True
 torch.backends.cudnn.allow_tf32 = True
 torch.backends.cuda.matmul.allow_tf32 = True
-
-# torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = True
-# torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = True
 torch._C._jit_set_autocast_mode(False)
-
-import torch.nn as nn
 from torch.nn import functional as F
 
 MyModule = torch.jit.ScriptModule
 MyFunction = torch.jit.script_method
 MyStatic = torch.jit.script
-# MyModule = nn.Module
-# MyFunction = torch.compile()
-# MyStatic = torch.compile()
 MyDisable = torch.compiler.disable
-# def __nop(ob): return ob
-# MyFunction = __nop
-# MyStatic = __nop
-# MyDisable = __nop
 
 DTYPE = torch.half
 ROCm_flag = torch.version.hip is not None
@@ -209,7 +197,12 @@ class RWKV_x070(MyModule):
         z['blocks.0.att.v1'] = z['blocks.0.att.a1'] # actually ignored
         z['blocks.0.att.v2'] = z['blocks.0.att.a2'] # actually ignored
         self.refresh_max_prefill_bsz()
-        print(f"max_prefill_bsz={self.max_prefill_bsz} for prefill_chunk_size={self.prefill_chunk_size}")
+        self.max_prefill_bsz_limit = int(self.max_prefill_bsz)
+        print(
+            f"max_prefill_bsz={self.max_prefill_bsz} "
+            f"max_prefill_bsz_limit={self.max_prefill_bsz_limit} "
+            f"for prefill_chunk_size={self.prefill_chunk_size}"
+        )
 
     # Estimate the largest batch size that fits current free VRAM for one chunked prefill.
     def refresh_max_prefill_bsz(self):

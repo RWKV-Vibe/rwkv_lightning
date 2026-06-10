@@ -1,11 +1,12 @@
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from infer.cancellation import CancellationToken, InferenceCancelled
+from infer.cancellation import CancellationToken, InferenceCancelled, PrefillBszLimitExceeded
 
 from API_servers.router.common import (
     check_password,
     client_closed_response,
+    prefill_bsz_limit_response,
     reserve_prefill_capacity,
     run_sync_with_disconnect_watch,
     stream_with_prefill_queue,
@@ -91,6 +92,8 @@ async def chat_completions(request: Request):
             )
     except InferenceCancelled:
         return client_closed_response()
+    except PrefillBszLimitExceeded as exc:
+        return prefill_bsz_limit_response(exc)
 
     choices = []
     for i, text in enumerate(results):
@@ -138,6 +141,8 @@ async def batch_translate(request: Request):
             )
     except InferenceCancelled:
         return client_closed_response()
+    except PrefillBszLimitExceeded as exc:
+        return prefill_bsz_limit_response(exc)
     except Exception:
         return JSONResponse(
             status_code=500,
@@ -208,6 +213,8 @@ async def fim_completions(request: Request):
             )
     except InferenceCancelled:
         return client_closed_response()
+    except PrefillBszLimitExceeded as exc:
+        return prefill_bsz_limit_response(exc)
 
     choices = []
     for i, text in enumerate(results):
