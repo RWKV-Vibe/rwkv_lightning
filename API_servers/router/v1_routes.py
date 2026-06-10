@@ -7,10 +7,9 @@ from API_servers.router.common import (
     check_password,
     client_closed_response,
     prefill_bsz_limit_response,
+    prefill_sse_response,
     reserve_prefill_capacity,
     run_sync_with_disconnect_watch,
-    sse_response,
-    stream_with_prefill_queue,
 )
 from API_servers.router.schemas import ChatRequest, TranslateRequest, TranslateResponse
 
@@ -71,9 +70,7 @@ async def chat_completions(request: Request):
             chunk_size=req.chunk_size,
             cancel_token=cancel_token,
         )
-        return sse_response(
-            stream_with_prefill_queue(request, stream, cancel_token, len(req.contents))
-        )
+        return prefill_sse_response(request, stream, cancel_token, len(req.contents))
 
     try:
         async with reserve_prefill_capacity(request, len(req.contents)):
@@ -191,9 +188,7 @@ async def fim_completions(request: Request):
             chunk_size=req.chunk_size,
             cancel_token=cancel_token,
         )
-        return sse_response(
-            stream_with_prefill_queue(request, stream, cancel_token, len(prompts))
-        )
+        return prefill_sse_response(request, stream, cancel_token, len(prompts))
 
     try:
         async with reserve_prefill_capacity(request, len(prompts)):
@@ -253,6 +248,4 @@ async def big_batch_completions(request: Request):
         chunk_size=req.chunk_size,
         cancel_token=cancel_token,
     )
-    return sse_response(
-        stream_with_prefill_queue(request, stream, cancel_token, len(req.contents))
-    )
+    return prefill_sse_response(request, stream, cancel_token, len(req.contents))

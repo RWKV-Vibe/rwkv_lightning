@@ -5,9 +5,17 @@ from contextlib import suppress
 
 from fastapi import Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
+from starlette.background import BackgroundTask
 from starlette.concurrency import run_in_threadpool
 
 from infer.cancellation import CancellationToken, InferenceCancelled, PrefillBszLimitExceeded
+
+
+SSE_HEADERS = {
+    "Cache-Control": "no-cache",
+    "Connection": "close",
+    "X-Accel-Buffering": "no",
+}
 
 
 def json_response(status_code: int, payload: dict):
@@ -16,18 +24,6 @@ def json_response(status_code: int, payload: dict):
 
 def client_closed_response():
     return Response(status_code=499)
-
-
-def sse_response(content):
-    return StreamingResponse(
-        content,
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "Connection": "close",
-            "X-Accel-Buffering": "no",
-        },
-    )
 
 
 def prefill_bsz_limit_payload(exc: PrefillBszLimitExceeded):
@@ -143,39 +139,126 @@ async def run_sync_with_disconnect_watch(request: Request, func, **kwargs):
         await cleanup_disconnect_watcher(watcher)
 
 
-async def stream_with_disconnect_watch(request: Request, stream, cancel_token: CancellationToken):
-    watcher = asyncio.create_task(watch_disconnect(request, cancel_token))
+async def _cleanup_prefill_stream_response(
+    request: Request,
+    stream,
+    request_bsz: int,
+    stream_state: dict,
+):
+    current_task = asyncio.current_task()
+    cleanup_task = stream_state.get("cleanup_task")
+    if stream_state.get("cleanup_done"):
+        return
+    if cleanup_task is not None and cleanup_task is not current_task:
+        with suppress(asyncio.CancelledError, Exception):
+            await cleanup_task
+        return
+
+    stream_state["cleanup_task"] = current_task
     try:
-        async for chunk in stream:
-            if cancel_token.is_cancelled():
-                break
-            yield chunk
-            if isinstance(chunk, str) and chunk.strip() == "data: [DONE]":
-                break
-    except InferenceCancelled:
-        cancel_token.cancel()
+        watcher = stream_state.get("watcher")
+        if watcher is not None:
+            await cleanup_disconnect_watcher(watcher)
+            stream_state["watcher"] = None
+
+        try:
+            await stream.aclose()
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            pass
     finally:
-        await stream.aclose()
-        await cleanup_disconnect_watcher(watcher)
+        permit = stream_state.get("permit")
+        if permit is not None:
+            await request.app.state.engine.release_prefill_permit(
+                request_bsz=request_bsz,
+                request_label=str(request.url.path),
+                ticket=permit["ticket"],
+            )
+            stream_state["permit"] = None
+        stream_state["cleanup_done"] = True
 
 
-async def stream_with_prefill_queue(
+def _schedule_prefill_stream_cleanup(
+    request: Request,
+    stream,
+    request_bsz: int,
+    stream_state: dict,
+):
+    if stream_state.get("cleanup_done") or stream_state.get("cleanup_task") is not None:
+        return
+
+    stream_state["cleanup_task"] = asyncio.create_task(
+        _cleanup_prefill_stream_response(
+            request,
+            stream,
+            request_bsz,
+            stream_state,
+        )
+    )
+
+
+def prefill_sse_response(
     request: Request,
     stream,
     cancel_token: CancellationToken,
     request_bsz: int,
 ):
-    try:
-        async with reserve_prefill_capacity(request, request_bsz, cancel_token):
-            async for chunk in stream_with_disconnect_watch(request, stream, cancel_token):
+    engine = request.app.state.engine
+    stream_state = {
+        "permit": None,
+        "watcher": None,
+        "cleanup_task": None,
+        "cleanup_done": False,
+    }
+
+    async def body():
+        try:
+            stream_state["watcher"] = asyncio.create_task(
+                watch_disconnect(request, cancel_token)
+            )
+            stream_state["permit"] = await engine.acquire_prefill_permit(
+                request_bsz=request_bsz,
+                request_label=str(request.url.path),
+                cancel_token=cancel_token,
+            )
+            if cancel_token.is_cancelled():
+                raise InferenceCancelled("request disconnected while queued")
+
+            async for chunk in stream:
+                if cancel_token.is_cancelled():
+                    break
                 yield chunk
-    except PrefillBszLimitExceeded as exc:
-        cancel_token.cancel()
-        await stream.aclose()
-        yield f"data: {json.dumps(prefill_bsz_limit_payload(exc), ensure_ascii=False)}\n\n"
-    except InferenceCancelled:
-        cancel_token.cancel()
-        await stream.aclose()
+                if isinstance(chunk, str) and chunk.strip() == "data: [DONE]":
+                    break
+        except PrefillBszLimitExceeded as exc:
+            cancel_token.cancel()
+            yield f"data: {json.dumps(prefill_bsz_limit_payload(exc), ensure_ascii=False)}\n\n"
+        except InferenceCancelled:
+            cancel_token.cancel()
+        except asyncio.CancelledError:
+            cancel_token.cancel()
+            raise
+        finally:
+            _schedule_prefill_stream_cleanup(
+                request,
+                stream,
+                request_bsz,
+                stream_state,
+            )
+
+    return StreamingResponse(
+        body(),
+        media_type="text/event-stream",
+        headers=SSE_HEADERS,
+        background=BackgroundTask(
+            _cleanup_prefill_stream_response,
+            request,
+            stream,
+            request_bsz,
+            stream_state,
+        ),
+    )
 
 
 def extract_sse_payload(item: str) -> str | None:

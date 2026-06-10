@@ -3,25 +3,39 @@
 while true; do
     echo -e "\n[执行] V1 流式批处理请求 $(date '+%Y-%m-%d %H:%M:%S')\n"
     
-    curl -X POST http://localhost:8000/v1/chat/completions \
-      -H "Content-Type: application/json" \
-      -d '{
-        "contents": [
-          "English: After a blissful two weeks, Jane encounters Rochester in the gardens. He invites her to walk with him, and Jane, caught off guard, accepts. Rochester confides that he has finally decided to marry Blanche Ingram and tells Jane that he knows of an available governess position in Ireland that she could take.\n\nChinese:",
-          "English: That night, a bolt of lightning splits the same chestnut tree under which Rochester and Jane had been sitting that evening.\n\nChinese:"
-        ],
-        "max_tokens": 1024,
-        "stop_tokens": ["\nUser:"],
-        "temperature": 0.8,
-        "top_k": 50,
-        "top_p": 0.6,
-        "alpha_presence": 1.0,
-        "alpha_frequency": 0.1,
-        "alpha_decay": 0.99,
-        "stream": true,
-        "chunk_size": 8,
-        "password": "rwkv7_7.2b"
-      }'
+curl -X POST 'http://localhost:8000/v1/chat/completions' \
+  --header 'User-Agent: yaak' \
+  --header 'Accept: */*' \
+  --header 'Content-Type: application/json' \
+  --data '{
+    "contents": [
+"English: Protecting the Fragile Environment of Antarctica\n\nChinese:",
+"English: Antarctica, the southernmost continent on Earth, stands as one of the last remaining regions where large-scale human settlement has not taken root. It is a land defined by extremes—extreme cold, extreme dryness, and extreme isolation. Temperatures can plunge below minus eighty degrees Celsius in the interior, while coastal areas, though slightly milder, remain inhospitable by conventional human standards. Despite these conditions, Antarctica is far from irrelevant to the rest of the world. On the contrary, it plays a central role in regulating global systems that sustain life across the planet. Its environment is not only unique but also extraordinarily fragile, making its protection one of the most pressing environmental priorities of the modern era.\n\nChinese:",
+"English: To understand the importance of Antarctica, one must first recognize its physical scale and influence. The Antarctic Ice Sheet covers nearly the entire continent and represents the largest single mass of ice on Earth. This ice is not simply frozen water; it is a dynamic and evolving system shaped by snowfall accumulation, glacier movement, and interactions with the ocean. The sheer volume of ice stored in Antarctica makes it a critical determinant of global sea levels. Even minor shifts in its stability can lead to measurable changes in coastal environments worldwide. Cities, agricultural lands, and entire ecosystems depend on the relative stability of sea levels, linking their fate directly to processes occurring thousands of kilometers away in Antarctica.\n\nChinese:",
+"English: The albedo effect, whereby Antarctica’s bright surface reflects solar radiation, is another crucial aspect of its global importance. This reflective capacity helps regulate the Earth’s temperature by preventing excessive heat absorption. However, as global temperatures rise, ice melt exposes darker surfaces beneath, such as rock or ocean water, which absorb more heat. This accelerates warming in a self-reinforcing cycle. Such feedback mechanisms illustrate how sensitive Antarctica is to changes in global climate and how its transformation can amplify broader environmental shifts.\n\nChinese:",
+"English: Beyond its ice, Antarctica is surrounded by the Southern Ocean, a vast and powerful body of water that plays a central role in global ocean circulation. The Antarctic Circumpolar Current flows unimpeded around the continent, connecting the Atlantic, Pacific, and Indian Oceans into a single, integrated system. This current regulates heat distribution across the planet and influences weather patterns far beyond the polar regions. It also contributes to the global conveyor belt of ocean circulation, which transports nutrients, oxygen, and carbon dioxide between the deep ocean and the surface.\n\nChinese:",
+"English: The Southern Ocean is one of the most significant carbon sinks on Earth. Through a combination of physical processes and biological activity, it absorbs large quantities of carbon dioxide from the atmosphere. Phytoplankton, microscopic organisms that perform photosynthesis, play a key role in this process. They capture carbon and convert it into organic matter, forming the base of the marine food web. When these organisms die, some of the carbon they contain sinks to the ocean floor, effectively removing it from the atmosphere for long periods. This natural mechanism helps mitigate the effects of human-induced carbon emissions, highlighting Antarctica’s role in stabilizing the global climate.\n\nChinese:",
+"English: Antarctica’s ecosystems, though often perceived as barren, are remarkably complex and finely balanced. Marine life dominates the continent’s biodiversity. Antarctic krill, a small but abundant crustacean, serves as the cornerstone of the marine ecosystem. It feeds on phytoplankton and, in turn, sustains a wide range of predators, including fish, seabirds, seals, and whales. The abundance of krill is closely tied to the presence of sea ice, which provides both habitat and a food source in the form of algae growing on its underside. Changes in sea ice patterns can therefore have cascading effects throughout the ecosystem.\n\nChinese:",
+"English: Higher-level species exhibit extraordinary adaptations to survive in this extreme environment. Penguins, for example, have evolved dense feathers and behavioral strategies such as huddling to conserve heat. Emperor penguins undertake one of the most challenging breeding cycles in the animal kingdom, enduring months of darkness and cold to raise their young. Seals rely on thick layers of blubber and specialized blood circulation systems to maintain body temperature. Whales migrate vast distances to exploit the rich feeding grounds of the Southern Ocean during the summer months. These species are not only integral to the ecosystem but also serve as indicators of environmental change.\n\nChinese:",
+"English: Terrestrial ecosystems, while limited in scope, are equally significant. Ice-free areas, which make up a small fraction of the continent, host communities of mosses, lichens, and microorganisms. These organisms are adapted to survive in conditions of extreme cold, dryness, and high ultraviolet radiation. Their growth rates are exceptionally slow, making them highly susceptible to disturbance. A single footprint or minor contamination event can leave lasting marks that persist for decades or even centuries.\n\nChinese:",
+"English: Climate change poses the most significant threat to Antarctica’s environment. Rising global temperatures have led to increased rates of ice melt, particularly in West Antarctica and along the Antarctic Peninsula. Ice shelves, which act as barriers holding back glaciers, are thinning and, in some cases, collapsing. When these shelves disintegrate, the glaciers behind them can accelerate into the ocean, contributing to sea-level rise. This process is not only a regional concern but a global one, as rising sea levels threaten coastal populations and infrastructure worldwide.\n\nChinese:",
+"English: This ice is not simply frozen water; it is a dynamic and evolving system shaped by snowfall accumulation, glacier movement, and interactions with the ocean.\n\nChinese:",
+"English: Ocean warming and acidification further compound these challenges. As seawater temperatures increase, the distribution and behavior of marine species may change, disrupting established ecological relationships. Acidification, caused by the absorption of excess carbon dioxide, reduces the availability of carbonate ions needed by certain organisms to build shells and skeletons. This can affect species at the base of the food web, with ripple effects throughout the ecosystem.\n\nChinese:",
+"English: Human activity, though relatively limited in scale, is becoming increasingly significant. Scientific research stations are essential for advancing knowledge about the continent, but they also introduce environmental pressures. Waste management, fuel storage, and infrastructure development must be carefully controlled to minimize impact. International agreements establish strict guidelines, yet enforcement and monitoring remain ongoing challenges.\n\nChinese:",
+"English: Tourism has emerged as a growing concern. Advances in transportation and increased global interest have made Antarctica more accessible, leading to a steady rise in visitor numbers. While tourism can foster appreciation and awareness, it also carries risks. Physical disturbance of habitats, stress on wildlife, and the introduction of non-native species are all potential consequences. Managing tourism requires a balance between access and preservation, with strict regulations and continuous oversight.\n\nChinese:",
+"English: Fishing activities in the Southern Ocean present another challenge. Antarctic krill and toothfish are targeted for commercial purposes, and while regulatory frameworks exist, ensuring sustainable practices is complex. Overexploitation of these species can disrupt the ecological balance, affecting predators that rely on them for survival. Ecosystem-based management approaches are essential to maintain long-term sustainability.\n\nChinese:"
+    ],
+    "max_tokens": 1024,
+    "stop_tokens": ["\n\n"],
+    "temperature": 1.0,
+    "top_k": 5,
+    "top_p": 0.3,
+    "alpha_presence": 0.2,
+    "alpha_frequency": 0.2,
+    "alpha_decay": 0.99,
+    "stream": true,
+    "password": "rwkv7_7.2b"
+  }'
     
     echo -e "\n\n[完成] 本次请求已结束，等待下次执行...\n"
     echo "----------------------------------------"

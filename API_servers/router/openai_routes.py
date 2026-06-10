@@ -16,9 +16,8 @@ from API_servers.router.common import (
     extract_sse_payload,
     json_response,
     prefill_bsz_limit_response,
+    prefill_sse_response,
     reserve_prefill_capacity,
-    sse_response,
-    stream_with_prefill_queue,
     watch_disconnect,
 )
 from API_servers.router.schemas import ChatRequest
@@ -319,7 +318,7 @@ async def openai_chat_completions(request: Request):
                 cancel_token,
                 prefix_cache_manager,
             )
-            return sse_response(stream_with_prefill_queue(request, stream, cancel_token, 1))
+            return prefill_sse_response(request, stream, cancel_token, 1)
 
         async with reserve_prefill_capacity(request, 1):
             cancel_token = CancellationToken()

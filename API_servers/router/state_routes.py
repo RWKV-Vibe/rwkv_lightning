@@ -13,10 +13,9 @@ from API_servers.router.common import (
     json_response,
     normalize_state_prompts,
     prefill_bsz_limit_response,
+    prefill_sse_response,
     reserve_prefill_capacity,
     run_sync_with_disconnect_watch,
-    sse_response,
-    stream_with_prefill_queue,
 )
 from API_servers.router.schemas import ChatRequest
 
@@ -71,7 +70,7 @@ async def state_chat_completions(request: Request):
             state_manager=state_manager,
             cancel_token=cancel_token,
         )
-        return sse_response(stream_with_prefill_queue(request, stream, cancel_token, 1))
+        return prefill_sse_response(request, stream, cancel_token, 1)
 
     try:
         async with reserve_prefill_capacity(request, 1):
@@ -208,9 +207,7 @@ async def multi_state_chat_completions(request: Request):
                         "\n",
                     )
 
-        return sse_response(
-            stream_with_prefill_queue(request, stream_with_dialogue_idx(), cancel_token, 1)
-        )
+        return prefill_sse_response(request, stream_with_dialogue_idx(), cancel_token, 1)
 
     try:
         async with reserve_prefill_capacity(request, 1):
