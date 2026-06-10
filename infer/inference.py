@@ -6,7 +6,7 @@ from threading import Lock
 from infer import inference_deps
 from infer.batch_inference import BatchInferenceMixin
 from infer.big_batch import BigBatchMixin
-from infer.cancellation import PrefillBszLimitExceeded
+from infer.cancellation import InferenceCancelled, PrefillBszLimitExceeded
 from infer.inference_utils import InferenceUtilsMixin
 
 
@@ -34,7 +34,9 @@ class InferenceEngine(
             self._prefill_condition = asyncio.Condition()
         return self._prefill_condition
 
-    async def acquire_prefill_permit(self, request_bsz: int, request_label: str = ""):
+    async def acquire_prefill_permit(
+        self, request_bsz: int, request_label: str = "", cancel_token=None
+    ):
         request_bsz = max(1, int(request_bsz))
         max_prefill_bsz_limit = int(
             getattr(
@@ -60,6 +62,9 @@ class InferenceEngine(
 
             try:
                 while True:
+                    if cancel_token is not None and cancel_token.is_cancelled():
+                        raise InferenceCancelled("request disconnected while queued")
+
                     is_turn = self._prefill_queue and self._prefill_queue[0] == ticket
                     if is_turn and hasattr(self.model, "refresh_max_prefill_bsz"):
                         current_limit = self.model.refresh_max_prefill_bsz()
@@ -96,10 +101,14 @@ class InferenceEngine(
                         await asyncio.wait_for(condition.wait(), timeout=0.1)
                     except asyncio.TimeoutError:
                         pass
-            except Exception:
+            except BaseException:
                 if ticket in self._prefill_queue:
                     self._prefill_queue.remove(ticket)
                     condition.notify_all()
+                    print(
+                        f"[PrefillQueue] removed ticket={ticket} path={request_label} "
+                        f"request_bsz={request_bsz}"
+                    )
                 raise
 
     async def release_prefill_permit(

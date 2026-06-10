@@ -1,5 +1,5 @@
 from fastapi import APIRouter, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse
 
 from infer.cancellation import CancellationToken, InferenceCancelled, PrefillBszLimitExceeded
 
@@ -9,6 +9,7 @@ from API_servers.router.common import (
     prefill_bsz_limit_response,
     reserve_prefill_capacity,
     run_sync_with_disconnect_watch,
+    sse_response,
     stream_with_prefill_queue,
 )
 from API_servers.router.schemas import ChatRequest, TranslateRequest, TranslateResponse
@@ -70,9 +71,8 @@ async def chat_completions(request: Request):
             chunk_size=req.chunk_size,
             cancel_token=cancel_token,
         )
-        return StreamingResponse(
-            stream_with_prefill_queue(request, stream, cancel_token, len(req.contents)),
-            media_type="text/event-stream",
+        return sse_response(
+            stream_with_prefill_queue(request, stream, cancel_token, len(req.contents))
         )
 
     try:
@@ -191,9 +191,8 @@ async def fim_completions(request: Request):
             chunk_size=req.chunk_size,
             cancel_token=cancel_token,
         )
-        return StreamingResponse(
-            stream_with_prefill_queue(request, stream, cancel_token, len(prompts)),
-            media_type="text/event-stream",
+        return sse_response(
+            stream_with_prefill_queue(request, stream, cancel_token, len(prompts))
         )
 
     try:
@@ -254,7 +253,6 @@ async def big_batch_completions(request: Request):
         chunk_size=req.chunk_size,
         cancel_token=cancel_token,
     )
-    return StreamingResponse(
-        stream_with_prefill_queue(request, stream, cancel_token, len(req.contents)),
-        media_type="text/event-stream",
+    return sse_response(
+        stream_with_prefill_queue(request, stream, cancel_token, len(req.contents))
     )

@@ -5,7 +5,6 @@ from typing import Any
 import asyncio
 
 from fastapi import APIRouter, Request
-from fastapi.responses import StreamingResponse
 
 from infer.cancellation import CancellationToken, InferenceCancelled, PrefillBszLimitExceeded
 from state_manager.state_pool import get_state_manager
@@ -18,6 +17,7 @@ from API_servers.router.common import (
     json_response,
     prefill_bsz_limit_response,
     reserve_prefill_capacity,
+    sse_response,
     stream_with_prefill_queue,
     watch_disconnect,
 )
@@ -319,10 +319,7 @@ async def openai_chat_completions(request: Request):
                 cancel_token,
                 prefix_cache_manager,
             )
-            return StreamingResponse(
-                stream_with_prefill_queue(request, stream, cancel_token, 1),
-                media_type="text/event-stream",
-            )
+            return sse_response(stream_with_prefill_queue(request, stream, cancel_token, 1))
 
         async with reserve_prefill_capacity(request, 1):
             cancel_token = CancellationToken()

@@ -4,7 +4,7 @@ from contextlib import asynccontextmanager
 from contextlib import suppress
 
 from fastapi import Request
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from starlette.concurrency import run_in_threadpool
 
 from infer.cancellation import CancellationToken, InferenceCancelled, PrefillBszLimitExceeded
@@ -16,6 +16,18 @@ def json_response(status_code: int, payload: dict):
 
 def client_closed_response():
     return Response(status_code=499)
+
+
+def sse_response(content):
+    return StreamingResponse(
+        content,
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "close",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 def prefill_bsz_limit_payload(exc: PrefillBszLimitExceeded):
@@ -93,20 +105,30 @@ async def cleanup_disconnect_watcher(task):
 
 
 @asynccontextmanager
-async def reserve_prefill_capacity(request: Request, request_bsz: int):
+async def reserve_prefill_capacity(
+    request: Request, request_bsz: int, cancel_token: CancellationToken | None = None
+):
     engine = request.app.state.engine
-    permit = await engine.acquire_prefill_permit(
-        request_bsz=request_bsz,
-        request_label=str(request.url.path),
-    )
+    queue_cancel_token = cancel_token or CancellationToken()
+    watcher = asyncio.create_task(watch_disconnect(request, queue_cancel_token))
+    permit = None
     try:
-        yield permit
-    finally:
-        await engine.release_prefill_permit(
+        permit = await engine.acquire_prefill_permit(
             request_bsz=request_bsz,
             request_label=str(request.url.path),
-            ticket=permit["ticket"],
+            cancel_token=queue_cancel_token,
         )
+        if queue_cancel_token.is_cancelled():
+            raise InferenceCancelled("request disconnected while queued")
+        yield permit
+    finally:
+        await cleanup_disconnect_watcher(watcher)
+        if permit is not None:
+            await engine.release_prefill_permit(
+                request_bsz=request_bsz,
+                request_label=str(request.url.path),
+                ticket=permit["ticket"],
+            )
 
 
 async def run_sync_with_disconnect_watch(request: Request, func, **kwargs):
@@ -128,6 +150,8 @@ async def stream_with_disconnect_watch(request: Request, stream, cancel_token: C
             if cancel_token.is_cancelled():
                 break
             yield chunk
+            if isinstance(chunk, str) and chunk.strip() == "data: [DONE]":
+                break
     except InferenceCancelled:
         cancel_token.cancel()
     finally:
@@ -142,13 +166,16 @@ async def stream_with_prefill_queue(
     request_bsz: int,
 ):
     try:
-        async with reserve_prefill_capacity(request, request_bsz):
+        async with reserve_prefill_capacity(request, request_bsz, cancel_token):
             async for chunk in stream_with_disconnect_watch(request, stream, cancel_token):
                 yield chunk
     except PrefillBszLimitExceeded as exc:
         cancel_token.cancel()
         await stream.aclose()
         yield f"data: {json.dumps(prefill_bsz_limit_payload(exc), ensure_ascii=False)}\n\n"
+    except InferenceCancelled:
+        cancel_token.cancel()
+        await stream.aclose()
 
 
 def extract_sse_payload(item: str) -> str | None:

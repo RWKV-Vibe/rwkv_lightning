@@ -2,7 +2,6 @@ import json
 from datetime import datetime
 
 from fastapi import APIRouter, Request
-from fastapi.responses import StreamingResponse
 
 from infer.cancellation import CancellationToken, InferenceCancelled, PrefillBszLimitExceeded
 from state_manager.state_pool import get_state_manager, remove_session_from_any_level
@@ -16,6 +15,7 @@ from API_servers.router.common import (
     prefill_bsz_limit_response,
     reserve_prefill_capacity,
     run_sync_with_disconnect_watch,
+    sse_response,
     stream_with_prefill_queue,
 )
 from API_servers.router.schemas import ChatRequest
@@ -71,10 +71,7 @@ async def state_chat_completions(request: Request):
             state_manager=state_manager,
             cancel_token=cancel_token,
         )
-        return StreamingResponse(
-            stream_with_prefill_queue(request, stream, cancel_token, 1),
-            media_type="text/event-stream",
-        )
+        return sse_response(stream_with_prefill_queue(request, stream, cancel_token, 1))
 
     try:
         async with reserve_prefill_capacity(request, 1):
@@ -211,9 +208,8 @@ async def multi_state_chat_completions(request: Request):
                         "\n",
                     )
 
-        return StreamingResponse(
-            stream_with_prefill_queue(request, stream_with_dialogue_idx(), cancel_token, 1),
-            media_type="text/event-stream",
+        return sse_response(
+            stream_with_prefill_queue(request, stream_with_dialogue_idx(), cancel_token, 1)
         )
 
     try:
