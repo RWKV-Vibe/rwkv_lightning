@@ -366,3 +366,91 @@ curl -X POST http://localhost:8000/FIM/v1/batch-FIM \
     "password": "rwkv7_7.2b"
   }'
 ```
+
+</details>
+
+___
+### **8. ```/high_throughput/chat/completions``` [High Throughput]**
+
+This endpoint is disabled by default. Start the API server with `--enable-high-throughput` to enable it:
+
+```bash
+python app.py --model-path <your model path> --port <your port number> --password rwkv7_7.2b --enable-high-throughput
+```
+
+Optional high-throughput tuning flags have defaults and can be omitted:
+
+- `--high-throughput-max-active-states 256`: resident active state pool size for this endpoint only.
+- `--high-throughput-prefill-area 4096`: preferred `batch_size * chunk_size` area for prefill scheduling.
+- `--high-throughput-prefill-batch-size 16`: preferred power-of-two prefill batch size.
+
+Only one high-throughput API path is registered:
+
+- `POST /high_throughput/chat/completions`
+
+Compared with `POST /v1/chat/completions`:
+
+- V1 uses the shared prefill queue and allocates request state per call.
+- High throughput does not use the V1 prefill queue; it uses its own resident state pool and internal scheduling.
+- V1 request batch size follows the old endpoint behavior and its independent queue limit.
+- High throughput defaults to at most 256 active resident states, then reuses those states for the next window.
+- High throughput supports the same common decode parameters: `max_tokens`, `stop_tokens`, `temperature`, `top_k`, `top_p`, `alpha_presence`, `alpha_frequency`, `alpha_decay`, `stream`, `chunk_size`, and `password`.
+- High throughput additionally supports request-level scheduler overrides: `max_batch_size` or `decode_max_batch_size`, `prefill_area`, and `prefill_target_batch_size` or `batch_size`.
+- High throughput accepts either V1-style `contents` or item-style `items`. Use `items` when you want stable per-item ids in the response.
+
+<details>
+<summary><strong><em>curl examples</em></strong></summary>
+
+- Non-streaming high-throughput request with V1-style `contents`
+
+```bash
+curl -X POST http://localhost:8000/high_throughput/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "contents": [
+      "English: That night, a bolt of lightning splits the same chestnut tree under which Rochester and Jane had been sitting that evening.\n\nChinese:",
+      "English: After a blissful two weeks, Jane encounters Rochester in the gardens.\n\nChinese:"
+    ],
+    "max_tokens": 1024,
+    "stop_tokens": ["\nUser:"],
+    "temperature": 0.8,
+    "top_k": 50,
+    "top_p": 0.6,
+    "alpha_presence": 1.0,
+    "alpha_frequency": 0.1,
+    "alpha_decay": 0.99,
+    "stream": false,
+    "password": "rwkv7_7.2b"
+  }'
+```
+
+- Streaming high-throughput request with item ids and scheduler overrides
+
+```bash
+curl -N -X POST http://localhost:8000/high_throughput/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "client_id": "client_a",
+    "batch_id": "batch_001",
+    "items": [
+      {"id": 1001, "text": "User: Give me one short dinner idea.\n\nAssistant:"},
+      {"id": 1002, "text": "User: Give me one short travel tip.\n\nAssistant:"}
+    ],
+    "max_tokens": 256,
+    "stop_tokens": ["\nUser:"],
+    "temperature": 0.8,
+    "top_k": 50,
+    "top_p": 0.6,
+    "alpha_presence": 1.0,
+    "alpha_frequency": 0.1,
+    "alpha_decay": 0.99,
+    "stream": true,
+    "chunk_size": 32,
+    "max_batch_size": 256,
+    "prefill_area": 4096,
+    "prefill_target_batch_size": 16,
+    "password": "rwkv7_7.2b"
+  }'
+```
+
+</details>
