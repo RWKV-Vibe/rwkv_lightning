@@ -7,8 +7,10 @@ import uvicorn
 
 from API_servers.fastapi_service import create_app
 from infer.high_throughput import (
+    DEFAULT_CUDA_CACHE_BUDGET_GB,
     DEFAULT_MAX_BATCH_SIZE,
     DEFAULT_PREFILL_AREA,
+    DEFAULT_PREFILL_CACHE_SHAPE_LIMIT,
     DEFAULT_PREFILL_TARGET_BATCH_SIZE,
     HighThroughputConfig,
 )
@@ -51,6 +53,23 @@ def parse_args():
         default=DEFAULT_PREFILL_AREA,
         help="Preferred prefill batch-size times chunk-size area for the high_throughput endpoint",
     )
+    parser.add_argument(
+        "--high-throughput-prefill-cache-shape-limit",
+        type=int,
+        default=DEFAULT_PREFILL_CACHE_SHAPE_LIMIT,
+        help="Number of distinct high_throughput prefill shapes to keep cached before clearing CUDA cache; 0 disables the limit",
+    )
+    parser.add_argument(
+        "--high-throughput-cuda-cache-budget-gb",
+        type=float,
+        default=DEFAULT_CUDA_CACHE_BUDGET_GB,
+        help="Extra CUDA reserved-memory budget, in GB, above the resident high_throughput pool before clearing cache; 0 disables the budget",
+    )
+    parser.add_argument(
+        "--high-throughput-clear-cuda-cache-each-request",
+        action="store_true",
+        help="Clear CUDA cache after every high_throughput request instead of reusing planned prefill shape cache",
+    )
     return parser.parse_args()
 
 
@@ -63,6 +82,9 @@ def main():
         decode_max_batch_size=args_cli.high_throughput_max_batch_size,
         prefill_area=args_cli.high_throughput_prefill_target_area,
         prefill_target_batch_size=args_cli.high_throughput_prefill_target_batch_size,
+        prefill_cache_shape_limit=args_cli.high_throughput_prefill_cache_shape_limit,
+        cuda_cache_budget_gb=args_cli.high_throughput_cuda_cache_budget_gb,
+        clear_cuda_cache_each_request=args_cli.high_throughput_clear_cuda_cache_each_request,
     )
     app = create_app(
         engine,

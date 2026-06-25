@@ -1,4 +1,5 @@
 import asyncio
+import gc
 import json
 import random
 import time
@@ -9,6 +10,8 @@ from dataclasses import dataclass, field
 DEFAULT_MAX_BATCH_SIZE = 256
 DEFAULT_PREFILL_AREA = 4096
 DEFAULT_PREFILL_TARGET_BATCH_SIZE = 16
+DEFAULT_PREFILL_CACHE_SHAPE_LIMIT = 64
+DEFAULT_CUDA_CACHE_BUDGET_GB = 6.0
 PREFILL_TAIL_SPLIT_RATIO = 1.25
 PREFILL_TAIL_TILE_RATIO = 0.5
 PREFILL_SPEED_TABLE = {
@@ -31,11 +34,17 @@ class HighThroughputConfig:
     decode_max_batch_size: int = DEFAULT_MAX_BATCH_SIZE
     prefill_area: int = DEFAULT_PREFILL_AREA
     prefill_target_batch_size: int = DEFAULT_PREFILL_TARGET_BATCH_SIZE
+    prefill_cache_shape_limit: int = DEFAULT_PREFILL_CACHE_SHAPE_LIMIT
+    cuda_cache_budget_gb: float = DEFAULT_CUDA_CACHE_BUDGET_GB
+    clear_cuda_cache_each_request: bool = False
 
     def normalize(self) -> "HighThroughputConfig":
         self.decode_max_batch_size = max(1, int(self.decode_max_batch_size))
         self.prefill_area = max(1, int(self.prefill_area))
         self.prefill_target_batch_size = max(1, int(self.prefill_target_batch_size))
+        self.prefill_cache_shape_limit = max(0, int(self.prefill_cache_shape_limit))
+        self.cuda_cache_budget_gb = max(0.0, float(self.cuda_cache_budget_gb))
+        self.clear_cuda_cache_each_request = bool(self.clear_cuda_cache_each_request)
         return self
 
 
@@ -88,14 +97,21 @@ class HighThroughputResidentRuntime:
         self.penalty_pool = None
         self.sample_rand_states = None
         self.rand_state_stride = 0
+        self.dirty_active_states = 0
+        self.cached_prefill_shapes: set[tuple[int, int]] = set()
+        self.clear_cuda_cache_after_request = False
         self._allocate_resident_pool_with_fallback(self.max_batch_size)
+        self.resident_cuda_reserved_bytes = self.cuda_memory_reserved()
         startup_plan = self.make_plan(total_items=self.max_batch_size)
         print(
             "[HighThroughput] resident pool ready "
             f"max_batch_size={self.max_batch_size} "
+            f"max_active_states={startup_plan.max_active_states} "
             f"prefill_batch_size={startup_plan.prefill_batch_size} "
             f"prefill_chunk_size={startup_plan.prefill_chunk_size} "
-            f"prefill_area={startup_plan.prefill_area}"
+            f"prefill_area={startup_plan.prefill_area} "
+            f"resident_reserved_gb={self.resident_cuda_reserved_bytes / (1024 ** 3):.3f} "
+            f"cuda_cache_budget_gb={self.config.cuda_cache_budget_gb:.3f}"
         )
 
     def _allocate_resident_pool_with_fallback(self, requested_max_batch_size: int):
@@ -157,6 +173,65 @@ class HighThroughputResidentRuntime:
         )
         self.rand_state_stride = self.sample_rand_states.numel() // max_batch_size
 
+    @staticmethod
+    def cleanup_extra_cuda_memory():
+        from infer import inference_deps
+
+        torch = inference_deps.get_torch()
+        gc.collect()
+        if not torch.cuda.is_available():
+            return
+        try:
+            torch.cuda.synchronize()
+        except Exception:
+            pass
+        torch.cuda.empty_cache()
+
+    @staticmethod
+    def cuda_memory_reserved() -> int:
+        from infer import inference_deps
+
+        torch = inference_deps.get_torch()
+        if not torch.cuda.is_available():
+            return 0
+        return int(torch.cuda.memory_reserved())
+
+    def prepare_prefill_cache(self, planned_shapes: set[tuple[int, int]]):
+        if not planned_shapes:
+            return
+
+        shape_limit = self.config.prefill_cache_shape_limit
+        if shape_limit <= 0:
+            return
+
+        projected_shapes = self.cached_prefill_shapes | planned_shapes
+        if len(projected_shapes) > shape_limit:
+            self.cleanup_extra_cuda_memory()
+            self.cached_prefill_shapes.clear()
+
+        if len(planned_shapes) > shape_limit:
+            self.clear_cuda_cache_after_request = True
+
+        self.cached_prefill_shapes.update(planned_shapes)
+
+    def finish_request_cleanup(self):
+        self.reset_dirty_active_states()
+        cache_budget_bytes = int(self.config.cuda_cache_budget_gb * 1024 ** 3)
+        reserved_limit = self.resident_cuda_reserved_bytes + cache_budget_bytes
+        over_cache_budget = (
+            cache_budget_bytes > 0
+            and self.cuda_memory_reserved() > reserved_limit
+        )
+        if (
+            self.config.clear_cuda_cache_each_request
+            or self.clear_cuda_cache_after_request
+            or over_cache_budget
+        ):
+            self.cleanup_extra_cuda_memory()
+            self.cached_prefill_shapes.clear()
+            self.clear_cuda_cache_after_request = False
+            self.resident_cuda_reserved_bytes = self.cuda_memory_reserved()
+
     def make_plan(
         self,
         *,
@@ -188,14 +263,10 @@ class HighThroughputResidentRuntime:
 
         max_prefill_batch_size = max(
             1,
-            min(total_items, decode_batch_size),
+            min(total_items, decode_batch_size, target_area),
         )
-        prefill_batch_size = choose_power_of_two_prefill_batch_size(
-            target_area=target_area,
-            target_batch_size=target_batch_size,
-            max_batch_size=max_prefill_batch_size,
-        )
-        prefill_chunk_size = max(1, round(target_area / prefill_batch_size))
+        prefill_batch_size = max_prefill_batch_size
+        prefill_chunk_size = max(1, target_area // prefill_batch_size)
 
         return HighThroughputPlan(
             max_active_states=self.max_batch_size,
@@ -227,6 +298,17 @@ class HighThroughputResidentRuntime:
         self.state[1][:, :batch_size].zero_()
         self.state[2][:batch_size].zero_()
         self.penalty_pool[:batch_size].zero_()
+        self.dirty_active_states = max(self.dirty_active_states, batch_size)
+
+    def reset_dirty_active_states(self):
+        if self.dirty_active_states <= 0:
+            return
+        dirty_active_states = self.dirty_active_states
+        self.state[0][:, :, :dirty_active_states, :].zero_()
+        self.state[1][:, :dirty_active_states].zero_()
+        self.state[2][:dirty_active_states].zero_()
+        self.penalty_pool[:dirty_active_states].zero_()
+        self.dirty_active_states = 0
 
     def prefill_into_logits_pool(
         self,
@@ -236,6 +318,7 @@ class HighThroughputResidentRuntime:
     ):
         engine = self.engine
         lengths = [len(item) for item in tokens]
+        self.prepare_prefill_cache(collect_prefill_shapes(lengths, plan))
         positions = [0] * len(tokens)
 
         while True:
@@ -244,30 +327,39 @@ class HighThroughputResidentRuntime:
             if not tile_indices:
                 break
 
+            state_slice = contiguous_index_slice(tile_indices)
             batch_tokens = [
                 tokens[i][positions[i] : positions[i] + step]
                 for i in tile_indices
             ]
-            batch_state = [
-                self.state[0][:, :, tile_indices],
-                self.state[1][:, tile_indices],
-                self.state[2][tile_indices],
-            ]
+            if state_slice is None:
+                batch_state = [
+                    self.state[0][:, :, tile_indices],
+                    self.state[1][:, tile_indices],
+                    self.state[2][tile_indices],
+                ]
+            else:
+                batch_state = self.state_range_view(state_slice.start, state_slice.stop)
 
             new_logits = engine.model.forward_batch_same_length(batch_tokens, batch_state)
             if new_logits.dim() == 3:
                 new_logits = new_logits[:, -1]
 
-            for active_index, original_index in enumerate(tile_indices):
-                self.logits_pool[original_index].copy_(new_logits[active_index])
-                positions[original_index] += step
-                self.state[0][:, :, original_index].copy_(
-                    batch_state[0][:, :, active_index]
-                )
-                self.state[1][:, original_index].copy_(
-                    batch_state[1][:, active_index]
-                )
-                self.state[2][original_index].copy_(batch_state[2][active_index])
+            if state_slice is not None:
+                self.logits_pool[state_slice].copy_(new_logits)
+                for original_index in tile_indices:
+                    positions[original_index] += step
+            else:
+                for active_index, original_index in enumerate(tile_indices):
+                    self.logits_pool[original_index].copy_(new_logits[active_index])
+                    positions[original_index] += step
+                    self.state[0][:, :, original_index].copy_(
+                        batch_state[0][:, :, active_index]
+                    )
+                    self.state[1][:, original_index].copy_(
+                        batch_state[1][:, active_index]
+                    )
+                    self.state[2][original_index].copy_(batch_state[2][active_index])
 
 
 def powers_of_two_up_to(max_value: int) -> list[int]:
@@ -320,49 +412,46 @@ def choose_prefill_tile(
     positions: list[int],
     plan: HighThroughputPlan,
 ) -> tuple[list[int], int]:
-    remaining = [
-        (i, lengths[i] - positions[i])
+    active = [
+        i
         for i in range(len(lengths))
         if positions[i] < lengths[i]
     ]
-    if not remaining:
+    if not active:
         return [], 0
 
-    remaining.sort(key=lambda item: item[1], reverse=True)
-    total_area = sum(rem for _, rem in remaining)
-    target_area = plan.requested_prefill_area
-    max_tile_area = target_area
-    if target_area < total_area <= int(target_area * PREFILL_TAIL_SPLIT_RATIO):
-        max_tile_area = plan.tail_split_area
+    max_tile_area = max(1, int(plan.requested_prefill_area))
+    batch_size = min(len(active), plan.decode_batch_size, max_tile_area)
+    tile_indices = active[:batch_size]
+    min_remaining = min(lengths[i] - positions[i] for i in tile_indices)
+    step = min(min_remaining, max(1, max_tile_area // batch_size))
+    return tile_indices, step
 
-    candidates = []
-    for batch_size in powers_of_two_up_to(min(len(remaining), plan.decode_batch_size)):
-        selected = remaining[:batch_size]
-        max_chunk_size = min(rem for _, rem in selected)
-        for chunk_size in powers_of_two_up_to(max_chunk_size):
-            area = batch_size * chunk_size
-            if area > max_tile_area:
-                continue
-            speed = prefill_speed(batch_size, chunk_size)
-            if speed <= 0:
-                continue
-            candidates.append((speed, area, batch_size, chunk_size, selected))
 
-    if not candidates:
-        original_index, _ = remaining[0]
-        return [original_index], 1
+def collect_prefill_shapes(
+    lengths: list[int],
+    plan: HighThroughputPlan,
+) -> set[tuple[int, int]]:
+    positions = [0] * len(lengths)
+    shapes = set()
+    while True:
+        tile_indices, step = choose_prefill_tile(lengths, positions, plan)
+        if not tile_indices:
+            break
+        shapes.add((len(tile_indices), step))
+        for original_index in tile_indices:
+            positions[original_index] += step
+    return shapes
 
-    _, _, batch_size, chunk_size, selected = max(
-        candidates,
-        key=lambda item: (
-            item[1],
-            -batch_distance(item[2], plan.requested_prefill_target_batch_size)[0],
-            item[2],
-            item[0],
-            -abs(item[2] - plan.requested_prefill_target_batch_size),
-        ),
-    )
-    return [original_index for original_index, _ in selected[:batch_size]], chunk_size
+
+def contiguous_index_slice(indices: list[int]) -> slice | None:
+    if not indices:
+        return None
+    start = indices[0]
+    for offset, index in enumerate(indices):
+        if index != start + offset:
+            return None
+    return slice(start, start + len(indices))
 
 
 def encode_high_throughput_prompts(engine, prompts: list[str], cancel_token=None):
@@ -382,6 +471,23 @@ def split_stop_tokens(stop_tokens):
         elif isinstance(stop_token, str) and stop_token:
             stop_strings.append(stop_token)
     return stop_strings, stop_token_ids
+
+
+def sort_prefill_inputs(
+    prompt_tokens: list[list[int]],
+    item_ids: list[int | None],
+    result_offset: int,
+):
+    order = sorted(range(len(prompt_tokens)), key=lambda index: (len(prompt_tokens[index]), index))
+    result_indices = [result_offset + index for index in order]
+    if order == list(range(len(prompt_tokens))):
+        return prompt_tokens, item_ids, result_indices
+
+    return (
+        [prompt_tokens[index] for index in order],
+        [item_ids[index] for index in order],
+        result_indices,
+    )
 
 
 def swap_state_rows(state, left: int, right: int):
@@ -491,9 +597,14 @@ def run_high_throughput_chunk(
     batch_size = len(prompt_tokens)
     stream_chunk_size = max(1, int(stream_chunk_size))
     stop_strings, stop_token_ids = split_stop_tokens(stop_tokens)
+    prompt_tokens, item_ids, result_indices = sort_prefill_inputs(
+        prompt_tokens,
+        item_ids,
+        result_offset,
+    )
     tasks = [
         HighThroughputTask(
-            index=result_offset + i,
+            index=result_indices[i],
             item_id=item_ids[i],
             prompt_tokens=tokens,
             stop_state=engine._create_stop_state(stop_strings),
@@ -625,29 +736,32 @@ def run_high_throughput_generate(
     results = [None] * len(encoded_prompts)
     usages = [None] * len(encoded_prompts)
 
-    with engine.model_lock:
-        for start in range(0, len(encoded_prompts), plan.decode_batch_size):
-            engine._raise_if_cancelled(cancel_token)
-            chunk_tokens = encoded_prompts[start : start + plan.decode_batch_size]
-            chunk_item_ids = item_ids[start : start + plan.decode_batch_size]
-            run_high_throughput_chunk(
-                runtime,
-                chunk_tokens,
-                plan=plan,
-                item_ids=chunk_item_ids,
-                max_length=max_length,
-                temperature=temperature,
-                top_k=top_k,
-                top_p=top_p,
-                alpha_presence=alpha_presence,
-                alpha_frequency=alpha_frequency,
-                alpha_decay=alpha_decay,
-                stop_tokens=stop_tokens,
-                result_offset=start,
-                results=results,
-                usages=usages,
-                cancel_token=cancel_token,
-            )
+    try:
+        with engine.model_lock:
+            for start in range(0, len(encoded_prompts), plan.decode_batch_size):
+                engine._raise_if_cancelled(cancel_token)
+                chunk_tokens = encoded_prompts[start : start + plan.decode_batch_size]
+                chunk_item_ids = item_ids[start : start + plan.decode_batch_size]
+                run_high_throughput_chunk(
+                    runtime,
+                    chunk_tokens,
+                    plan=plan,
+                    item_ids=chunk_item_ids,
+                    max_length=max_length,
+                    temperature=temperature,
+                    top_k=top_k,
+                    top_p=top_p,
+                    alpha_presence=alpha_presence,
+                    alpha_frequency=alpha_frequency,
+                    alpha_decay=alpha_decay,
+                    stop_tokens=stop_tokens,
+                    result_offset=start,
+                    results=results,
+                    usages=usages,
+                    cancel_token=cancel_token,
+                )
+    finally:
+        runtime.finish_request_cleanup()
 
     return results, usages
 
@@ -693,35 +807,38 @@ async def run_high_throughput_stream(
             results = [None] * len(worker_encoded_prompts)
             usages = [None] * len(worker_encoded_prompts)
 
-            with engine.model_lock:
-                for start in range(0, len(worker_encoded_prompts), plan.decode_batch_size):
-                    engine._raise_if_cancelled(cancel_token)
-                    chunk_tokens = worker_encoded_prompts[
-                        start : start + plan.decode_batch_size
-                    ]
-                    chunk_item_ids = window_item_ids[
-                        start : start + plan.decode_batch_size
-                    ]
-                    run_high_throughput_chunk(
-                        runtime,
-                        chunk_tokens,
-                        plan=plan,
-                        item_ids=chunk_item_ids,
-                        max_length=max_length,
-                        temperature=temperature,
-                        top_k=top_k,
-                        top_p=top_p,
-                        alpha_presence=alpha_presence,
-                        alpha_frequency=alpha_frequency,
-                        alpha_decay=alpha_decay,
-                        stop_tokens=stop_tokens,
-                        result_offset=start,
-                        results=results,
-                        usages=usages,
-                        cancel_token=cancel_token,
-                        stream_callback=enqueue,
-                        stream_chunk_size=chunk_size,
-                    )
+            try:
+                with engine.model_lock:
+                    for start in range(0, len(worker_encoded_prompts), plan.decode_batch_size):
+                        engine._raise_if_cancelled(cancel_token)
+                        chunk_tokens = worker_encoded_prompts[
+                            start : start + plan.decode_batch_size
+                        ]
+                        chunk_item_ids = window_item_ids[
+                            start : start + plan.decode_batch_size
+                        ]
+                        run_high_throughput_chunk(
+                            runtime,
+                            chunk_tokens,
+                            plan=plan,
+                            item_ids=chunk_item_ids,
+                            max_length=max_length,
+                            temperature=temperature,
+                            top_k=top_k,
+                            top_p=top_p,
+                            alpha_presence=alpha_presence,
+                            alpha_frequency=alpha_frequency,
+                            alpha_decay=alpha_decay,
+                            stop_tokens=stop_tokens,
+                            result_offset=start,
+                            results=results,
+                            usages=usages,
+                            cancel_token=cancel_token,
+                            stream_callback=enqueue,
+                            stream_chunk_size=chunk_size,
+                        )
+            finally:
+                runtime.finish_request_cleanup()
             enqueue("data: [DONE]\n\n")
         except Exception as exc:
             enqueue(exc)
